@@ -5,4 +5,5 @@ extern crate alloc;
 
 /// Byte-field readers and CRCs, shared with the crates below the drivers.
 pub use stela_contracts::{bytes, crc};
+pub mod amd_metal;
 pub mod firmware;

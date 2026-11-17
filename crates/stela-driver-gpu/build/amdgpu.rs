@@ -388,14 +388,52 @@ pub fn tables() {
             "a revision quirk moves {listed} to {quirked}, whose registers are in another BAR"
         );
     }
+    // The graphics generation of each family: the oldest graphics block its
+    // IP block list can hold.
+    let mut generations = BTreeMap::new();
+    let mut generation = |list: &str| {
+        *generations.entry(list.to_owned()).or_insert_with(|| {
+            graphics(&source(&format!("{list}.c")))
+                .into_iter()
+                .min()
+                .unwrap_or_else(|| panic!("{list}.c adds no graphics block"))
+        })
+    };
+    let discovery_generation = generation(&lists.default);
+    let mut family_generation = |family: &str| match lists.families.get(family) {
+        Some(list) => generation(list),
+        None => discovery_generation,
+    };
+    // A generation RADV's device cannot serve the Metal device on is left
+    // out (`stela_driver_core::amd_metal`): the image holds no support for
+    // it either.
+    for (family, _) in table.devices.values() {
+        let generation = family_generation(family);
+        assert!(
+            generation >= stela_driver_core::amd_metal::FIRST_GENERATION
+                || table.unbuilt.contains_key(family),
+            "the profile builds amdgpu's support for {family}, of graphics generation \
+             {generation}, which cannot serve the Metal device: leave its Kconfig symbol unset"
+        );
+    }
+    for (listed, quirked) in &table.quirks {
+        assert!(
+            family_generation(listed) == family_generation(quirked),
+            "a revision quirk moves {listed} to {quirked}, of another graphics generation"
+        );
+    }
     let mut text = String::from(
-        "/// amdgpu's `pciidlist` entries that name a device: its ID, the bits of\n\
-         /// the DMA mask its family's memory controller sets, the probe's answer,\n\
-         /// whether the table flags it `AMD_IS_APU`, and the BAR of its registers.\n\
-         pub(crate) const DEVICES: &[(u16, u8, Support, bool, u8)] = &[\n",
+        "/// amdgpu's `pciidlist` entries that name a device: its ID, its family\n\
+         /// (`CHIP_*` without the prefix), its graphics generation (the oldest\n\
+         /// graphics block the family's list holds), the bits of the DMA mask\n\
+         /// its family's memory controller sets, the probe's answer, whether\n\
+         /// the table flags it `AMD_IS_APU`, and the BAR of its registers.\n\
+         pub(crate) const DEVICES: &[(u16, &str, u8, u8, Support, bool, u8)] = &[\n",
     );
     for (device, (family, apu)) in &table.devices {
         let bits = family_mask(family);
+        let generation = family_generation(family);
+        let name = family.strip_prefix("CHIP_").unwrap_or(family);
         let support = match table.unbuilt.get(family) {
             Some(generation) => {
                 format!("Support::NotBuilt(\"amdgpu built without {generation} support\")")
@@ -404,7 +442,7 @@ pub fn tables() {
         };
         let bar = window.bar(family);
         text.push_str(&format!(
-            "    ({device:#06x}, {bits}, {support}, {apu}, {bar}),\n"
+            "    ({device:#06x}, {name:?}, {generation}, {bits}, {support}, {apu}, {bar}),\n"
         ));
     }
     text.push_str(
@@ -426,7 +464,9 @@ pub fn tables() {
         "];\n/// The narrowest mask of the memory controllers IP discovery chooses from.\n\
          pub(crate) const DISCOVERY_BITS: u8 = {discovery};\n\
          /// The BAR of the registers of a device IP discovery identifies.\n\
-         pub(crate) const DISCOVERY_REGISTERS: u8 = {};\n",
+         pub(crate) const DISCOVERY_REGISTERS: u8 = {};\n\
+         /// The oldest graphics generation IP discovery chooses a block of.\n\
+         pub(crate) const DISCOVERY_GENERATION: u8 = {discovery_generation};\n",
         window.bar("CHIP_IP_DISCOVERY")
     ));
     text.push_str(
@@ -740,6 +780,15 @@ fn block_lists(device: &str) -> Result<BlockLists, String> {
 /// The major versions of the memory controller blocks `list` adds.
 fn controllers(list: &str) -> BTreeSet<u32> {
     list.split("&gmc_v")
+        .skip(1)
+        .filter_map(|rest| rest.split('_').next()?.parse().ok())
+        .collect()
+}
+
+/// The major versions of the graphics blocks `list` adds, which Mesa names
+/// the generations by (`gfx_v8_0_ip_block` is GFX8's).
+fn graphics(list: &str) -> BTreeSet<u8> {
+    list.split("&gfx_v")
         .skip(1)
         .filter_map(|rest| rest.split('_').next()?.parse().ok())
         .collect()

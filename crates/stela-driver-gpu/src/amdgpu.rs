@@ -3,6 +3,7 @@
 //! of devices it leaves to radeon and its family rules as the build read
 //! them (`build/amdgpu.rs`).
 use crate::{Adapter, stack::Control};
+use stela_driver_core::amd_metal;
 
 include!(concat!(env!("OUT_DIR"), "/amdgpu_devices.rs"));
 
@@ -28,10 +29,23 @@ fn entry(device: u16) -> Option<(u8, Support, bool, u8)> {
         .binary_search_by_key(&device, |(id, ..)| *id)
         .ok()
         .map(|index| {
-            let (_, bits, support, apu, registers) = DEVICES[index];
+            let (.., bits, support, apu, registers) = DEVICES[index];
             (bits, support, apu, registers)
         })
 }
+
+/// The family (`CHIP_*` without the prefix) and graphics generation of
+/// `device`, if the table names it by ID.
+pub fn generation(device: u16) -> Option<(&'static str, u8)> {
+    DEVICES
+        .binary_search_by_key(&device, |(id, ..)| *id)
+        .ok()
+        .map(|index| (DEVICES[index].1, DEVICES[index].2))
+}
+
+/// Every device IP discovery identifies is of a generation that serves the
+/// Metal device, so one the table matches by class is claimed.
+const _: () = assert!(DISCOVERY_GENERATION >= amd_metal::FIRST_GENERATION);
 
 /// The table's mask bits and probe answer for `device`, if it names it.
 fn listed(device: u16) -> Option<(u8, Support)> {
@@ -45,14 +59,21 @@ fn discovered(adapter: &Adapter) -> bool {
     CLASSES.contains(&class)
 }
 
-/// Whether amdgpu's probe takes the adapter: its table holds it, by ID or by
-/// class, the driver does not leave it to radeon, and this build holds its
-/// family's support.
+/// Whether Stela drives the adapter with amdgpu: its table holds it, by ID
+/// or by class, the driver does not leave it to radeon, RADV's device on its
+/// family can serve the Metal device ([`amd_metal::serves`]), and this build
+/// holds its family's support. A GPU that cannot serve the Metal device is
+/// left out whole: Stela does not drive it for its displays alone.
 pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
     if LEFT_TO_RADEON.binary_search(&adapter.device).is_ok() {
         return Err(
             "amdgpu leaves this GPU to an older driver (radeon, r128 or mach64), which is not ported to Stela",
         );
+    }
+    if let Some((family, generation)) = generation(adapter.device)
+        && !amd_metal::serves(family, generation)
+    {
+        return Err(amd_metal::LEFT_OUT);
     }
     match listed(adapter.device) {
         Some((_, Support::Probed)) => Ok(()),
@@ -294,20 +315,74 @@ mod tests {
         // A device of the list amdgpu leaves to radeon, VGA class or not.
         let radeon = adapter(LEFT_TO_RADEON[0], [3, 0, 0]);
         assert!(admits(&radeon).unwrap_err().contains("radeon"));
-        // Southern and Sea Islands, which amdgpu's probe takes by default:
-        // Tahiti (SI, GMC 6), Hainan (SI, no display), Bonaire and Kaveri
-        // (CIK, GMC 7), all with 40-bit masks. The profile builds every
-        // family's support, so the probe refuses none.
-        for device in [0x6798, 0x6660, 0x6649, 0x1304] {
+    }
+
+    #[test]
+    fn a_gpu_whose_radv_device_cannot_serve_metal_is_left_out() {
+        // Southern and Sea Islands, GFX6 and GFX7: Tahiti, Hainan (no
+        // display), Bonaire and Kaveri. RADV has no half-float arithmetic
+        // there. Arcturus and Aldebaran are compute accelerators RADV opens
+        // no device on.
+        for (device, family, generation) in [
+            (0x6798, "TAHITI", 6),
+            (0x6660, "HAINAN", 6),
+            (0x6649, "BONAIRE", 7),
+            (0x1304, "KAVERI", 7),
+            (0x738c, "ARCTURUS", 9),
+            (0x7408, "ALDEBARAN", 9),
+        ] {
+            assert_eq!(super::generation(device), Some((family, generation)));
             let gpu = adapter(device, [3, 0, 0]);
-            assert_eq!(admits(&gpu), Ok(()), "{device:04x}");
-            assert_eq!(dma_bits(&gpu), 40, "{device:04x}");
+            assert_eq!(admits(&gpu), Err(amd_metal::LEFT_OUT), "{device:04x}");
         }
-        assert!(
-            DEVICES
-                .iter()
-                .all(|(_, _, support, ..)| *support == Support::Probed)
-        );
+        // Topaz, Polaris 10, Vega 10, Navi 10 and Navi 21 serve it.
+        for (device, generation) in [
+            (0x6900, 8),
+            (0x67df, 8),
+            (0x6860, 9),
+            (0x731f, 9),
+            (0x73bf, 9),
+        ] {
+            assert_eq!(
+                super::generation(device).map(|(_, generation)| generation),
+                Some(generation),
+                "{device:04x}"
+            );
+            assert_eq!(admits(&adapter(device, [3, 0, 0])), Ok(()), "{device:04x}");
+        }
+        // Every device of the table is admitted exactly where the rule
+        // says its family serves, and the image holds no support for a
+        // generation that does not: the profile leaves it unbuilt.
+        for &(device, family, generation, _, support, ..) in DEVICES {
+            let serves = amd_metal::serves(family, generation);
+            assert_eq!(
+                admits(&adapter(device, [3, 0, 0])).is_ok(),
+                serves,
+                "{device:04x} {family}"
+            );
+            assert_eq!(
+                matches!(support, Support::NotBuilt(_)),
+                generation < amd_metal::FIRST_GENERATION,
+                "{device:04x} {family}"
+            );
+        }
+        // A device discovery identifies is GFX9 or later.
+        assert_eq!(DISCOVERY_GENERATION, 9);
+    }
+
+    /// Each requirement the rule names is one the Metal device checks, so a
+    /// requirement the layer drops cannot keep a GPU out.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_rules_requirements_are_the_metal_devices() {
+        use crate::metal::vulkan::{backend::requirements, physical::Features};
+        let checked = requirements(&Features::default());
+        for (name, _) in amd_metal::LATE_REQUIREMENTS {
+            assert!(
+                checked.iter().any(|requirement| requirement.name == *name),
+                "{name} is no requirement of the Metal device"
+            );
+        }
     }
 
     #[test]

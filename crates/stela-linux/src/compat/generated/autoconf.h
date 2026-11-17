@@ -91,13 +91,10 @@
  * calculation takes there; Stela's arch compiles for x86-64, so the
  * dependency's reason holds. */
 #define CONFIG_DRM_AMDGPU 1
-/* amdgpu's support of Southern Islands and Sea Islands GPUs, which its
- * probe uses by default for both (`amdgpu_support_enabled`); only amdgpu's
- * own units read these. Display Core for Southern Islands
- * (DRM_AMD_DC_SI) stays off, as by default: those GPUs show through
- * amdgpu's own DCE 6 display code. */
-#define CONFIG_DRM_AMDGPU_SI 1
-#define CONFIG_DRM_AMDGPU_CIK 1
+/* amdgpu's support of Southern Islands and Sea Islands GPUs
+ * (DRM_AMDGPU_SI, DRM_AMDGPU_CIK) stays off: RADV's device on those
+ * graphics generations cannot serve the Metal device, so Stela leaves
+ * their GPUs out (stela-driver-core's `amd_metal`). */
 #define CONFIG_DRM_AMD_DC 1
 #define CONFIG_DRM_AMD_DC_FP 1
 #define CONFIG_DRM_DISPLAY_DSC_HELPER 1

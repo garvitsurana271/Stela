@@ -276,10 +276,10 @@ pub static INTEL: GpuStack = GpuStack {
 /// tables hold (Tiger Lake to Meteor Lake, DG1, DG2) is xe's, as Linux binds
 /// it with xe registered first and probing every device of its table; i915
 /// drives the devices of the rest of its table that ANV opens: Skylake to
-/// Ice Lake (`crate::i915::admits`). For now it drives displays only: ANV's
-/// CPU mappings of i915's objects fault through Linux page tables Stela's
-/// clients do not have (`remap_io_sg`), and the Intel admission knows xe's
-/// devices only.
+/// Ice Lake (`crate::i915::admits`). ANV, over i915's uAPI, is its Vulkan
+/// driver when the image holds it, and the Metal device admits its GPUs as
+/// it admits xe's. Whether a GPU serves the Metal device is
+/// [`metal_devices`]' choice, as for xe's.
 #[cfg(feature = "i915-port")]
 pub static INTEL_I915: GpuStack = GpuStack {
     vendor: Vendor::Intel,
@@ -300,8 +300,10 @@ pub static INTEL_I915: GpuStack = GpuStack {
         reset: None,
     },
     #[cfg(feature = "metal")]
-    metal: None,
-    #[cfg(all(feature = "metal-linked", not(test)))]
+    metal: Some(crate::metal::intel::I915_ADMISSION),
+    #[cfg(all(feature = "metal-linked", not(test), stela_vulkan_intel))]
+    vulkan: Some(crate::metal::intel::DRIVER),
+    #[cfg(all(feature = "metal-linked", not(test), not(stela_vulkan_intel)))]
     vulkan: None,
 };
 
@@ -700,10 +702,10 @@ mod tests {
             let stack = GpuStack::select(&with(device)).unwrap();
             assert_eq!(stack.kernel.driver, driver);
         }
-        // i915's GPUs drive displays only.
+        // This test binary links no Vulkan driver, ANV included.
         assert!(!INTEL_I915.draws());
         #[cfg(feature = "metal")]
-        assert!(INTEL_I915.metal.is_none());
+        assert!(INTEL_I915.metal.is_some());
         // Broadwell, Haswell, i830, the IDs Mesa leaves out and Nova Lake,
         // which xe names no GuC image for, are no driver's.
         for device in [0x1616, 0x0416, 0x3577, 0x8a70, 0x4c80, 0xd750] {

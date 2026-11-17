@@ -105,7 +105,7 @@ pub enum Refusal {
     Nvidia(nvidia::Refusal),
     #[cfg(feature = "amdgpu-port")]
     Amd(crate::metal::amd::Refusal),
-    #[cfg(feature = "xe-port")]
+    #[cfg(any(feature = "xe-port", feature = "i915-port"))]
     Intel(crate::metal::intel::Refusal),
 }
 

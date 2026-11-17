@@ -53,16 +53,16 @@ pub const XE_VERSION: u8 = 12;
 /// a marked device. A GPU not handed over is not claimed, keeps the
 /// firmware's screen and is reported as any GPU without a driver is.
 pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
-    match platform(adapter.device) {
-        Some(platform)
-            if !platform.forced
-                && platform.version < XE_VERSION
-                && crate::anv::opens(adapter.device) =>
-        {
-            Ok(())
-        }
-        _ => Err(adapter.unavailable_reason()),
-    }
+    handed(adapter.device)
+        .map(|_| ())
+        .ok_or_else(|| adapter.unavailable_reason())
+}
+
+/// What i915's table says of `device`, if i915 is handed it ([`admits`]).
+pub fn handed(device: u16) -> Option<Platform> {
+    platform(device).filter(|platform| {
+        !platform.forced && platform.version < XE_VERSION && crate::anv::opens(device)
+    })
 }
 
 /// The DMA mask i915 sets on the adapter. One outside its table is never

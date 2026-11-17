@@ -59,5 +59,7 @@
 !/src/nouveau/ci/
 !/src/nouveau/drm-shim/
 !/src/intel/tools/
+# Mesa's i915 no-op shim, which the host test of ANV on i915 compiles.
+/src/intel/tools/intel_noop_drm_shim.c
 !/src/intel/executor/
 !/src/intel/nullhw-layer/

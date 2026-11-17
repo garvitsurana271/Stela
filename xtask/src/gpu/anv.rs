@@ -1,17 +1,18 @@
-//! ANV on xe without a GPU, on the build host: Mesa built for this machine
-//! with the image's ANV options, its objects linked into a test program as
-//! Mesa links its driver, with Stela's libdrm stand-in
+//! ANV on xe and on i915 without a GPU, on the build host: Mesa built for
+//! this machine with the image's ANV options, its objects linked into a test
+//! program as Mesa links its driver, with Stela's libdrm stand-in
 //! (`compat/mesa/drm.c`) in libdrm's place and Stela's NIR options hook,
-//! run over an xe render node that answers xe's queries and accepts its
-//! binds and submissions without running them
-//! (`intel/hosted/xe_noop_drm_shim.c`, on Mesa's DRM shim). For each
-//! platform xe binds, the program creates ANV's device, builds a compute
-//! pipeline through BRW from SPIR-V and one from NIR, as the Metal device
-//! passes the AIR compiler's NIR, and submits one dispatch
-//! (`intel/tests/anv_device.c`); every xe ioctl ANV made must be one Stela's
-//! xe registers. It also counts the platforms where ANV meets the Metal
-//! device's Vulkan requirements and reads and writes Metal's tier 2
-//! read-write texture formats.
+//! run over a render node that answers the kernel driver's queries and
+//! accepts its binds and submissions without running them: xe's
+//! (`intel/hosted/xe_noop_drm_shim.c`) or Mesa's own i915 shim
+//! (`intel/hosted/i915_noop_drm_shim.c`), on Mesa's DRM shim. For each
+//! device each driver binds, the program creates ANV's device, builds a
+//! compute pipeline through BRW from SPIR-V and one from NIR, as the Metal
+//! device passes the AIR compiler's NIR, and submits one dispatch
+//! (`intel/tests/anv_device.c`); every ioctl ANV made must be one Stela's
+//! driver serves on a render node. It also counts the devices where ANV
+//! meets the Metal device's Vulkan requirements and reads and writes Metal's
+//! tier 2 read-write texture formats.
 //!
 //! Needs what ANV's image build needs (`clc.rs`: mesa_clc's LLVM, Clang,
 //! SPIRV-LLVM-Translator and SPIRV-Tools, and glslang) and the host's
@@ -31,6 +32,42 @@ use std::{
 #[allow(dead_code)]
 #[path = "../../../crates/stela-driver-gpu/build/xe_tables.rs"]
 mod xe_tables;
+
+/// i915's own tables, read as its build reads them.
+#[allow(dead_code)]
+#[path = "../../../crates/stela-driver-gpu/build/i915_tables.rs"]
+mod i915_tables;
+
+/// A kernel driver ANV runs over in the test.
+struct Kernel {
+    name: &'static str,
+    /// Its no-op render node, under `crates/stela-driver-gpu/src`.
+    shim: &'static str,
+    /// Where it registers its ioctls, under Linux's tree, and their prefix.
+    ioctls: (&'static str, &'static str),
+}
+
+const XE: Kernel = Kernel {
+    name: "xe",
+    shim: "intel/hosted/xe_noop_drm_shim.c",
+    ioctls: ("drivers/gpu/drm/xe/xe_device.c", "XE_"),
+};
+const I915: Kernel = Kernel {
+    name: "i915",
+    shim: "intel/hosted/i915_noop_drm_shim.c",
+    ioctls: ("drivers/gpu/drm/i915/i915_driver.c", "I915_"),
+};
+
+/// The graphics versions ANV drives (`anv_physical_device_try_create`
+/// refuses the rest). i915 drives the earlier ones with displays only: the
+/// image's ANV has no Gen8 compiler (`-Dintel-elk=false`), and hasvk, Mesa's
+/// Vulkan driver for Gen7 and Gen8, lacks the Metal device's descriptor
+/// indexing, update-after-bind and non-uniform image indexing, its
+/// formatless storage image reads, unused-attachment dynamic rendering and
+/// unrestricted dynamic topology (`vulkan_hasvk/anv_device.c`); Gen7 also
+/// lacks buffer device addresses and half floats, and Ivy Bridge
+/// conditional rendering.
+const ANV_VERSIONS: std::ops::RangeInclusive<u8> = 9..=11;
 
 /// A device of xe's table that Stela's xe stack admits, as the test treats
 /// it: run on ANV, or listed as one ANV does not drive.
@@ -89,6 +126,58 @@ fn devices() -> Result<Vec<Device>> {
     }
     ensure!(!devices.is_empty(), "xe's table admits no device");
     Ok(devices)
+}
+
+/// The devices of i915's PCI ID table that i915 binds without force probe
+/// and xe's table does not hold (those are xe's), with Mesa's answer for
+/// each, from Gen9 on; and how many of i915's earlier devices there are, by
+/// graphics version, which show displays only by rule ([`ANV_VERSIONS`]).
+fn i915_devices() -> Result<(Vec<Device>, std::collections::BTreeMap<u8, usize>)> {
+    let linux = third_party("linux");
+    let read = |path: PathBuf| {
+        fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+    };
+    let ids = read(linux.join("include/drm/intel/pciids.h"))?;
+    let xe = xe_tables::devices(&read(linux.join("drivers/gpu/drm/xe/xe_pci.c"))?, &ids)
+        .map_err(|error| anyhow::anyhow!("xe's PCI ID table: {error}"))?;
+    let table = i915_tables::devices(&read(linux.join("drivers/gpu/drm/i915/i915_pci.c"))?, &ids)
+        .map_err(|error| anyhow::anyhow!("i915's PCI ID table: {error}"))?;
+    let mesa = mesa_devices(&read(
+        third_party("mesa").join("include/pci_ids/iris_pci_ids.h"),
+    )?);
+    let mut devices = Vec::new();
+    let mut earlier = std::collections::BTreeMap::new();
+    for (id, described) in table {
+        if described.forced || xe.contains_key(&id) {
+            continue;
+        }
+        if described.version < *ANV_VERSIONS.start() {
+            *earlier.entry(described.version).or_default() += 1;
+            continue;
+        }
+        ensure!(
+            ANV_VERSIONS.contains(&described.version),
+            "i915 binds {id:04x}, of graphics version {}, which xe's table does not hold",
+            described.version
+        );
+        let listed = mesa.get(&id);
+        devices.push(Device {
+            id,
+            platform: described.platform,
+            family: listed.map(|(family, _)| family.clone()),
+            discrete: described.discrete,
+            absent: match listed {
+                None => Some("Mesa's Intel device table does not list it"),
+                Some((_, true)) => Some("Mesa lists it only for its force probe"),
+                Some((_, false)) => None,
+            },
+        });
+    }
+    ensure!(
+        !devices.is_empty(),
+        "i915's table holds no Gen9 to Gen11 device"
+    );
+    Ok((devices, earlier))
 }
 
 /// Mesa's Intel device table: each PCI device ID with its family and
@@ -186,19 +275,62 @@ pub fn test(jobs: u16) -> Result<()> {
             .args(&targets)
             .env("PATH", &path),
     )?;
-    let (shim, program) = link_test(&build, &output, &link, &tools.glslang.0)?;
-    let registered = hosted::registered_ioctls(
-        &fs::read_to_string(third_party("linux").join("drivers/gpu/drm/xe/xe_device.c"))?,
-        "XE_",
-    );
-    ensure!(!registered.is_empty(), "xe_device.c registers no ioctl");
-    let devices = devices()?;
+    let (shims, program) = link_test(&build, &output, &link, &tools.glslang.0)?;
     let mut failures = Vec::new();
+    run(
+        &XE,
+        &devices()?,
+        &program,
+        &shims[0],
+        &output,
+        &mut failures,
+    )?;
+    let (devices, earlier) = i915_devices()?;
+    run(&I915, &devices, &program, &shims[1], &output, &mut failures)?;
+    for (version, count) in &earlier {
+        println!(
+            "i915 graphics version {version}: {count} devices show displays only by rule: \
+             ANV drives graphics versions {} to {} of i915's, and hasvk lacks the Metal \
+             device's requirements",
+            ANV_VERSIONS.start(),
+            ANV_VERSIONS.end()
+        );
+    }
+    ensure!(
+        failures.is_empty(),
+        "ANV failed on the host (logs in {}):\n{}",
+        output.display(),
+        failures.join("\n")
+    );
+    Ok(())
+}
+
+/// Runs the test program over `kernel`'s shim for each of `devices`, logging
+/// each run's output beside the program, and adds each failure to
+/// `failures`.
+fn run(
+    kernel: &Kernel,
+    devices: &[Device],
+    program: &Path,
+    shim: &Path,
+    output: &Path,
+    failures: &mut Vec<String>,
+) -> Result<()> {
+    let (registry, prefix) = kernel.ioctls;
+    let served = hosted::render_ioctls(
+        &fs::read_to_string(third_party("linux").join(registry))?,
+        prefix,
+    );
+    ensure!(
+        !served.is_empty(),
+        "{registry} serves no ioctl on a render node"
+    );
+    let marker = format!("{} shim: ioctls", kernel.name);
     let (mut run, mut metal, mut read_write) = (0, 0, 0);
     // Each Mesa family's devices, and how many met the Metal device's
     // requirements and the tier 2 formats.
     let mut families = std::collections::BTreeMap::<String, (usize, usize, usize)>::new();
-    for device in &devices {
+    for device in devices {
         let id = format!("{:04x}", device.id);
         let name = format!(
             "{id} {} ({})",
@@ -209,7 +341,7 @@ pub fn test(jobs: u16) -> Result<()> {
             println!("{name}: no Vulkan device from ANV ({reason}): shows displays only");
             continue;
         }
-        let result = Command::new(&program)
+        let result = Command::new(program)
             .args([
                 id.as_str(),
                 if device.discrete {
@@ -217,27 +349,28 @@ pub fn test(jobs: u16) -> Result<()> {
                 } else {
                     "integrated"
                 },
+                kernel.name,
             ])
-            .env("LD_PRELOAD", &shim)
+            .env("LD_PRELOAD", shim)
             .env("INTEL_STUB_GPU_DEVICE_ID", &id)
             .stdin(Stdio::null())
             .output()?;
         let stdout = String::from_utf8_lossy(&result.stdout);
         let stderr = String::from_utf8_lossy(&result.stderr);
         fs::write(
-            output.join(format!("{id}.log")),
+            output.join(format!("{}-{id}.log", kernel.name)),
             format!("{stdout}{stderr}"),
         )?;
-        let used = hosted::used_ioctls(&stderr, "xe shim: ioctls");
-        let unregistered: Vec<_> = used
+        let used = hosted::used_ioctls(&stderr, &marker);
+        let unserved: Vec<_> = used
             .keys()
-            .filter(|ioctl| !registered.contains(ioctl))
+            .filter(|ioctl| !served.contains(ioctl))
             .cloned()
             .collect();
         match (
             result.status.success(),
             used.is_empty(),
-            unregistered.is_empty(),
+            unserved.is_empty(),
         ) {
             (true, false, true) => {
                 run += 1;
@@ -253,7 +386,8 @@ pub fn test(jobs: u16) -> Result<()> {
                 family.2 += usize::from(formats);
                 println!("{name}: {}", stdout.trim().replace('\n', "; "));
                 println!(
-                    "  xe ioctls: {}",
+                    "  {} ioctls: {}",
+                    kernel.name,
                     used.iter()
                         .map(|(ioctl, count)| format!("{ioctl} {count}"))
                         .collect::<Vec<_>>()
@@ -261,34 +395,32 @@ pub fn test(jobs: u16) -> Result<()> {
                 );
             }
             (true, _, false) => failures.push(format!(
-                "{name}: ANV used ioctls Stela's xe does not register: {}",
-                unregistered.join(", ")
+                "{name}: ANV used ioctls Stela's {} does not serve on a render node: {}",
+                kernel.name,
+                unserved.join(", ")
             )),
             _ => failures.push(format!(
-                "{name} failed with {}: {}",
+                "{name} on {} failed with {}: {}",
+                kernel.name,
                 result.status,
                 stderr.trim()
             )),
         }
     }
-    ensure!(
-        failures.is_empty(),
-        "ANV on xe failed on the host (logs in {}):\n{}",
-        output.display(),
-        failures.join("\n")
-    );
     for (family, (count, met, formats)) in &families {
         println!(
-            "Mesa family {family}: {count} devices, Metal requirements met on {met}, \
-             tier 2 read-write formats on {formats}"
+            "Mesa family {family} on {}: {count} devices, Metal requirements met on {met}, \
+             tier 2 read-write formats on {formats}",
+            kernel.name
         );
     }
     let absent = devices.len() - run;
     println!(
-        "ANV ran on xe's ioctls for {run} devices of xe's table, with no GPU; the Metal \
+        "ANV ran on {0}'s ioctls for {run} devices of {0}'s table, with no GPU; the Metal \
          device's Vulkan requirements are met on {metal} of them, and Metal's tier 2 \
          read-write texture formats on {read_write}; {absent} devices get no Vulkan device \
-         from ANV and show displays only"
+         from ANV and show displays only",
+        kernel.name
     );
     Ok(())
 }
@@ -299,13 +431,13 @@ const METAL_MET: &str = "Metal device: every requirement met";
 /// Metal's read-write texture tier 2.
 const READ_WRITE_MET: &str = "Metal read-write textures: every tier 2 format read and written";
 
-/// Builds the shim and the test program; their paths.
+/// Builds the xe and i915 shims and the test program; their paths.
 fn link_test(
     build: &Path,
     output: &Path,
     link: &[String],
     glslang: &Path,
-) -> Result<(PathBuf, PathBuf)> {
+) -> Result<(Vec<PathBuf>, PathBuf)> {
     let sources = gpu();
     crate::tools::exec(
         Command::new(glslang)
@@ -321,21 +453,7 @@ fn link_test(
             .arg(sources.join("intel/tests/anv_device.comp"))
             .stdout(Stdio::null()),
     )?;
-    let shim_object = output.join("xe_noop_drm_shim.o");
-    crate::tools::exec(
-        hosted::compile_command(
-            build,
-            SHIM_MODEL,
-            &sources.join("intel/hosted/xe_noop_drm_shim.c"),
-            &shim_object,
-        )?
-        .args(["-fPIC", "-Isrc/intel", "-Isrc/intel/dev"])
-        .arg(format!(
-            "-I{}",
-            third_party("mesa").join("src/intel").display()
-        )),
-    )?;
-    // The shim's stat and stat64 come first (see the shim's source).
+    // The DRM shim's stat and stat64 come first (see the xe shim's source).
     let renamed = output.join("drm_shim.o");
     crate::tools::exec(
         Command::new("objcopy")
@@ -348,19 +466,33 @@ fn link_test(
             .arg(build.join(SHIM_OBJECTS[0]))
             .arg(&renamed),
     )?;
-    let shim = output.join("xe_noop_drm_shim.so");
-    crate::tools::exec(
-        Command::new("cc")
-            .current_dir(build)
-            .arg("-shared")
-            .arg("-o")
-            .arg(&shim)
-            .arg(&shim_object)
-            .arg(&renamed)
-            .arg(SHIM_OBJECTS[1])
-            .args(SHIM_ARCHIVES)
-            .args(["-ldl", "-lpthread", "-lm"]),
-    )?;
+    let mut shims = Vec::new();
+    for kernel in [&XE, &I915] {
+        let stem = Path::new(kernel.shim).file_stem().context("shim name")?;
+        let shim_object = output.join(stem).with_extension("o");
+        crate::tools::exec(
+            hosted::compile_command(build, SHIM_MODEL, &sources.join(kernel.shim), &shim_object)?
+                .args(["-fPIC", "-Isrc/intel", "-Isrc/intel/dev"])
+                .arg(format!(
+                    "-I{}",
+                    third_party("mesa").join("src/intel").display()
+                )),
+        )?;
+        let shim = output.join(stem).with_extension("so");
+        crate::tools::exec(
+            Command::new("cc")
+                .current_dir(build)
+                .arg("-shared")
+                .arg("-o")
+                .arg(&shim)
+                .arg(&shim_object)
+                .arg(&renamed)
+                .arg(SHIM_OBJECTS[1])
+                .args(SHIM_ARCHIVES)
+                .args(["-ldl", "-lpthread", "-lm"]),
+        )?;
+        shims.push(shim);
+    }
     let libc = format!("-idirafter{}", sources.join("compat/libc").display());
     let units = [
         (
@@ -398,7 +530,7 @@ fn link_test(
     let program = output.join("anv_device");
     let words = hosted::program_link(link, &program, &objects, &libdrm);
     crate::tools::exec(Command::new(&words[0]).current_dir(build).args(&words[1..]))?;
-    Ok((shim, program))
+    Ok((shims, program))
 }
 
 #[cfg(test)]

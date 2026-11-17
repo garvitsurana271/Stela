@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* ANV on xe with no GPU: the image's route to a device, run on the host.
+/* ANV on xe or i915 with no GPU: the image's route to a device, run on the host.
  * The program links ANV's objects as Mesa links its driver, Stela's libdrm
  * stand-in (compat/mesa/drm.c) in place of libdrm, and Stela's NIR options
- * hook (compat/mesa/anv_nir_options.c), and runs over the xe no-op shim
- * (intel/hosted/xe_noop_drm_shim.c) preloaded. It creates the instance and
+ * hook (compat/mesa/anv_nir_options.c), and runs over the kernel driver's
+ * no-op shim (intel/hosted/xe_noop_drm_shim.c or i915_noop_drm_shim.c)
+ * preloaded. It creates the instance and
  * the device of the one GPU the shim shows, checks what Vulkan reports of it
  * against the expected device, asks the hook for each stage's NIR options,
  * builds a compute pipeline from SPIR-V (BRW compiles it; its statistics count
@@ -19,9 +20,9 @@
  * test: the Metal device refuses such a device, or reports the tier absent,
  * when it opens.
  *
- * Usage: anv_device DEVICE-ID integrated|discrete
+ * Usage: anv_device DEVICE-ID integrated|discrete xe|i915
  * Prints a "Metal device: ..." line, a "Metal read-write textures: ..." line
- * and a line "ANV on xe: ..." and exits 0, or names the failed check. */
+ * and a line "ANV on <driver>: ..." and exits 0, or names the failed check. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -296,7 +297,7 @@ static void brw_statistics(VkDevice device,
 
 int main(int argc, char **argv)
 {
-	CHECK(argc == 3);
+	CHECK(argc == 4);
 	expected_device = (uint16_t)strtoul(argv[1], NULL, 16);
 	VkPhysicalDeviceType expected_type = !strcmp(argv[2], "discrete")
 						     ? VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
@@ -667,10 +668,10 @@ int main(int argc, char **argv)
 	vkDestroyShaderModule(device, module, NULL);
 	vkDestroyDevice(device, NULL);
 	vkDestroyInstance(instance, NULL);
-	printf("ANV on xe: %s (0x%04x, %s), NIR options for %u stages, compute pipeline of %llu "
+	printf("ANV on %s: %s (0x%04x, %s), NIR options for %u stages, compute pipeline of %llu "
 	       "instructions in %llu bytes from SPIR-V and of %llu instructions in %llu bytes "
 	       "from NIR, one dispatch submitted\n",
-	       properties.properties.deviceName, expected_device, argv[2], STAGES,
+	       argv[3], properties.properties.deviceName, expected_device, argv[2], STAGES,
 	       (unsigned long long)instructions, (unsigned long long)code_bytes,
 	       (unsigned long long)nir_instructions, (unsigned long long)nir_code_bytes);
 	return 0;

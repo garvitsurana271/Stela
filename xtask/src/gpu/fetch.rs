@@ -371,7 +371,7 @@ pub fn export() -> Result<()> {
         let patches = submodule.patches_directory();
         let mut names = HashMap::new();
         for patch in submodule.patches()? {
-            names.insert(subject(&patch)?, name(&patch));
+            names.insert(subject(&patch)?, (name(&patch), author(&patch)?));
             fs::remove_file(patch)?;
         }
         if submodule.head()? != submodule.pin {
@@ -399,8 +399,13 @@ pub fn export() -> Result<()> {
                     break;
                 }
                 let subject = subject(&patch)?;
-                let name = names.remove(&subject).unwrap_or_else(|| slug(&subject));
-                let text = publish_header(&fs::read_to_string(&patch)?, &identity)
+                // A patch already in the series keeps its name and the
+                // author it names; a new one gets the configured identity.
+                let (name, author) = names
+                    .remove(&subject)
+                    .unwrap_or_else(|| (slug(&subject), None));
+                let author = author.as_deref().unwrap_or(&identity);
+                let text = publish_header(&fs::read_to_string(&patch)?, author)
                     .with_context(|| patch.display().to_string())?;
                 fs::write(patches.join(format!("{number:04}-{name}.patch")), text)?;
                 fs::remove_file(patch)?;
@@ -414,7 +419,7 @@ pub fn export() -> Result<()> {
 }
 
 /// The repository's configured `user.name <user.email>`, which `export`
-/// writes as the author of Stela's own patches.
+/// writes as the author of each patch new to the series.
 fn identity() -> Result<String> {
     let field = |key: &str| -> Result<String> {
         let value = capture(git(tools::root()).args(["config", key])).with_context(|| {
@@ -431,8 +436,11 @@ fn identity() -> Result<String> {
 
 /// A patch with its header's `From:` set to `identity` and its `Date:` set to
 /// the same instant in UTC, so the series carries neither a submodule commit's
-/// own author address nor its time zone. A patch whose message has a
-/// `Signed-off-by:` trailer is upstream work and keeps its author and date.
+/// own author address nor its time zone. `identity` is the configured one for
+/// a new patch and the author the series already names for one it holds
+/// ([`author`]), so a contributor's patch stays theirs. A patch whose message
+/// has a `Signed-off-by:` trailer is upstream work and keeps its author and
+/// date.
 fn publish_header(patch: &str, identity: &str) -> Result<String> {
     let message = patch.split("\n---\n").next().unwrap_or(patch);
     if message
@@ -546,6 +554,16 @@ fn subject(patch: &Path) -> Result<String> {
         subject.push_str(line);
     }
     Ok(subject)
+}
+
+/// The author a patch's header names, which `export` keeps while the
+/// commit's subject stays the same.
+fn author(patch: &Path) -> Result<Option<String>> {
+    Ok(fs::read_to_string(patch)?
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| line.strip_prefix("From: "))
+        .map(str::to_owned))
 }
 
 /// A patch file's name between its number and extension, which `export`
@@ -682,6 +700,23 @@ mod tests {
             "meson: build Stela's shader compiler libraries without API drivers"
         );
         assert_eq!(name(&patch), "stela-compilers");
+        // A patch names its author in its header only.
+        assert_eq!(author(&patch)?, None);
+        fs::write(
+            &patch,
+            "From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\n\
+             From: A Contributor <contributor@example.org>\n\
+             Subject: [PATCH] meson: build Stela's shader compiler libraries without API\n \
+             drivers\n\nFrom: a body line\n---\n",
+        )?;
+        let kept = author(&patch)?;
+        assert_eq!(
+            kept.as_deref(),
+            Some("A Contributor <contributor@example.org>")
+        );
+        // Exported again, the patch still names that author.
+        let again = publish_header(&fs::read_to_string(&patch)?, kept.as_deref().unwrap())?;
+        assert_eq!(again, fs::read_to_string(&patch)?);
         assert_eq!(slug(&subject(&patch)?), "build-stelas-shader");
         assert_eq!(slug("brw: Add Xe3P (GFX_VERx10 == 350)"), "add-xe3p-gfx");
         Ok(())

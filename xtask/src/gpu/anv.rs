@@ -58,41 +58,92 @@ const I915: Kernel = Kernel {
     ioctls: ("drivers/gpu/drm/i915/i915_driver.c", "I915_"),
 };
 
-/// The graphics versions ANV drives (`anv_physical_device_try_create`
-/// refuses the rest). i915 drives the earlier ones with displays only: the
-/// image's ANV has no Gen8 compiler (`-Dintel-elk=false`), and hasvk, Mesa's
-/// Vulkan driver for Gen7 and Gen8, lacks the Metal device's descriptor
-/// indexing, update-after-bind and non-uniform image indexing, its
-/// formatless storage image reads, unused-attachment dynamic rendering and
-/// unrestricted dynamic topology (`vulkan_hasvk/anv_device.c`); Gen7 also
-/// lacks buffer device addresses and half floats, and Ivy Bridge
-/// conditional rendering.
-const ANV_VERSIONS: std::ops::RangeInclusive<u8> = 9..=11;
+/// Mesa's own tables for ANV, read as the image's build reads them for the
+/// drivers' admission (`crates/stela-driver-gpu/src/anv.rs`).
+#[path = "../../../crates/stela-driver-gpu/build/anv_tables.rs"]
+mod anv_tables;
 
-/// A device of xe's table that Stela's xe stack admits, as the test treats
-/// it: run on ANV, or listed as one ANV does not drive.
+/// A device of a kernel driver's table that Mesa's Intel table lists, as
+/// the test treats it.
 struct Device {
     id: u16,
-    /// xe's platform and Mesa's device family, for the log.
+    /// The kernel driver's platform and Mesa's device family, for the log.
     platform: String,
-    family: Option<String>,
-    /// xe's `is_dgfx`: Vulkan must report a discrete GPU.
+    family: String,
+    /// The kernel driver's `is_dgfx`: Vulkan must report a discrete GPU.
     discrete: bool,
-    /// Why ANV has no Vulkan device for it, by Mesa's own table: the GPU
-    /// shows displays only and the Metal device goes elsewhere.
-    absent: Option<&'static str>,
+    /// Whether ANV creates a physical device for it (`anv_tables::opened`),
+    /// which is the drivers' admission: the test runs ANV on it. One it
+    /// does not open is handed to no driver, and the test checks that ANV
+    /// gives no Vulkan device for it.
+    opened: bool,
+}
+
+/// The devices of one kernel driver's table the test covers, and how many
+/// of the table Mesa's Intel table does not list at all, by what the kernel
+/// driver calls them: those are handed to no driver, and no shim describes
+/// them, so they are not run.
+#[derive(Default)]
+struct Devices {
+    listed: Vec<Device>,
+    unlisted: std::collections::BTreeMap<String, usize>,
+}
+
+/// Mesa's Intel device table with each device's graphics version, and the
+/// set ANV opens.
+struct Mesa {
+    listed: std::collections::BTreeMap<u16, anv_tables::Listed>,
+    opened: Vec<u16>,
+}
+
+fn read(path: PathBuf) -> Result<String> {
+    fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+}
+
+fn mesa() -> Result<Mesa> {
+    let mesa = third_party("mesa");
+    let listed = anv_tables::devices(
+        &read(mesa.join("include/pci_ids/iris_pci_ids.h"))?,
+        &read(mesa.join("src/intel/dev/intel_device_info.c"))?,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let versions =
+        anv_tables::anv_versions(&read(mesa.join("src/intel/vulkan/anv_physical_device.c"))?)
+            .map_err(anyhow::Error::msg)?;
+    let opened = anv_tables::opened(&listed, versions);
+    Ok(Mesa { listed, opened })
+}
+
+impl Mesa {
+    /// Files `id` of a kernel driver's table under `devices`; `unlisted`
+    /// is what to count it under when Mesa's table does not list it.
+    fn file(
+        &self,
+        devices: &mut Devices,
+        id: u16,
+        platform: String,
+        discrete: bool,
+        unlisted: String,
+    ) {
+        match self.listed.get(&id) {
+            None => *devices.unlisted.entry(unlisted).or_default() += 1,
+            Some(listed) => devices.listed.push(Device {
+                id,
+                platform,
+                family: listed.family.clone(),
+                discrete,
+                opened: self.opened.binary_search(&id).is_ok(),
+            }),
+        }
+    }
 }
 
 /// Every device of xe's PCI ID table whose platform xe's firmware table
-/// gives a GuC image (Stela's xe refuses the others before any claim), with
-/// Mesa's answer for it from ANV's device table (`iris_pci_ids.h`): a
-/// device it does not list, or lists only for its force probe, gets no
-/// Vulkan device from ANV.
-fn devices() -> Result<Vec<Device>> {
+/// gives a GuC image: xe's probe ends without one, so the others are handed
+/// to no driver whatever ANV says of them (`crate::xe::admits` in
+/// stela-driver-gpu).
+fn xe_devices(mesa: &Mesa) -> Result<Devices> {
     let linux = third_party("linux");
-    let read = |path: PathBuf| {
-        fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
-    };
     let table = xe_tables::devices(
         &read(linux.join("drivers/gpu/drm/xe/xe_pci.c"))?,
         &read(linux.join("include/drm/intel/pciids.h"))?,
@@ -100,108 +151,60 @@ fn devices() -> Result<Vec<Device>> {
     .map_err(|error| anyhow::anyhow!("xe's PCI ID table: {error}"))?;
     let firmware = xe_tables::uc_firmware(&read(linux.join("drivers/gpu/drm/xe/xe_uc_fw.c"))?)
         .map_err(|error| anyhow::anyhow!("xe's firmware table: {error}"))?;
-    let mesa = mesa_devices(&read(
-        third_party("mesa").join("include/pci_ids/iris_pci_ids.h"),
-    )?);
-    let mut devices = Vec::new();
+    let mut devices = Devices::default();
     for (id, (_, _, platform, _, discrete)) in table {
         if firmware
             .get(&platform)
-            .is_none_or(|files| files[0].is_none())
+            .is_some_and(|files| files[0].is_some())
         {
-            continue;
+            mesa.file(&mut devices, id, platform.clone(), discrete, platform);
         }
-        let listed = mesa.get(&id);
-        devices.push(Device {
-            id,
-            platform,
-            family: listed.map(|(family, _)| family.clone()),
-            discrete,
-            absent: match listed {
-                None => Some("Mesa's Intel device table does not list it"),
-                Some((_, true)) => Some("Mesa lists it only for its force probe"),
-                Some((_, false)) => None,
-            },
-        });
     }
-    ensure!(!devices.is_empty(), "xe's table admits no device");
+    ensure!(
+        devices.listed.iter().any(|device| device.opened),
+        "ANV opens no device of xe's table"
+    );
     Ok(devices)
 }
 
+/// The first graphics version i915 leaves to xe (`XE_VERSION` in
+/// stela-driver-gpu's `i915.rs`).
+const XE_VERSION: u8 = 12;
+
 /// The devices of i915's PCI ID table that i915 binds without force probe
-/// and xe's table does not hold (those are xe's), with Mesa's answer for
-/// each, from Gen9 on; and how many of i915's earlier devices there are, by
-/// graphics version, which show displays only by rule ([`ANV_VERSIONS`]).
-fn i915_devices() -> Result<(Vec<Device>, std::collections::BTreeMap<u8, usize>)> {
+/// and xe's table does not hold (those are xe's).
+fn i915_devices(mesa: &Mesa) -> Result<Devices> {
     let linux = third_party("linux");
-    let read = |path: PathBuf| {
-        fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
-    };
     let ids = read(linux.join("include/drm/intel/pciids.h"))?;
     let xe = xe_tables::devices(&read(linux.join("drivers/gpu/drm/xe/xe_pci.c"))?, &ids)
         .map_err(|error| anyhow::anyhow!("xe's PCI ID table: {error}"))?;
     let table = i915_tables::devices(&read(linux.join("drivers/gpu/drm/i915/i915_pci.c"))?, &ids)
         .map_err(|error| anyhow::anyhow!("i915's PCI ID table: {error}"))?;
-    let mesa = mesa_devices(&read(
-        third_party("mesa").join("include/pci_ids/iris_pci_ids.h"),
-    )?);
-    let mut devices = Vec::new();
-    let mut earlier = std::collections::BTreeMap::new();
+    let mut devices = Devices::default();
     for (id, described) in table {
         if described.forced || xe.contains_key(&id) {
             continue;
         }
-        if described.version < *ANV_VERSIONS.start() {
-            *earlier.entry(described.version).or_default() += 1;
-            continue;
-        }
         ensure!(
-            ANV_VERSIONS.contains(&described.version),
+            described.version < XE_VERSION,
             "i915 binds {id:04x}, of graphics version {}, which xe's table does not hold",
             described.version
         );
-        let listed = mesa.get(&id);
-        devices.push(Device {
+        mesa.file(
+            &mut devices,
             id,
-            platform: described.platform,
-            family: listed.map(|(family, _)| family.clone()),
-            discrete: described.discrete,
-            absent: match listed {
-                None => Some("Mesa's Intel device table does not list it"),
-                Some((_, true)) => Some("Mesa lists it only for its force probe"),
-                Some((_, false)) => None,
-            },
-        });
+            described.platform,
+            described.discrete,
+            format!("graphics version {}", described.version),
+        );
     }
     ensure!(
-        !devices.is_empty(),
-        "i915's table holds no Gen9 to Gen11 device"
+        devices.listed.iter().any(|device| device.opened),
+        "ANV opens no device of i915's table"
     );
-    Ok((devices, earlier))
+    Ok(devices)
 }
 
-/// Mesa's Intel device table: each PCI device ID with its family and
-/// whether Mesa drives it only by force probe.
-fn mesa_devices(table: &str) -> std::collections::BTreeMap<u16, (String, bool)> {
-    let mut devices = std::collections::BTreeMap::new();
-    for line in table.lines() {
-        let Some(entry) = line.trim().strip_prefix("CHIPSET(") else {
-            continue;
-        };
-        let mut fields = entry.split(',').map(str::trim);
-        let (Some(id), Some(family)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        let Some(id) = id
-            .strip_prefix("0x")
-            .and_then(|digits| u16::from_str_radix(digits, 16).ok())
-        else {
-            continue;
-        };
-        devices.insert(id, (family.to_owned(), entry.contains("FORCE_PROBE")));
-    }
-    devices
-}
 /// The driver's link target, whose inputs the test program links.
 const DRIVER: &str = "src/intel/vulkan/libvulkan_intel.so";
 /// One of ANV's own units and one of the DRM shim's, whose flags the test's
@@ -277,25 +280,11 @@ pub fn test(jobs: u16) -> Result<()> {
     )?;
     let (shims, program) = link_test(&build, &output, &link, &tools.glslang.0)?;
     let mut failures = Vec::new();
-    run(
-        &XE,
-        &devices()?,
-        &program,
-        &shims[0],
-        &output,
-        &mut failures,
-    )?;
-    let (devices, earlier) = i915_devices()?;
-    run(&I915, &devices, &program, &shims[1], &output, &mut failures)?;
-    for (version, count) in &earlier {
-        println!(
-            "i915 graphics version {version}: {count} devices show displays only by rule: \
-             ANV drives graphics versions {} to {} of i915's, and hasvk lacks the Metal \
-             device's requirements",
-            ANV_VERSIONS.start(),
-            ANV_VERSIONS.end()
-        );
-    }
+    let mesa = mesa()?;
+    let xe = xe_devices(&mesa)?;
+    run(&XE, &xe, &program, &shims[0], &output, &mut failures)?;
+    let i915 = i915_devices(&mesa)?;
+    run(&I915, &i915, &program, &shims[1], &output, &mut failures)?;
     ensure!(
         failures.is_empty(),
         "ANV failed on the host (logs in {}):\n{}",
@@ -310,7 +299,7 @@ pub fn test(jobs: u16) -> Result<()> {
 /// `failures`.
 fn run(
     kernel: &Kernel,
-    devices: &[Device],
+    devices: &Devices,
     program: &Path,
     shim: &Path,
     output: &Path,
@@ -326,28 +315,20 @@ fn run(
         "{registry} serves no ioctl on a render node"
     );
     let marker = format!("{} shim: ioctls", kernel.name);
-    let (mut run, mut metal, mut read_write) = (0, 0, 0);
+    let (mut run, mut metal, mut read_write, mut refused) = (0, 0, 0, 0);
     // Each Mesa family's devices, and how many met the Metal device's
     // requirements and the tier 2 formats.
     let mut families = std::collections::BTreeMap::<String, (usize, usize, usize)>::new();
-    for device in devices {
+    for device in &devices.listed {
         let id = format!("{:04x}", device.id);
-        let name = format!(
-            "{id} {} ({})",
-            device.platform,
-            device.family.as_deref().unwrap_or("not in Mesa")
-        );
-        if let Some(reason) = device.absent {
-            println!("{name}: no Vulkan device from ANV ({reason}): shows displays only");
-            continue;
-        }
+        let name = format!("{id} {} ({})", device.platform, device.family);
         let result = Command::new(program)
             .args([
                 id.as_str(),
-                if device.discrete {
-                    "discrete"
-                } else {
-                    "integrated"
+                match (device.opened, device.discrete) {
+                    (false, _) => "none",
+                    (true, true) => "discrete",
+                    (true, false) => "integrated",
                 },
                 kernel.name,
             ])
@@ -361,6 +342,20 @@ fn run(
             output.join(format!("{}-{id}.log", kernel.name)),
             format!("{stdout}{stderr}"),
         )?;
+        if !device.opened {
+            // Handed to no driver: ANV must give it no Vulkan device.
+            if result.status.success() && stdout.contains(NO_DEVICE) {
+                refused += 1;
+            } else {
+                failures.push(format!(
+                    "{name} is handed to no driver, but ANV on {} did not refuse it ({}): {}",
+                    kernel.name,
+                    result.status,
+                    stderr.trim()
+                ));
+            }
+            continue;
+        }
         let used = hosted::used_ioctls(&stderr, &marker);
         let unserved: Vec<_> = used
             .keys()
@@ -378,9 +373,7 @@ fn run(
                 let formats = stdout.contains(READ_WRITE_MET);
                 metal += usize::from(met);
                 read_write += usize::from(formats);
-                let family = families
-                    .entry(device.family.clone().unwrap_or_default())
-                    .or_default();
+                let family = families.entry(device.family.clone()).or_default();
                 family.0 += 1;
                 family.1 += usize::from(met);
                 family.2 += usize::from(formats);
@@ -414,17 +407,39 @@ fn run(
             kernel.name
         );
     }
-    let absent = devices.len() - run;
+    let opened = devices.listed.iter().filter(|device| device.opened).count();
     println!(
-        "ANV ran on {0}'s ioctls for {run} devices of {0}'s table, with no GPU; the Metal \
-         device's Vulkan requirements are met on {metal} of them, and Metal's tier 2 \
-         read-write texture formats on {read_write}; {absent} devices get no Vulkan device \
-         from ANV and show displays only",
+        "ANV ran on {0}'s ioctls for {run} of the {opened} devices {0} is handed, with no GPU; \
+         the Metal device's Vulkan requirements are met on {metal} of them, and Metal's tier 2 \
+         read-write texture formats on {read_write}",
         kernel.name
     );
+    // A device handed to a driver must open the Metal device: the drivers'
+    // admission claims no other.
+    if metal != opened || read_write != opened {
+        failures.push(format!(
+            "{} is handed {opened} devices, of which {metal} meet the Metal device's \
+             requirements and {read_write} its tier 2 read-write formats",
+            kernel.name
+        ));
+    }
+    let left_out = devices.listed.len() - opened;
+    println!(
+        "{0} is not handed {left_out} more devices of its table that Mesa lists: ANV gave no \
+         Vulkan device for {refused} of them",
+        kernel.name
+    );
+    for (what, count) in &devices.unlisted {
+        println!(
+            "{} is not handed {count} devices of {what}: Mesa's Intel table does not list them",
+            kernel.name
+        );
+    }
     Ok(())
 }
 
+/// What the test program prints when ANV gives no Vulkan device.
+const NO_DEVICE: &str = "no Vulkan device from ANV";
 /// What the test program prints for a device the Metal device admits.
 const METAL_MET: &str = "Metal device: every requirement met";
 /// What it prints for a device that reads and writes every format of
@@ -545,14 +560,87 @@ mod tests {
         assert!(arguments.contains(&"-Dtools=drm-shim".to_owned()));
     }
 
+    /// The test program checks exactly the Metal device's Vulkan
+    /// requirements, and the dma-buf import its native backend asks for, so
+    /// a device it passes is one the Metal device opens.
     #[test]
-    fn mesas_table_says_which_devices_anv_drives() {
-        let table = "CHIPSET(0x9a49, tgl_gt2, \"TGL GT2\", \"Intel(R) Iris(R) Xe Graphics\")\n\
-                     /* a comment */\n\
-                     CHIPSET(0xd750, nvl_p, \"NVL\", \"Intel(R) Graphics\", FORCE_PROBE)\n";
-        let devices = mesa_devices(table);
-        assert_eq!(devices.get(&0x9a49), Some(&("tgl_gt2".to_owned(), false)));
-        assert_eq!(devices.get(&0xd750), Some(&("nvl_p".to_owned(), true)));
-        assert_eq!(devices.len(), 2);
+    fn the_programs_requirements_are_the_metal_devices() {
+        let read = |path: &str| {
+            fs::read_to_string(crate::tools::root().join(path))
+                .unwrap_or_else(|error| panic!("{path}: {error}"))
+        };
+        // The first string after each `marker` in the part of `text` from
+        // `start` to `end`.
+        let names = |text: &str, start: &str, end: &str, marker: &str| -> Vec<String> {
+            let body = &text[text.find(start).expect(start) + start.len()..];
+            let body = &body[..body.find(end).expect(end)];
+            body.split(marker)
+                .skip(1)
+                .map(|part| {
+                    let part = &part[part.find('"').expect("a name") + 1..];
+                    part[..part.find('"').expect("a name")].to_owned()
+                })
+                .collect()
+        };
+        let metal = names(
+            &read("crates/stela-driver-gpu/src/metal/vulkan/backend.rs"),
+            "pub fn requirements(",
+            "\n    ]\n}",
+            "requirement(",
+        );
+        assert_eq!(metal.len(), 18, "{metal:?}");
+        let mut program = names(
+            &read("crates/stela-driver-gpu/src/intel/tests/anv_device.c"),
+            "} requirements[] = {",
+            "};",
+            "{",
+        );
+        assert_eq!(
+            program.pop().as_deref(),
+            Some("VK_EXT_external_memory_dma_buf")
+        );
+        assert_eq!(program, metal);
+    }
+
+    /// The readers over forms of Mesa's tables: a family's graphics
+    /// version is the last its initializer states once its macros are
+    /// written out, a force-probed device is not opened, and ANV's bounds
+    /// are its own two checks.
+    #[test]
+    fn mesas_tables_say_which_devices_anv_opens() {
+        let ids = "CHIPSET(0x1616, bdw_gt2, \"BDW GT2\", \"Intel(R) HD Graphics 5500\")\n\
+                   CHIPSET(0x1916, skl_gt2, \"SKL GT2\", \"Intel(R) HD Graphics 520\")\n\
+                   /* a comment */\n\
+                   CHIPSET(0x9a49, tgl_gt2, \"TGL GT2\", \"Intel(R) Iris(R) Xe Graphics\")\n\
+                   CHIPSET(0xd750, nvl_p, \"NVL\", \"Intel(R) Graphics\", FORCE_PROBE)\n";
+        let info = "#define GFX8_FEATURES \\\n   .ver = 8, \\\n   .has_64bit = true\n\
+                    #define GFX9_FEATURES \\\n   GFX8_FEATURES, \\\n   .ver = 9\n\
+                    #define XE3_FEATURES(gt) \\\n   .ver = 30, .gt = gt\n\
+                    static const struct intel_device_info intel_device_info_bdw_gt2 = {\n   \
+                    GFX8_FEATURES, .gt = 2,\n};\n\
+                    static const struct intel_device_info intel_device_info_skl_gt2 = {\n   \
+                    GFX9_FEATURES, .gt = 2,\n};\n\
+                    static const struct intel_device_info intel_device_info_tgl_gt2 = {\n   \
+                    .ver = 12,\n};\n\
+                    static const struct intel_device_info intel_device_info_nvl_p = {\n   \
+                    XE3_FEATURES(2),\n};\n";
+        let listed = anv_tables::devices(ids, info).unwrap();
+        let version = |id: u16| listed[&id].version;
+        assert_eq!(
+            [0x1616, 0x1916, 0x9a49, 0xd750].map(version),
+            [8, 9, 12, 30]
+        );
+        assert!(listed[&0xd750].forced && !listed[&0x9a49].forced);
+        let anv = "result = intel_get_device_info_from_fd(fd, &devinfo, 9, -1);\n\
+                   if (devinfo.ver < 9) {\n} else if (devinfo.ver > 30) {\n";
+        let versions = anv_tables::anv_versions(anv).unwrap();
+        assert_eq!(versions, (9, 30));
+        // Broadwell is below ANV's versions and Nova Lake force-probed.
+        assert_eq!(anv_tables::opened(&listed, versions), [0x1916, 0x9a49]);
+        // A table in a form the readers do not know is refused, not
+        // misread.
+        assert!(anv_tables::devices("CHIPSET(0x1916, kbl_gt2, \"\")", info).is_err());
+        assert!(anv_tables::devices("", info).is_err());
+        assert!(anv_tables::anv_versions("if (devinfo.ver < 9)").is_err());
     }
 }

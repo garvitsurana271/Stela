@@ -20,9 +20,11 @@
  * test: the Metal device refuses such a device, or reports the tier absent,
  * when it opens.
  *
- * Usage: anv_device DEVICE-ID integrated|discrete xe|i915
+ * Usage: anv_device DEVICE-ID integrated|discrete|none xe|i915
  * Prints a "Metal device: ..." line, a "Metal read-write textures: ..." line
- * and a line "ANV on <driver>: ..." and exits 0, or names the failed check. */
+ * and a line "ANV on <driver>: ..." and exits 0, or names the failed check.
+ * With "none" (a device Stela hands to no driver) it checks that ANV gives no
+ * Vulkan device and prints "no Vulkan device from ANV". */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -108,7 +110,6 @@ static int has_extension(VkInstance instance, VkPhysicalDevice physical, const c
 static void report_metal_requirements(VkInstance instance, VkPhysicalDevice physical)
 {
 	LOAD(instance, vkGetPhysicalDeviceFeatures2);
-	LOAD(instance, vkGetPhysicalDeviceProperties2);
 	VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT unused = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT,
 	};
@@ -145,14 +146,6 @@ static void report_metal_requirements(VkInstance instance, VkPhysicalDevice phys
 		.pNext = &v12,
 	};
 	vkGetPhysicalDeviceFeatures2(physical, &features);
-	VkPhysicalDeviceExtendedDynamicState3PropertiesEXT dynamic3 = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT,
-	};
-	VkPhysicalDeviceProperties2 properties = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-		.pNext = &dynamic3,
-	};
-	vkGetPhysicalDeviceProperties2(physical, &properties);
 	const VkPhysicalDeviceFeatures *core = &features.features;
 	const struct {
 		const char *name;
@@ -184,7 +177,6 @@ static void report_metal_requirements(VkInstance instance, VkPhysicalDevice phys
 		{"nullDescriptor", robustness.nullDescriptor},
 		{"conditionalRendering", conditional.conditionalRendering},
 		{"dynamicRenderingUnusedAttachments", unused.dynamicRenderingUnusedAttachments},
-		{"dynamicPrimitiveTopologyUnrestricted", dynamic3.dynamicPrimitiveTopologyUnrestricted},
 		{"hostQueryReset", v12.hostQueryReset},
 		{"VK_EXT_external_memory_dma_buf",
 		 has_extension(instance, physical, "VK_KHR_external_memory_fd") &&
@@ -325,6 +317,13 @@ int main(int argc, char **argv)
 
 	uint32_t count = 0;
 	VK(vkEnumeratePhysicalDevices(instance, &count, NULL));
+	if (!strcmp(argv[2], "none")) {
+		/* A device Stela hands to no driver: ANV gives it no Vulkan
+		 * device. */
+		CHECK(count == 0);
+		puts("no Vulkan device from ANV");
+		return 0;
+	}
 	CHECK(count == 1);
 	VkPhysicalDevice physical;
 	VK(vkEnumeratePhysicalDevices(instance, &count, &physical));

@@ -198,7 +198,8 @@ const ANV: Driver = Driver {
     stand_ins: &["anv_nir_options"],
     libraries: &[],
 };
-/// RADV, with ACO, for AMD GPUs from GFX6. Mesa's configuration has it
+/// RADV, with ACO, for the AMD GPUs the port drives, from GFX8
+/// (`stela_driver_core::amd_metal`). Mesa's configuration has it
 /// compile the shaders that build acceleration structures from GLSL, which
 /// needs the host's glslang; without it RADV would report ray tracing it
 /// cannot build. Its objects are its shared library's own, not a library's,
@@ -217,7 +218,7 @@ pub(super) const RADV: Driver = Driver {
     )],
     options: &["-Damd-use-llvm=false"],
     host_tools: true,
-    // AMD's stack gives no Vulkan driver yet.
+    // A release image holds no amdgpu, so none of its GPUs asks for RADV.
     released: false,
     model: "radv_query.c",
     stand_ins: &["radv_nir_options", "radv_submit"],

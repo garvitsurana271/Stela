@@ -277,18 +277,24 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
         .filter(|identity| identity.vendor == NVIDIA && identity.class[0] == 0x03)
         .map(|identity| identity.device)
         .collect();
-    // An image that links another vendor's Vulkan driver drives that
-    // vendor's display controllers itself: one of them is the GPU macOS
-    // starts with, so the NVIDIA-only notice does not apply.
+    // An image that links another vendor's Vulkan driver drives the display
+    // controllers that vendor's stack takes (`GpuStack::select`): one of
+    // them is the GPU macOS starts with, so the NVIDIA-only notice does not
+    // apply. A controller its stack leaves out, as one whose Vulkan device
+    // cannot serve the Metal device, is no such GPU.
     let driven = functions
         .iter()
         .map(crate::pci_io::FunctionObservation::identity)
         .filter(|identity| identity.vendor != NVIDIA && identity.class[0] == 0x03)
         .find_map(|identity| {
-            let vendor = stela_drivers::gpu::Vendor::from_pci(identity.vendor);
-            stela_drivers::gpu::stack::STACKS
-                .iter()
-                .find(|stack| stack.vendor == vendor && stack.draws())
+            stela_drivers::gpu::stack::GpuStack::select(&stela_drivers::gpu::Adapter {
+                address: identity.address,
+                vendor: stela_drivers::gpu::Vendor::from_pci(identity.vendor),
+                device: identity.device,
+                class: identity.class,
+            })
+            .ok()
+            .filter(|stack| stack.draws())
         });
     let notice = if driven.is_some() {
         0

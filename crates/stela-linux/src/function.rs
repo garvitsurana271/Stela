@@ -243,7 +243,8 @@ pub struct Identity {
 const _: () = assert!(size_of::<Identity>() == 20);
 
 /// A function presented to Linux for other drivers' searches only: no
-/// driver binds it and it has no configuration, resources, interrupt or DMA.
+/// driver binds it and it has no resources, interrupt or DMA. Its
+/// configuration is at most a copy its owner read ([`Published::snapshot`]).
 pub struct Published {
     device: NonNull<c_void>,
 }
@@ -259,6 +260,26 @@ impl Published {
             .map(|device| Self { device })
             .ok_or(error)
     }
+
+    /// As [`Self::new`], with a copy of the first bytes of the function's
+    /// configuration (at most 256), which a driver's reads then answer.
+    ///
+    /// # Safety
+    /// As [`Self::new`].
+    pub unsafe fn snapshot(identity: Identity, configuration: &[u8]) -> Result<Self, Errno> {
+        let mut error: c_int = 0;
+        // SAFETY: the caller's contract; C copies the identity and bytes.
+        NonNull::new(unsafe {
+            stela_linux_pci_publish_snapshot(
+                &identity,
+                configuration.as_ptr(),
+                configuration.len(),
+                &raw mut error,
+            )
+        })
+        .map(|device| Self { device })
+        .ok_or(error)
+    }
 }
 
 impl Drop for Published {
@@ -269,10 +290,28 @@ impl Drop for Published {
     }
 }
 
+/// Sets the graphics memory the firmware reserved for an integrated Intel
+/// GPU (`intel_graphics_stolen_res`), as Linux's x86 early quirks would
+/// have found it, for i915 to read during its probe.
+///
+/// # Safety
+/// In an entered Linux owner, before any driver registers.
+pub unsafe fn set_graphics_stolen(base: u64, size: u64) {
+    // SAFETY: the caller's contract; nothing reads the resource yet.
+    unsafe { stela_linux_set_graphics_stolen(base, size) }
+}
+
 unsafe extern "C" {
+    fn stela_linux_set_graphics_stolen(base: u64, size: u64);
     fn stela_linux_pci_attach(function: *const RawFunction, error: *mut c_int) -> *mut c_void;
     fn stela_linux_pci_publish_identity(
         identity: *const Identity,
+        error: *mut c_int,
+    ) -> *mut c_void;
+    fn stela_linux_pci_publish_snapshot(
+        identity: *const Identity,
+        config: *const u8,
+        length: usize,
         error: *mut c_int,
     ) -> *mut c_void;
     fn stela_linux_owner() -> *const super::owner::RawOwner;

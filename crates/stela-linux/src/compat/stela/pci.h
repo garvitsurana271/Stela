@@ -109,6 +109,12 @@ _Static_assert(sizeof(struct stela_linux_pci_identity) == 20, "Linux PCI identit
  * stela_linux_pci_remove_device drops the registration reference. */
 struct pci_dev *stela_linux_pci_publish_identity(const struct stela_linux_pci_identity *identity,
 						 int *error);
+/* As stela_linux_pci_publish_identity, with a copy of the first length bytes
+ * (at most 256) of the function's configuration as its owner read them:
+ * reads inside the copy answer its bytes, others fail as for an absent
+ * function, and a write is refused and reported once. */
+struct pci_dev *stela_linux_pci_publish_snapshot(const struct stela_linux_pci_identity *identity,
+						 const u8 *config, size_t length, int *error);
 /* Cumulative final releases quarantined outside the original process owner.
  * Atomic observation only; no reset or deferred reclamation is implied. */
 u64 stela_linux_pci_quarantined_functions(void);

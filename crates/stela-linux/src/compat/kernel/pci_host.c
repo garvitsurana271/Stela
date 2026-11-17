@@ -511,12 +511,32 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
 	return dev;
 }
 
+/* The configuration a published function's owner read for it, if any. */
+struct snapshot {
+	size_t length;
+	u8 bytes[];
+};
+
 static int read_identity_config(struct pci_bus *bus, unsigned int devfn, int where, int size,
 				u32 *value)
 {
-	(void)bus, (void)devfn, (void)where, (void)size;
-	*value = ~(u32)0;
-	return PCIBIOS_DEVICE_NOT_FOUND;
+	const struct stela_linux_pci_function *function = bus->sysdata;
+	const struct snapshot *snapshot = function->context;
+
+	(void)devfn;
+	if (!snapshot || where < 0 || size <= 0 || (size_t)where + (size_t)size > snapshot->length) {
+		*value = ~(u32)0;
+		return PCIBIOS_DEVICE_NOT_FOUND;
+	}
+	*value = 0;
+	for (int i = size - 1; i >= 0; i--)
+		*value = *value << 8 | snapshot->bytes[where + i];
+	return PCIBIOS_SUCCESSFUL;
+}
+
+static void free_snapshot(void *snapshot)
+{
+	kfree(snapshot);
 }
 
 static int write_identity_config(struct pci_bus *bus, unsigned int devfn, int where, int size,
@@ -533,14 +553,37 @@ static struct pci_ops identity_ops = {.read = read_identity_config,
 struct pci_dev *stela_linux_pci_publish_identity(const struct stela_linux_pci_identity *identity,
 						 int *status)
 {
+	return stela_linux_pci_publish_snapshot(identity, NULL, 0, status);
+}
+
+struct pci_dev *stela_linux_pci_publish_snapshot(const struct stela_linux_pci_identity *identity,
+						 const u8 *config, size_t length, int *status)
+{
 	int error = stela_linux_kernel_hosted() ? -EPERM : -ENOMEM;
-	struct host_function *host = error == -EPERM ? NULL : kzalloc_obj(*host);
+	struct host_function *host = NULL;
+	struct snapshot *snapshot = NULL;
 
 	if (status)
-		*status = error;
-	if (!host)
+		*status = length > 256 || (length && !config) ? -EINVAL : error;
+	if (length > 256 || (length && !config))
 		return NULL;
-	/* No callback and no context: the release frees the host alone. */
+	if (error != -EPERM) {
+		host = kzalloc_obj(*host);
+		snapshot = length ? kmalloc(struct_size(snapshot, bytes, length), GFP_KERNEL) : NULL;
+	}
+	if (!host || (length && !snapshot)) {
+		kfree(host);
+		kfree(snapshot);
+		return NULL;
+	}
+	/* No callback; the context is the snapshot, if any, which the release
+	 * frees with the host. */
+	if (snapshot) {
+		snapshot->length = length;
+		memcpy(snapshot->bytes, config, length);
+		host->function.context = snapshot;
+		host->function.release_context = free_snapshot;
+	}
 	host->function.bus = identity->bus;
 	host->function.devfn = identity->devfn;
 	host->owner = stela_linux_owner();
@@ -722,6 +765,35 @@ static void test_identity(void)
 
 	stela_linux_pci_remove_device(bridge);
 	assert(!pci_get_class(PCI_CLASS_BRIDGE_ISA << 8, NULL) && !pci_dev_present(bridges));
+
+	/* A host bridge with the configuration its owner read: reads inside
+	 * the copy answer it, past it they fail, and writes are refused. */
+	const struct stela_linux_pci_identity host_bridge = {
+		.bus = 0, .devfn = PCI_DEVFN(0, 0), .vendor = PCI_VENDOR_ID_INTEL, .device = 0x3e30,
+		.class_revision = PCI_CLASS_BRIDGE_HOST << 16 | 0x0d,
+	};
+	u8 snapshot[0x58] = {0x86, 0x80, 0x30, 0x3e};
+	snapshot[0x48] = 0x01, snapshot[0x49] = 0x00, snapshot[0x4a] = 0xd1, snapshot[0x4b] = 0xfe;
+	snapshot[0x54] = 0x19;
+	assert(!stela_linux_pci_publish_snapshot(&host_bridge, snapshot, 257, &status));
+	assert(status == -EINVAL);
+	struct pci_dev *host = stela_linux_pci_publish_snapshot(&host_bridge, snapshot,
+								 sizeof(snapshot), &status);
+	assert(host && !status);
+	found = pci_get_domain_bus_and_slot(0, 0, PCI_DEVFN(0, 0));
+	assert(found == host);
+	pci_dev_put(found);
+	assert(!pci_read_config_dword(host, 0x48, &value) && value == 0xfed10001);
+	u16 word = 0;
+	assert(!pci_read_config_word(host, PCI_DEVICE_ID, &word) && word == 0x3e30);
+	u8 byte = 0;
+	assert(!pci_read_config_byte(host, 0x54, &byte) && byte == 0x19);
+	assert(pci_read_config_dword(host, 0x58, &value) == PCIBIOS_DEVICE_NOT_FOUND);
+	assert(value == ~(u32)0);
+	assert(pci_write_config_dword(host, 0x48, 0) == PCIBIOS_DEVICE_NOT_FOUND);
+	assert(refusals == before + 1);
+	refusals = before;
+	stela_linux_pci_remove_device(host);
 	assert(stela_linux_pci_quarantined_functions() == quarantined);
 	pci_unregister_driver(&early);
 	pci_unregister_driver(&late);

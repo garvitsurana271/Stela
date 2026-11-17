@@ -21,6 +21,9 @@ mod nouveau_firmware;
 #[cfg(feature = "xe-port")]
 #[path = "build/xe.rs"]
 mod xe;
+#[cfg(feature = "xe-port")]
+#[path = "build/xe_tables.rs"]
+mod xe_tables;
 
 /// The Vulkan drivers `cargo xtask gpu nvk` linked into the image's archives,
 /// as it lists them beside them: with `metal-linked`, Intel's sets

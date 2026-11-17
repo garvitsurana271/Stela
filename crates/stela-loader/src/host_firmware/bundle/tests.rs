@@ -5,9 +5,9 @@ const BASE: (usize, usize) = (88, 185_584_904);
 /// What each port adds to the bundle, as files and bytes, and how many of
 /// its recipes hold another's bytes. amdgpu: 479 files, 77.1 MiB; `mec2`
 /// and `mec` of most families and a revision's files that did not change
-/// are one file. xe: 28 files, 9.9 MiB.
+/// are one file. xe: 29 files, 10.0 MiB.
 const AMD: (usize, usize, usize) = (479, 80_886_776, 93);
-const INTEL: (usize, usize, usize) = (28, 10_403_248, 0);
+const INTEL: (usize, usize, usize) = (29, 10_480_332, 0);
 use stela_driver_core::firmware::{Provenance, Resource, Target};
 
 #[test]

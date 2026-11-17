@@ -24,15 +24,71 @@ pub fn force_probed(device: u16) -> bool {
         .is_ok_and(|index| DEVICES[index].2)
 }
 
-/// Whether xe's table holds the adapter. Intel graphics before Tiger Lake
-/// are i915's, which Stela does not have.
+/// Whether xe binds the adapter: its PCI ID table holds the device and its
+/// firmware table names a GuC image for the device's platform. Intel
+/// graphics before Tiger Lake are i915's, which Stela does not have. A
+/// platform xe lists before its GuC image is released (at the pinned Linux:
+/// Nova Lake and Crescent Island) ends xe's probe with "No GuC firmware
+/// defined for platform", as on Linux, so it is refused before the claim and
+/// keeps the firmware's screen.
 pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
-    match mask_bits(adapter.device) {
-        Some(_) => Ok(()),
-        None => Err(
+    if mask_bits(adapter.device).is_none() {
+        return Err(
             "xe's PCI ID table does not hold this Intel GPU (Ice Lake and older need i915, which is not ported to Stela)",
+        );
+    }
+    match firmware(adapter.device) {
+        Some(Firmware { guc: Some(_), .. }) => Ok(()),
+        _ => Err(
+            "xe's firmware table names no GuC image for this Intel GPU's platform, so xe's probe would stop as Linux's does (No GuC firmware defined for platform)",
         ),
     }
+}
+
+/// The microcontroller images xe asks for on a device, from its own
+/// firmware table (`xe_uc_fw.c`), as it names them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Firmware {
+    /// The graphics microcontroller's image, which xe cannot run without.
+    pub guc: Option<&'static str>,
+    /// The media microcontroller's image, where the platform has one.
+    pub huc: Option<&'static str>,
+    /// The security controller's image, which xe loads on Meteor Lake and
+    /// later integrated GPUs.
+    pub gsc: Option<&'static str>,
+}
+
+/// The images xe's firmware table names for `device`'s platform, if xe's
+/// PCI ID table holds the device.
+pub fn firmware(device: u16) -> Option<Firmware> {
+    let platform = PLATFORMS
+        .binary_search_by_key(&device, |(id, ..)| *id)
+        .ok()
+        .map(|index| PLATFORMS[index].1)?;
+    let files = FIRMWARE
+        .iter()
+        .find(|(name, _)| *name == platform)
+        .map_or([None; 3], |(_, files)| *files);
+    Some(Firmware {
+        guc: files[0],
+        huc: files[1],
+        gsc: files[2],
+    })
+}
+
+/// Every display microcontroller program the display code declares for the
+/// displays of xe's platforms (display version 12 and later). Which one a
+/// device asks for follows its display version, which Meteor Lake and later
+/// report only from the hardware.
+pub fn display_firmware() -> &'static [&'static str] {
+    DISPLAY_FIRMWARE
+}
+
+/// Every PCI device ID of xe's table, each with its platform name.
+pub fn devices() -> impl Iterator<Item = (u16, &'static str)> {
+    PLATFORMS
+        .iter()
+        .map(|(device, platform, ..)| (*device, *platform))
 }
 
 /// The DMA mask xe sets on the adapter. One outside its table is never
@@ -274,6 +330,117 @@ mod tests {
         // A count past the answer is no answer.
         assert_eq!(query::memory_bytes(&mut answering(1, &[2])), None);
         assert_eq!(query::memory_bytes(&mut answering(2, &integrated)), None);
+    }
+
+    #[test]
+    fn every_file_xe_and_its_display_name_has_a_pinned_recipe() {
+        use stela_loader::host_firmware::recipes;
+        let pinned: alloc::collections::BTreeSet<&str> = recipes::XE
+            .iter()
+            .map(|recipe| recipe.image.member)
+            .collect();
+        for (platform, files) in FIRMWARE {
+            for file in files.iter().flatten() {
+                assert!(pinned.contains(file), "{platform}: {file} has no recipe");
+            }
+        }
+        // Display version 35's program is asked for only by Nova Lake, which
+        // xe gives no GuC image and so refuses; nothing is pinned for it.
+        for file in DISPLAY_FIRMWARE {
+            assert_eq!(
+                pinned.contains(file),
+                *file != "i915/xe3p_lpd_dmc.bin",
+                "{file}"
+            );
+        }
+        // The tables are xe's own: Tiger Lake, Meteor Lake and Battlemage.
+        assert_eq!(
+            firmware(0x9a49),
+            Some(Firmware {
+                guc: Some("i915/tgl_guc_70.bin"),
+                huc: Some("i915/tgl_huc.bin"),
+                gsc: None,
+            })
+        );
+        assert_eq!(firmware(0x7d55).unwrap().gsc, Some("i915/mtl_gsc_1.bin"));
+        assert_eq!(firmware(0xe20b).unwrap().huc, Some("xe/bmg_huc.bin"));
+        assert!(DISPLAY_FIRMWARE.contains(&"i915/adlp_dmc_ver2_16.bin"));
+        // Ice Lake's program is i915's.
+        assert!(!DISPLAY_FIRMWARE.contains(&"i915/icl_dmc_ver1_09.bin"));
+    }
+
+    #[test]
+    fn every_device_xe_admits_requires_the_files_xe_names_for_it() {
+        use stela_loader::host_firmware::{recipes, requirements::Inventory};
+        let adapter = |device| Adapter {
+            address: crate::bus::pci::Address {
+                segment: 0,
+                bus: 0,
+                device: 2,
+                function: 0,
+            },
+            vendor: crate::Vendor::Intel,
+            device,
+            class: [3, 0, 0],
+        };
+        let mut admitted = 0;
+        for (device, name, display, _) in PLATFORMS {
+            let files = firmware(*device).unwrap();
+            let mut inventory = Inventory::default();
+            let required = recipes::require_xe(&mut inventory, *device);
+            if admits(&adapter(*device)).is_err() {
+                // Refused before any claim; no files are selected for it.
+                assert!(files.guc.is_none(), "{device:04x} ({name})");
+                continue;
+            }
+            admitted += 1;
+            required.unwrap_or_else(|error| panic!("{device:04x} ({name}): {error:?}"));
+            let names: alloc::vec::Vec<&str> = inventory
+                .requests()
+                .iter()
+                .map(|request| request.name.as_str())
+                .collect();
+            let (programs, images): (alloc::vec::Vec<&str>, alloc::vec::Vec<&str>) = names
+                .iter()
+                .partition(|name| DISPLAY_FIRMWARE.contains(name));
+            let expected: alloc::vec::Vec<&str> = [files.guc, files.huc, files.gsc]
+                .into_iter()
+                .flatten()
+                .collect();
+            assert_eq!(images, expected, "{device:04x} ({name})");
+            // One display program where the platform has a display engine.
+            assert_eq!(
+                programs.len(),
+                usize::from(*display),
+                "{device:04x} ({name})"
+            );
+        }
+        assert!(admitted >= 130, "{admitted}");
+    }
+
+    #[test]
+    fn a_platform_without_a_guc_image_is_refused_before_the_claim() {
+        let adapter = |device| Adapter {
+            address: crate::bus::pci::Address {
+                segment: 0,
+                bus: 0,
+                device: 2,
+                function: 0,
+            },
+            vendor: crate::Vendor::Intel,
+            device,
+            class: [3, 0, 0],
+        };
+        // Nova Lake S and P and Crescent Island are in xe's table at the pin,
+        // with no GuC image in its firmware table.
+        for device in [0xd740, 0xd750, 0x674c] {
+            assert!(platform(device).is_some(), "{device:04x}");
+            assert_eq!(firmware(device).unwrap().guc, None, "{device:04x}");
+            assert!(admits(&adapter(device)).is_err(), "{device:04x}");
+        }
+        for device in [0x9a49, 0x56a0, 0xe20b, 0xb080] {
+            assert_eq!(admits(&adapter(device)), Ok(()), "{device:04x}");
+        }
     }
 
     #[test]

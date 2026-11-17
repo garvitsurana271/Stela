@@ -1267,6 +1267,12 @@ pub const XE: &[Recipe] = &[
         79088,
         "3516de2e134ddcf3b319c75d2e437779fecbd58cbb77234bd6f297c544e92ccb",
     ),
+    // The name the display code asks for when `adlp_dmc.bin` is missing.
+    xe_i915(
+        "i915/adlp_dmc_ver2_16.bin",
+        77084,
+        "2da482ea46a40e54c9ca3b54185959177f393eff98ece21acdac7eb6cacb0fcb",
+    ),
     xe_i915(
         "i915/dg1_dmc_ver2_02.bin",
         16624,
@@ -1304,7 +1310,13 @@ pub const XE: &[Recipe] = &[
     ),
 ];
 
-/// A platform's name, PCI device IDs and files: GuC, HuC, GSC, DMC.
+/// The display program no platform requires but xe's display code names:
+/// the one it asks for when ADL-P's own is missing.
+#[cfg(test)]
+const XE_FALLBACK: &str = "i915/adlp_dmc_ver2_16.bin";
+
+/// A platform's name, PCI device IDs and files: GuC, HuC, GSC, DMC (none
+/// for a GPU without a display engine).
 type XePlatform = (&'static str, &'static [u16], [Option<&'static str>; 4]);
 
 /// The platforms of xe's PCI ID table that have pinned files, each with the
@@ -1389,7 +1401,7 @@ const XE_PLATFORMS: &[XePlatform] = &[
         &[
             0x56a0, 0x56a1, 0x56a2, 0x56be, 0x56bf, 0x5690, 0x5691, 0x5692, 0x56a5, 0x56a6, 0x56b0,
             0x56b1, 0x56ba, 0x56bb, 0x56bc, 0x56bd, 0x5693, 0x5694, 0x5695, 0x56a3, 0x56a4, 0x56b2,
-            0x56b3, 0x5696, 0x5697, 0x56c0, 0x56c2, 0x56c1,
+            0x56b3, 0x5696, 0x5697,
         ],
         [
             Some("i915/dg2_guc_70.bin"),
@@ -1397,6 +1409,12 @@ const XE_PLATFORMS: &[XePlatform] = &[
             None,
             Some("i915/dg2_dmc_ver2_08.bin"),
         ],
+    ),
+    // DG2 without a display engine: no display program is asked for.
+    (
+        "Data Center GPU Flex (ATS-M)",
+        &[0x56c0, 0x56c1, 0x56c2],
+        [Some("i915/dg2_guc_70.bin"), None, None, None],
     ),
     (
         "Meteor Lake or Arrow Lake",
@@ -2415,7 +2433,7 @@ mod tests {
                 assert!(!devices.contains(device), "{platform} {device:04x}");
                 devices.push(*device);
             }
-            assert!(files[0].is_some() && files[3].is_some(), "{platform}");
+            assert!(files[0].is_some(), "{platform}");
             for file in files.iter().flatten() {
                 assert!(xe_member(file, "intel").is_some(), "{platform} {file}");
             }
@@ -2429,8 +2447,9 @@ mod tests {
             assert!(
                 XE_PLATFORMS
                     .iter()
-                    .any(|(_, _, files)| files.contains(&Some(member))),
-                "{member} has no platform"
+                    .any(|(_, _, files)| files.contains(&Some(member)))
+                    != (member == XE_FALLBACK),
+                "{member} has no platform, or one and is the fallback"
             );
             let notice = if member.starts_with("xe/") {
                 "LICENSES/LICENSE.xe"

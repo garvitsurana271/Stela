@@ -2271,6 +2271,7 @@ dependencies = [
  "stela-driver-base",
  "stela-driver-core",
  "stela-linux",
+ "stela-loader",
  "triomphe",
 ]
 

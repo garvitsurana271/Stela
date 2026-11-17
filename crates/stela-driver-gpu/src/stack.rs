@@ -164,8 +164,8 @@ pub static AMD: GpuStack = GpuStack {
     kernel: Kernel {
         driver: "amdgpu",
         admits: crate::amdgpu::admits,
-        // `rmmio_base` (`amdgpu_device.c`): BAR 5 from Bonaire on, BAR 2
-        // before; BAR 0 is the memory aperture.
+        // `rmmio_base` (`amdgpu_device.c`): BAR 5 for every family Stela
+        // drives; BAR 0 is the memory aperture.
         registers: crate::amdgpu::registers,
         resets_itself: true,
         // The mask the device's memory controller block sets
@@ -635,11 +635,10 @@ mod tests {
         assert_eq!(AMD.kernel.table_integrated(&integrated), None);
         assert!(claim_rank(true, None) > claim_rank(true, Some(false)));
         // An APU the table names by ID and flags, Renoir, is integrated
-        // before its probe; Southern Islands' registers are in BAR 2.
+        // before its probe; its registers are in BAR 5.
         integrated.device = 0x1636;
         assert_eq!(AMD.kernel.table_integrated(&integrated), Some(true));
-        integrated.device = 0x6798;
-        assert_eq!((AMD.kernel.registers)(&integrated), 2);
+        assert_eq!((AMD.kernel.registers)(&integrated), 5);
         // amdgpu resets its GPUs at its probe; nouveau and xe do not.
         assert!(AMD.kernel.resets_itself);
         assert!(

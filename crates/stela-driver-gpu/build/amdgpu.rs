@@ -374,7 +374,8 @@ pub fn tables() {
             "a revision quirk moves {listed} to {quirked}, which sets another DMA mask"
         );
     }
-    // The register window's BAR of each family (`rmmio_base`).
+    // The register window's BAR (`rmmio_base`), the same for every family
+    // Stela drives: asserted below for each.
     let window = RegisterWindow::read(
         &source("amdgpu_device.c"),
         &read(PathBuf::from(
@@ -382,12 +383,6 @@ pub fn tables() {
         )),
     )
     .unwrap_or_else(|error| panic!("amdgpu's register window: {error}"));
-    for (listed, quirked) in &table.quirks {
-        assert!(
-            window.bar(listed) == window.bar(quirked),
-            "a revision quirk moves {listed} to {quirked}, whose registers are in another BAR"
-        );
-    }
     // The graphics generation of each family: the oldest graphics block its
     // IP block list can hold.
     let mut generations = BTreeMap::new();
@@ -406,16 +401,35 @@ pub fn tables() {
     };
     // A generation RADV's device cannot serve the Metal device on is left
     // out (`stela_driver_core::amd_metal`): the image holds no support for
-    // it either.
+    // it, and holds it for every family that serves. Every family that
+    // serves has its registers in the same BAR, so the table carries
+    // neither the probe's answer nor the BAR.
     for (family, _) in table.devices.values() {
         let generation = family_generation(family);
+        let serves = generation >= stela_driver_core::amd_metal::FIRST_GENERATION;
         assert!(
-            generation >= stela_driver_core::amd_metal::FIRST_GENERATION
-                || table.unbuilt.contains_key(family),
+            serves || table.unbuilt.contains_key(family),
             "the profile builds amdgpu's support for {family}, of graphics generation \
              {generation}, which cannot serve the Metal device: leave its Kconfig symbol unset"
         );
+        assert!(
+            !serves || !table.unbuilt.contains_key(family),
+            "the profile leaves out amdgpu's support for {family}, of graphics generation \
+             {generation}, which serves the Metal device: set its Kconfig symbol"
+        );
+        assert!(
+            !serves || window.drives(family),
+            "{family}, which serves the Metal device, has its registers in BAR {}, not {}",
+            window.older,
+            window.newer
+        );
     }
+    assert!(
+        window.drives("CHIP_IP_DISCOVERY"),
+        "a device IP discovery identifies has its registers in BAR {}, not {}",
+        window.older,
+        window.newer
+    );
     for (listed, quirked) in &table.quirks {
         assert!(
             family_generation(listed) == family_generation(quirked),
@@ -426,23 +440,16 @@ pub fn tables() {
         "/// amdgpu's `pciidlist` entries that name a device: its ID, its family\n\
          /// (`CHIP_*` without the prefix), its graphics generation (the oldest\n\
          /// graphics block the family's list holds), the bits of the DMA mask\n\
-         /// its family's memory controller sets, the probe's answer, whether\n\
-         /// the table flags it `AMD_IS_APU`, and the BAR of its registers.\n\
-         pub(crate) const DEVICES: &[(u16, &str, u8, u8, Support, bool, u8)] = &[\n",
+         /// its family's memory controller sets, and whether the table flags it\n\
+         /// `AMD_IS_APU`.\n\
+         pub(crate) const DEVICES: &[(u16, &str, u8, u8, bool)] = &[\n",
     );
     for (device, (family, apu)) in &table.devices {
         let bits = family_mask(family);
         let generation = family_generation(family);
         let name = family.strip_prefix("CHIP_").unwrap_or(family);
-        let support = match table.unbuilt.get(family) {
-            Some(generation) => {
-                format!("Support::NotBuilt(\"amdgpu built without {generation} support\")")
-            }
-            None => "Support::Probed".to_owned(),
-        };
-        let bar = window.bar(family);
         text.push_str(&format!(
-            "    ({device:#06x}, {name:?}, {generation}, {bits}, {support}, {apu}, {bar}),\n"
+            "    ({device:#06x}, {name:?}, {generation}, {bits}, {apu}),\n"
         ));
     }
     text.push_str(
@@ -463,11 +470,11 @@ pub fn tables() {
     text.push_str(&format!(
         "];\n/// The narrowest mask of the memory controllers IP discovery chooses from.\n\
          pub(crate) const DISCOVERY_BITS: u8 = {discovery};\n\
-         /// The BAR of the registers of a device IP discovery identifies.\n\
-         pub(crate) const DISCOVERY_REGISTERS: u8 = {};\n\
+         /// The BAR of the register window of every device Stela drives.\n\
+         pub(crate) const REGISTERS: u8 = {};\n\
          /// The oldest graphics generation IP discovery chooses a block of.\n\
          pub(crate) const DISCOVERY_GENERATION: u8 = {discovery_generation};\n",
-        window.bar("CHIP_IP_DISCOVERY")
+        window.newer
     ));
     text.push_str(
         "/// amdgpu's interface's families (`AMDGPU_FAMILY_*`), by number.\n\
@@ -725,19 +732,15 @@ impl RegisterWindow {
         })
     }
 
-    /// The register BAR of `family` (`CHIP_*`).
-    fn bar(&self, family: &str) -> u8 {
+    /// Whether `family` (`CHIP_*`) has its registers in the `newer` BAR.
+    fn drives(&self, family: &str) -> bool {
         let position = |name: &str| {
             self.order
                 .iter()
                 .position(|known| known == name)
                 .unwrap_or_else(|| panic!("{name} is no amd_asic_type"))
         };
-        if position(family) >= position(&self.first) {
-            self.newer
-        } else {
-            self.older
-        }
+        position(family) >= position(&self.first)
     }
 }
 

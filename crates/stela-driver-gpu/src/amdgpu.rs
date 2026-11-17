@@ -7,30 +7,15 @@ use stela_driver_core::amd_metal;
 
 include!(concat!(env!("OUT_DIR"), "/amdgpu_devices.rs"));
 
-/// What amdgpu's probe answers for one device of its table.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Support {
-    /// The probe goes on to the device's IP blocks.
-    Probed,
-    /// `amdgpu_support_enabled` refuses the family: this build's Kconfig
-    /// leaves its support out.
-    #[allow(
-        dead_code,
-        reason = "generated only while the profile leaves a family's support out; it builds all"
-    )]
-    NotBuilt(&'static str),
-}
-
 /// The table's entry for `device`, if it names the device by ID: its DMA
-/// mask's bits, the probe's answer, its `AMD_IS_APU` flag and its register
-/// BAR.
-fn entry(device: u16) -> Option<(u8, Support, bool, u8)> {
+/// mask's bits and its `AMD_IS_APU` flag.
+fn entry(device: u16) -> Option<(u8, bool)> {
     DEVICES
         .binary_search_by_key(&device, |(id, ..)| *id)
         .ok()
         .map(|index| {
-            let (.., bits, support, apu, registers) = DEVICES[index];
-            (bits, support, apu, registers)
+            let (.., bits, apu) = DEVICES[index];
+            (bits, apu)
         })
 }
 
@@ -47,11 +32,6 @@ pub fn generation(device: u16) -> Option<(&'static str, u8)> {
 /// Metal device, so one the table matches by class is claimed.
 const _: () = assert!(DISCOVERY_GENERATION >= amd_metal::FIRST_GENERATION);
 
-/// The table's mask bits and probe answer for `device`, if it names it.
-fn listed(device: u16) -> Option<(u8, Support)> {
-    entry(device).map(|(bits, support, ..)| (bits, support))
-}
-
 /// Whether the table's class entries hold the adapter: any AMD function of
 /// one of these classes, which the driver then identifies by IP discovery.
 fn discovered(adapter: &Adapter) -> bool {
@@ -60,10 +40,11 @@ fn discovered(adapter: &Adapter) -> bool {
 }
 
 /// Whether Stela drives the adapter with amdgpu: its table holds it, by ID
-/// or by class, the driver does not leave it to radeon, RADV's device on its
-/// family can serve the Metal device ([`amd_metal::serves`]), and this build
-/// holds its family's support. A GPU that cannot serve the Metal device is
-/// left out whole: Stela does not drive it for its displays alone.
+/// or by class, the driver does not leave it to radeon, and RADV's device on
+/// its family can serve the Metal device ([`amd_metal::serves`]); the build
+/// holds the support of every family that does. A GPU that cannot serve the
+/// Metal device is left out whole: Stela does not drive it for its displays
+/// alone.
 pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
     if LEFT_TO_RADEON.binary_search(&adapter.device).is_ok() {
         return Err(
@@ -75,11 +56,11 @@ pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
     {
         return Err(amd_metal::LEFT_OUT);
     }
-    match listed(adapter.device) {
-        Some((_, Support::Probed)) => Ok(()),
-        Some((_, Support::NotBuilt(reason))) => Err(reason),
-        None if discovered(adapter) => Ok(()),
-        None => Err("amdgpu's PCI ID table does not hold this device"),
+    // The build holds amdgpu's support of every family that serves.
+    if entry(adapter.device).is_some() || discovered(adapter) {
+        Ok(())
+    } else {
+        Err("amdgpu's PCI ID table does not hold this device")
     }
 }
 
@@ -88,21 +69,21 @@ pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
 /// by class sets its mask after IP discovery, and gets the narrowest mask of
 /// the memory controllers discovery can choose.
 pub fn dma_bits(adapter: &Adapter) -> u8 {
-    listed(adapter.device).map_or(DISCOVERY_BITS, |(bits, _)| bits)
+    entry(adapter.device).map_or(DISCOVERY_BITS, |(bits, _)| bits)
 }
 
 /// The BAR of the adapter's register window, as `amdgpu_device_init` maps
-/// it: BAR 2 for the Southern Islands families, BAR 5 from Bonaire on and
-/// for every device IP discovery identifies.
-pub fn registers(adapter: &Adapter) -> usize {
-    usize::from(entry(adapter.device).map_or(DISCOVERY_REGISTERS, |(.., bar)| bar))
+/// it: BAR 5 for every family Stela drives (from Bonaire on, and every
+/// device IP discovery identifies).
+pub fn registers(_: &Adapter) -> usize {
+    usize::from(REGISTERS)
 }
 
 /// Whether amdgpu's table flags the adapter `AMD_IS_APU`. It flags only
 /// the older APUs it names by ID; the probe flags the rest from IP
 /// discovery ([`query::integrated`]).
 pub fn integrated(adapter: &Adapter) -> bool {
-    entry(adapter.device).is_some_and(|(_, _, apu, _)| apu)
+    entry(adapter.device).is_some_and(|(_, apu)| apu)
 }
 
 /// The name amdgpu's interface gives the family `family`
@@ -256,9 +237,9 @@ mod tests {
         assert!(LEFT_TO_RADEON.windows(2).all(|pair| pair[0] < pair[1]));
         // Polaris 10 (GMC 8): 40 bits. Vega 10, Navi 10 and Sienna Cichlid
         // (GMC 9, 10 and 11 or later): the narrowest mask of those.
-        assert_eq!(listed(0x67df), Some((40, Support::Probed)));
+        assert_eq!(entry(0x67df), Some((40, false)));
         for device in [0x6860, 0x731f, 0x73bf] {
-            assert_eq!(listed(device), Some((DISCOVERY_BITS, Support::Probed)));
+            assert_eq!(entry(device), Some((DISCOVERY_BITS, false)));
         }
         assert_eq!(DISCOVERY_BITS, 44);
         // VGA, other display and processing accelerator.
@@ -267,10 +248,11 @@ mod tests {
 
     #[test]
     fn registers_and_apus_are_the_tables() {
-        // Tahiti (SI): BAR 2. Bonaire (CIK), Polaris 10, Navi 21 and a
-        // device found by class: BAR 5.
-        assert_eq!(registers(&adapter(0x6798, [3, 0, 0])), 2);
-        for device in [0x6649, 0x67df, 0x73bf, 0x0001] {
+        // Polaris 10, Navi 21 and a device found by class: BAR 5, as for
+        // every family from Bonaire on. Only Southern Islands, which Stela
+        // leaves out, had its registers in BAR 2; the build fails if a
+        // family it drives has them elsewhere.
+        for device in [0x67df, 0x73bf, 0x0001] {
             assert_eq!(registers(&adapter(device, [3, 0, 0])), 5, "{device:04x}");
         }
         // Kaveri, Carrizo, Raven and Renoir are flagged APUs by ID; a
@@ -282,9 +264,6 @@ mod tests {
         for device in [0x67df, 0x13c0, 0x164e] {
             assert!(!integrated(&adapter(device, [3, 0, 0])), "{device:04x}");
         }
-        // Every SI family's devices and only those take BAR 2.
-        assert!(DEVICES.iter().any(|(.., bar)| *bar == 2));
-        assert!(DEVICES.iter().all(|(.., bar)| *bar == 2 || *bar == 5));
     }
 
     #[test]
@@ -303,7 +282,7 @@ mod tests {
         // A GPU the table does not name is found by its class and gets the
         // mask every memory controller of discovery allows.
         let unnamed = adapter(0x0001, [3, 0, 0]);
-        assert_eq!(listed(unnamed.device), None);
+        assert_eq!(entry(unnamed.device), None);
         assert_eq!(admits(&unnamed), Ok(()));
         assert_eq!(dma_bits(&unnamed), 44);
         // An unnamed function of another class is not amdgpu's.
@@ -351,18 +330,13 @@ mod tests {
             assert_eq!(admits(&adapter(device, [3, 0, 0])), Ok(()), "{device:04x}");
         }
         // Every device of the table is admitted exactly where the rule
-        // says its family serves, and the image holds no support for a
-        // generation that does not: the profile leaves it unbuilt.
-        for &(device, family, generation, _, support, ..) in DEVICES {
+        // says its family serves. The build fails unless the profile holds
+        // amdgpu's support for exactly the generations that serve.
+        for &(device, family, generation, ..) in DEVICES {
             let serves = amd_metal::serves(family, generation);
             assert_eq!(
                 admits(&adapter(device, [3, 0, 0])).is_ok(),
                 serves,
-                "{device:04x} {family}"
-            );
-            assert_eq!(
-                matches!(support, Support::NotBuilt(_)),
-                generation < amd_metal::FIRST_GENERATION,
                 "{device:04x} {family}"
             );
         }

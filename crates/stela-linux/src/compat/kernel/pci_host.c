@@ -22,6 +22,8 @@ struct host_function {
 	 * function's with one. */
 	struct page *rom;
 	struct host_function *rom_next;
+	/* The lines of the function's MSI-X vectors while dev.msix_enabled. */
+	unsigned int msix_first, msix_count;
 };
 
 /* The functions with a platform ROM copy. Only the serialized owner attaches
@@ -225,9 +227,15 @@ static const struct dma_map_ops mapping_ops = {
 	.dma_supported = mask_supported,
 };
 
+static struct host_function *host_of(struct pci_dev *dev);
+static void disable_msix(struct pci_dev *dev);
+
 int pci_enable_msi(struct pci_dev *dev)
 {
 	const struct stela_linux_pci_function *function = of_bus(dev->bus);
+
+	if (dev->msix_enabled)
+		return -EINVAL;
 	int error = function->enable_msi(function->context);
 
 	dev->msi_enabled = !error;
@@ -248,27 +256,105 @@ void pci_disable_msi(struct pci_dev *dev)
 void pci_restore_msi_state(struct pci_dev *dev)
 {
 	const struct stela_linux_pci_function *function = of_bus(dev->bus);
+	unsigned int first = 0;
 
+	if (dev->msix_enabled &&
+	    (function->enable_msix(function->context, host_of(dev)->msix_count, &first) !=
+		     (int)host_of(dev)->msix_count ||
+	     first != host_of(dev)->msix_first)) {
+		pci_err(dev, "the owner could not write the MSI-X table again after a reset\n");
+		disable_msix(dev);
+	}
 	if (dev->msi_enabled && function->enable_msi(function->context)) {
 		pci_err(dev, "the owner could not route the message again after a reset\n");
 		dev->msi_enabled = 0;
 	}
 }
 
+bool stela_linux_pci_routes_msix(const struct pci_dev *dev)
+{
+	return dev->bus && dev->bus->ops == &config_ops && of_bus(dev->bus)->enable_msix;
+}
+
+static struct host_function *host_of(struct pci_dev *dev)
+{
+	return container_of(dev, struct host_function, dev);
+}
+
+int stela_linux_pci_msix_lines(struct pci_dev *dev)
+{
+	unsigned int first = 0;
+
+	if (!stela_linux_pci_routes_msix(dev))
+		return 0;
+	const struct stela_linux_pci_function *function = of_bus(dev->bus);
+	int lines = function->enable_msix(function->context, 0, &first);
+
+	return lines > 0 ? lines : 0;
+}
+
+/* MSI-X vectors, min_vecs to max_vecs of them, as drivers/pci/msi/msi.c
+ * sets them up: as many as the table holds and the owner routes, each
+ * masked until its line is enabled. */
+static int enable_msix(struct pci_dev *dev, unsigned int min_vecs, unsigned int max_vecs)
+{
+	const struct stela_linux_pci_function *function = of_bus(dev->bus);
+	int entries = pci_msix_vec_count(dev);
+	unsigned int first = 0;
+
+	if (entries < 0)
+		return entries;
+	if ((unsigned int)entries < min_vecs)
+		return -ENOSPC;
+	if (dev->msi_enabled || dev->msix_enabled)
+		return -EINVAL;
+	int vectors = function->enable_msix(function->context, min(max_vecs, (unsigned int)entries),
+					    &first);
+	if (vectors <= 0)
+		return vectors ? vectors : -ENOSPC;
+	if ((unsigned int)vectors < min_vecs) {
+		function->disable_msix(function->context);
+		return -ENOSPC;
+	}
+	host_of(dev)->msix_first = first;
+	host_of(dev)->msix_count = (unsigned int)vectors;
+	dev->msix_enabled = 1;
+	return vectors;
+}
+
+static void disable_msix(struct pci_dev *dev)
+{
+	const struct stela_linux_pci_function *function = of_bus(dev->bus);
+
+	if (dev->msix_enabled)
+		function->disable_msix(function->context);
+	dev->msix_enabled = 0;
+	host_of(dev)->msix_count = 0;
+}
+
 /* Interrupt vectors, following drivers/pci/msi/api.c: MSI-X, MSI and INTx
- * in that order, each only where the caller allows it. A function's owner
- * routes one message and no MSI-X table, so one vector is what there is, and
- * MSI-X alone is refused. */
+ * in that order, each only where the caller allows it. MSI-X gives as many
+ * vectors as its owner routes; MSI and INTx give one. */
 int pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int min_vecs, unsigned int max_vecs,
 			  unsigned int flags)
 {
 	int error = -ENOSPC;
+	bool tried_msix = (flags & PCI_IRQ_MSIX) && stela_linux_pci_routes_msix(dev);
 
 	if (!min_vecs || max_vecs < min_vecs)
 		return -ERANGE;
+	if (tried_msix) {
+		int vectors = enable_msix(dev, min_vecs, max_vecs);
+
+		if (vectors > 0)
+			return vectors;
+		error = vectors;
+	}
 	if (min_vecs > 1) {
-		stela_linux_unsupported("more than one PCI interrupt vector");
-		return -ENOSPC;
+		/* MSI and INTx give one vector; MSI-X, where routed, gave its answer. */
+		if (!tried_msix)
+			stela_linux_unsupported("more than one PCI interrupt vector");
+		return error;
 	}
 	if (flags & PCI_IRQ_MSI) {
 		error = pci_enable_msi(dev);
@@ -277,19 +363,23 @@ int pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int min_vecs, unsigned i
 	}
 	if ((flags & PCI_IRQ_INTX) && dev->irq)
 		return 1;
-	if (!(flags & (PCI_IRQ_MSI | PCI_IRQ_INTX)))
+	if (!(flags & (PCI_IRQ_MSI | PCI_IRQ_INTX)) && !stela_linux_pci_routes_msix(dev))
 		stela_linux_unsupported("PCI MSI-X vectors");
 	return error;
 }
 
 void pci_free_irq_vectors(struct pci_dev *dev)
 {
+	disable_msix(dev);
 	pci_disable_msi(dev);
 }
 
-/* The Linux interrupt of vector nr: the function's one line or message. */
+/* The Linux interrupt of vector nr: an MSI-X vector's line, or the
+ * function's one line or message. */
 int pci_irq_vector(struct pci_dev *dev, unsigned int nr)
 {
+	if (dev->msix_enabled)
+		return nr < host_of(dev)->msix_count ? (int)(host_of(dev)->msix_first + nr) : -EINVAL;
 	return nr ? -EINVAL : (int)dev->irq;
 }
 
@@ -637,6 +727,111 @@ static void test_identity(void)
 	pci_unregister_driver(&late);
 }
 
+/* A function with an MSI-X table of eight entries, whose owner routes as
+ * many vectors as msix_routes allows. */
+static u8 msix_config[256];
+static int msix_routes;
+static unsigned int msix_asked, msix_enabled_vectors, msix_writes;
+
+static int msix_read(void *context, int where, int size, u32 *value)
+{
+	assert(context == msix_config);
+	*value = 0;
+	memcpy(value, &msix_config[where], (size_t)size);
+	return 0;
+}
+
+static int msix_write(void *context, int where, int size, u32 value)
+{
+	assert(context == msix_config);
+	memcpy(&msix_config[where], &value, (size_t)size);
+	return 0;
+}
+
+static int msix_lines = 64;
+
+static int msix_enable(void *context, unsigned int vectors, unsigned int *first_irq)
+{
+	assert(context == msix_config);
+	if (!vectors)
+		return msix_lines;
+	msix_asked = vectors;
+	msix_writes++;
+	if (msix_routes < 0)
+		return msix_routes;
+	msix_enabled_vectors = min(vectors, (unsigned int)msix_routes);
+	*first_irq = 40;
+	return (int)msix_enabled_vectors;
+}
+
+static void msix_disable(void *context)
+{
+	assert(context == msix_config);
+	msix_enabled_vectors = 0;
+}
+
+/* MSI-X gives as many vectors as the owner routes, each its own line, and
+ * falls back to MSI where it routes none or too few. */
+static void test_msix(void)
+{
+	memcpy(&msix_config[PCI_VENDOR_ID], "\x86\x80\xa0\x56", 4);
+	memcpy(&msix_config[PCI_CLASS_REVISION], "\x08\x00\x00\x03", 4);
+	msix_config[PCI_STATUS] = PCI_STATUS_CAP_LIST;
+	msix_config[PCI_CAPABILITY_LIST] = 0x60;
+	msix_config[0x60] = PCI_CAP_ID_MSIX;
+	*(u16 *)&msix_config[0x60 + PCI_MSIX_FLAGS] = 7;
+	struct stela_linux_pci_function function = {
+		.context = msix_config, .read_config = msix_read, .write_config = msix_write,
+		.dma_map = test_map, .dma_unmap = test_unmap,
+		.enable_msi = test_enable_msi, .disable_msi = test_disable_msi,
+		.enable_msix = msix_enable, .disable_msix = msix_disable,
+		.dma_limit = DMA_BIT_MASK(40), .bus = 4, .devfn = PCI_DEVFN(0, 0), .irq = 11,
+	};
+	struct pci_dev *dev = stela_linux_pci_attach(&function, NULL);
+	unsigned int before = refusals;
+
+	assert(dev && stela_linux_pci_routes_msix(dev) && pci_msix_vec_count(dev) == 8);
+	/* No more entries than the owner has lines for; none left is MSI. */
+	msix_lines = 3;
+	assert(pci_msix_vec_count(dev) == 3 && refusals == before);
+	msix_lines = 0;
+	assert(pci_msix_vec_count(dev) == -EINVAL && refusals == before + 1);
+	refusals = before;
+	msix_lines = 64;
+	assert(!msix_asked);
+	msix_routes = 8;
+	assert(pci_alloc_irq_vectors(dev, 1, 4, PCI_IRQ_MSIX) == 4 && msix_asked == 4);
+	assert(dev->msix_enabled && msix_enabled_vectors == 4 && !on_message);
+	assert(pci_irq_vector(dev, 0) == 40 && pci_irq_vector(dev, 3) == 43);
+	assert(pci_irq_vector(dev, 4) == -EINVAL);
+	assert(pci_enable_msi(dev) == -EINVAL && !on_message);
+	/* After a reset, the same vectors are written again. */
+	msix_writes = 0;
+	pci_restore_msi_state(dev);
+	assert(msix_writes == 1 && msix_asked == 4 && dev->msix_enabled);
+	pci_free_irq_vectors(dev);
+	assert(!dev->msix_enabled && !msix_enabled_vectors);
+
+	/* No more than the table holds; fewer where the routes run out. */
+	assert(pci_alloc_irq_vectors(dev, 1, 64, PCI_IRQ_MSIX) == 8 && msix_asked == 8);
+	pci_free_irq_vectors(dev);
+	msix_routes = 2;
+	assert(pci_alloc_irq_vectors(dev, 1, 4, PCI_IRQ_ALL_TYPES) == 2);
+	pci_free_irq_vectors(dev);
+
+	/* Too few routes for the minimum: none kept, and MSI gives one alone. */
+	msix_routes = 1;
+	assert(pci_alloc_irq_vectors(dev, 2, 4, PCI_IRQ_MSIX) == -ENOSPC);
+	assert(!dev->msix_enabled && !msix_enabled_vectors);
+	assert(pci_alloc_irq_vectors(dev, 9, 9, PCI_IRQ_MSIX) == -ENOSPC);
+	msix_routes = -ENOSPC;
+	assert(pci_alloc_irq_vectors(dev, 1, 4, PCI_IRQ_MSIX | PCI_IRQ_MSI) == 1);
+	assert(on_message && !dev->msix_enabled && pci_irq_vector(dev, 0) == 11);
+	pci_free_irq_vectors(dev);
+	assert(!on_message && refusals == before);
+	stela_linux_pci_remove_device(dev);
+}
+
 static const struct stela_linux_services test_services = {.unsupported = test_unsupported};
 static const struct stela_linux_owner test_owner = {.services = &test_services};
 
@@ -664,6 +859,7 @@ int main(void)
 
 	assert(dev && !stela_linux_pci_bound(dev));
 	test_identity();
+	test_msix();
 
 	assert(dev && dev->vendor == 0x10de && dev->device == 0x2d07);
 	assert(dev->subsystem_vendor == 0x1043 && dev->subsystem_device == 0x8721);

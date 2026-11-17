@@ -85,7 +85,7 @@ use stela_drivers::{
 use stela_engine::machine::engine::Hub;
 use stela_linux::{
     catalogue::{FunctionCustody, PciAuthority, PciFirmware},
-    function::{self, Attached, Msi, Placement, Region},
+    function::{self, Attached, Msi, Placement, Region, msix},
     kernel::KernelOwner,
     owner::{Errno, Platform, RealtimeOrigin, RealtimeRead},
     random::Seeded,
@@ -105,6 +105,8 @@ const ERANGE: Errno = -34;
 const ENODEV: Errno = -19;
 const EINVAL: Errno = -22;
 const ENOMEM: Errno = -12;
+const EBUSY: Errno = -16;
+const ENOSPC: Errno = -28;
 const EOPNOTSUPP: Errno = -95;
 
 const MSI_CAPABILITY: u8 = 5;
@@ -699,6 +701,126 @@ unsafe impl Source for MsiSource {
     }
 }
 
+/// The uncached mapping of a function's MSI-X table, kept for the boot.
+struct UcTable(*mut u32);
+
+// SAFETY: `msix_for` maps exactly the table's pages uncached and never unmaps
+// them; each volatile access is one aligned dword in order.
+unsafe impl msix::TableAccess for UcTable {
+    fn read32(&self, offset: u64) -> u32 {
+        // SAFETY: offset below the table length, per the trait.
+        unsafe { self.0.byte_add(offset as usize).read_volatile() }
+    }
+    fn write32(&self, offset: u64, value: u32) {
+        // SAFETY: as above.
+        unsafe { self.0.byte_add(offset as usize).write_volatile(value) }
+    }
+}
+
+fn vector_error(error: msix::Error) -> IrqError {
+    match error {
+        msix::Error::Config(error) => error.into(),
+        msix::Error::Readback { .. } | msix::Error::Disabled => IrqError::Mask,
+        msix::Error::Control { .. } => IrqError::FailedRead,
+        msix::Error::Index => IrqError::Route,
+    }
+}
+
+/// A function's MSI-X: its table and the lines Linux knows its vectors by.
+struct Msix {
+    table: Rc<msix::Table<UcTable>>,
+    lines: Rc<RefCell<Vec<Line>>>,
+    /// The first line given to the vectors, and how many.
+    given: Cell<Option<(u32, u32)>>,
+}
+
+/// The MSI-X table of `device`, mapped, where its capability places the
+/// table and pending bits inside the function's memory BARs.
+fn msix_for(
+    window: &'static Window,
+    device: &Device,
+    placement: &Placement,
+    lines: &Rc<RefCell<Vec<Line>>>,
+) -> Option<Rc<Msix>> {
+    let layout = msix::Layout::read(&device.config, device.msix_capability?).ok()?;
+    let address = layout.table_address(&placement.regions)?;
+    let first = address & !(PAGE - 1);
+    let pages = usize::try_from((address - first + layout.table_bytes()).div_ceil(PAGE)).ok()?;
+    let base = window.reserve(pages)?;
+    for page in 0..pages as u64 {
+        if !window.install(base + page * PAGE, first + page * PAGE, Cache::Uncached) {
+            if window.remove(base, pages) {
+                window.release(base, pages);
+            }
+            return None;
+        }
+    }
+    let table = UcTable((base + (address - first)) as *mut u32);
+    Some(Rc::new(Msix {
+        table: Rc::new(msix::Table::new(layout, table)),
+        lines: lines.clone(),
+        given: Cell::new(None),
+    }))
+}
+
+/// One MSI-X vector of a function, routed to the boot CPU.
+struct MsixSource {
+    table: Rc<msix::Table<UcTable>>,
+    index: u16,
+    requester: stela_drivers::bus::pci::requester::RequesterId,
+    programmed: bool,
+    event: stela_linux::service::IrqEvent,
+    environment: *const Environment,
+    line: u32,
+}
+
+// SAFETY: as MsiSource's: the vector had no route of its own when its line
+// was given, and a programmed route's close refuses and retains its owners.
+unsafe impl Source for MsixSource {
+    fn mask(&mut self) -> Result<(), IrqError> {
+        self.table.mask(self.index).map_err(vector_error)
+    }
+    fn quiesce(&mut self) -> Result<(), IrqError> {
+        if self.programmed {
+            return Err(IrqError::Unsupported);
+        }
+        self.mask()
+    }
+    fn route_kind(&self) -> stela_drivers::bus::irq::RouteKind {
+        stela_drivers::bus::irq::RouteKind::Msi
+    }
+    fn requester(&self) -> Option<&stela_drivers::bus::pci::requester::RequesterId> {
+        Some(&self.requester)
+    }
+    unsafe fn program(
+        &mut self,
+        route: &stela_drivers::bus::irq::AllocatedRoute<'_>,
+    ) -> Result<(), IrqError> {
+        let Route::Msi(message) = route.programming() else {
+            return Err(IrqError::Route);
+        };
+        self.programmed = true;
+        self.table
+            .program(self.index, message.address, message.data)
+            .map_err(vector_error)
+    }
+    unsafe fn unmask(&mut self) -> Result<(), IrqError> {
+        self.table.unmask(self.index).map_err(vector_error)
+    }
+    unsafe fn synchronize(&mut self) -> Result<(), IrqError> {
+        unsafe extern "C" {
+            fn stela_linux_irq_actions_joined(irq: u32) -> bool;
+        }
+        // SAFETY: as MsiSource's.
+        if !unsafe { stela_linux_irq_actions_joined(self.line) } {
+            return Err(IrqError::Drain);
+        }
+        self.event.begin_close();
+        // SAFETY: as MsiSource's.
+        unsafe { (&*self.environment).join_irq(&self.event) }.map_err(|_| IrqError::Drain)
+    }
+}
+
 /// The GPU interrupts taken, which the host beat reports.
 static FIRED: AtomicU64 = AtomicU64::new(0);
 
@@ -726,6 +848,9 @@ impl Handler for Fired {
 struct Device {
     config: SharedConfig,
     msi: Option<Msi>,
+    msix_capability: Option<u16>,
+    /// Its MSI-X table, mapped when Linux starts.
+    msix: Option<Rc<Msix>>,
     custody: Rc<FunctionCustody>,
     _views: ManuallyDrop<GpuViews>,
     _resources: ManuallyDrop<Vec<owned::Resource>>,
@@ -748,12 +873,80 @@ impl function::Host for Device {
         }
         Ok(())
     }
+    fn routes_msix(&self) -> bool {
+        self.msix.is_some()
+    }
+    fn enable_msix(&mut self, vectors: u32) -> Result<(u32, u32), function::MsiError> {
+        let Some(msix) = self.msix.clone() else {
+            return Err(function::MsiError::Native(EOPNOTSUPP));
+        };
+        let entries = u32::from(msix.table.layout().entries);
+        let Ok(mut lines) = msix.lines.try_borrow_mut() else {
+            return Err(function::MsiError::Native(EBUSY));
+        };
+        // The lines already given, up to the first one retired, serve a
+        // write-back after a reset or vectors set up again. New ones stay
+        // below the lines Linux leaves to owners.
+        let given = msix.given.get();
+        let reusable = given.map_or(0, |(first, given)| {
+            lines[first as usize..(first + given) as usize]
+                .iter()
+                .take_while(|line| line.retired.is_none())
+                .count() as u32
+        });
+        let free = stela_linux::service::LINES.saturating_sub(lines.len() as u32);
+        if vectors == 0 {
+            return Ok((0, reusable.max(free).min(entries)));
+        }
+        let wanted = vectors.min(entries);
+        let (first, count) = match given {
+            Some((first, _)) if reusable >= wanted => (first, wanted),
+            _ => {
+                let count = wanted.min(free);
+                if count == 0 {
+                    return Err(function::MsiError::Native(ENOSPC));
+                }
+                let first = lines.len() as u32;
+                lines
+                    .try_reserve(count as usize)
+                    .map_err(|_| function::MsiError::Native(ENOMEM))?;
+                lines.extend((0..count).map(|index| Line {
+                    config: self.config.clone(),
+                    msi: None,
+                    msix: Some((msix.table.clone(), index as u16)),
+                    custody: self.custody.clone(),
+                    registration: None,
+                    retired: None,
+                }));
+                msix.given.set(Some((first, count)));
+                (first, count)
+            }
+        };
+        drop(lines);
+        match msix.table.enable(&mut self.config) {
+            Ok(()) => Ok((first, count)),
+            Err(msix::Error::Config(error)) => Err(function::MsiError::Config(error)),
+            Err(_) => Err(function::MsiError::Native(EIO)),
+        }
+    }
+    fn disable_msix(&mut self) -> Result<(), function::MsiError> {
+        let Some(msix) = &self.msix else {
+            return Ok(());
+        };
+        match msix.table.disable(&mut self.config) {
+            Ok(()) => Ok(()),
+            Err(msix::Error::Config(error)) => Err(function::MsiError::Config(error)),
+            Err(_) => Err(function::MsiError::Native(EIO)),
+        }
+    }
 }
 
 /// An interrupt line Linux knows a function by, its index in `Host::lines`.
 struct Line {
     config: SharedConfig,
     msi: Option<Msi>,
+    /// The table and entry of an MSI-X vector's line.
+    msix: Option<(Rc<msix::Table<UcTable>>, u16)>,
     custody: Rc<FunctionCustody>,
     registration: Option<Box<dyn IrqRegistration>>,
     retired: Option<stela_drivers::bus::irq::RetiredSource<dyn Source>>,
@@ -774,7 +967,8 @@ struct Host {
     bars: Vec<Range<u64>>,
     /// Device mappings' sizes in pages, by address.
     devices: RefCell<BTreeMap<u64, usize>>,
-    lines: RefCell<Vec<Line>>,
+    /// Shared with each function's MSI-X, which adds its vectors' lines.
+    lines: Rc<RefCell<Vec<Line>>>,
     /// The unsupported operations already reported.
     reported: RefCell<BTreeSet<String>>,
     /// The first error Linux reported, which a stop before the start
@@ -1026,9 +1220,11 @@ impl Platform for Host {
                 .unmask()
                 .map_err(|_| IrqEnableError::retained(EIO));
         }
-        let Some(msi) = line.msi else {
+        let vector = match (&line.msix, line.msi) {
+            (Some((table, index)), _) => Ok((table.clone(), *index)),
+            (None, Some(msi)) => Err(msi),
             // SAFETY: no native attempt or service epoch was issued.
-            return Err(unsafe { IrqEnableError::unexposed(EOPNOTSUPP) });
+            (None, None) => return Err(unsafe { IrqEnableError::unexposed(EOPNOTSUPP) }),
         };
         // The attachment's own route: its root decides how messages arrive.
         // SAFETY: a short borrow on the original process; nothing reenters.
@@ -1043,15 +1239,26 @@ impl Platform for Host {
         // SAFETY: actual original entered process; any preceding epoch joined.
         let event = unsafe { self.environment().irq_epoch(irq) }
             .map_err(|_| IrqEnableError::retained(EIO))?;
-        let source = Box::new(MsiSource {
-            config: line.config.clone(),
-            msi,
-            requester: line.custody.requester().clone(),
-            programmed: false,
-            event: event.clone(),
-            environment: self.environment.get(),
-            line: irq,
-        });
+        let source: Box<dyn Source> = match vector {
+            Ok((table, index)) => Box::new(MsixSource {
+                table,
+                index,
+                requester: line.custody.requester().clone(),
+                programmed: false,
+                event: event.clone(),
+                environment: self.environment.get(),
+                line: irq,
+            }),
+            Err(msi) => Box::new(MsiSource {
+                config: line.config.clone(),
+                msi,
+                requester: line.custody.requester().clone(),
+                programmed: false,
+                event: event.clone(),
+                environment: self.environment.get(),
+                line: irq,
+            }),
+        };
         let handler = Arc::new(Fired {
             event: event.clone(),
         });
@@ -1618,6 +1825,10 @@ fn claim(
         .iter()
         .find(|(_, id)| *id == MSI_CAPABILITY)
         .map(|(offset, _)| Msi::at(u16::from(*offset)));
+    let msix_capability = capabilities
+        .iter()
+        .find(|(_, id)| *id == msix::CAPABILITY)
+        .map(|(offset, _)| u16::from(*offset));
     #[cfg(feature = "nvk")]
     let drm = {
         let config = function.config();
@@ -1653,6 +1864,8 @@ fn claim(
         device: Device {
             config: SharedConfig(Rc::new(RefCell::new(ManuallyDrop::into_inner(function)))),
             msi,
+            msix_capability,
+            msix: None,
             custody: FunctionCustody::new(ManuallyDrop::into_inner(attachment)),
             _views: views,
             _resources: resources,
@@ -2369,7 +2582,7 @@ pub(super) fn amd_acpi_methods(
 /// failed, as the guest should not start with a half-started GPU beneath it.
 pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error> {
     // Keep the exact original claims on every partial startup refusal.
-    let claimed = ManuallyDrop::new(claimed);
+    let mut claimed = ManuallyDrop::new(claimed);
     let Machine {
         work,
         window,
@@ -2388,11 +2601,16 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         .map(|claimed| Line {
             config: claimed.device.config.clone(),
             msi: claimed.device.msi,
+            msix: None,
             custody: claimed.device.custody.clone(),
             registration: None,
             retired: None,
         })
         .collect();
+    let lines = Rc::new(RefCell::new(lines));
+    for claimed in claimed.iter_mut() {
+        claimed.device.msix = msix_for(window, &claimed.device, &claimed.placement, &lines);
+    }
     let bars = claimed
         .iter()
         .flat_map(|claimed| claimed.bars.iter().cloned())
@@ -2448,7 +2666,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         environment: Cell::new(ptr::null()),
         bars,
         devices: RefCell::new(BTreeMap::new()),
-        lines: RefCell::new(lines),
+        lines,
         reported: RefCell::new(BTreeSet::new()),
         first_error: RefCell::new(None),
         gsp_start: RefCell::new(Default::default()),

@@ -14,6 +14,10 @@ bool stela_linux_pci_devices_present(void);
  * from a successful absent capability (*found == 0). No context ownership moves. */
 int stela_linux_pci_find_capability(struct pci_dev *dev, int cap, u8 *found);
 bool stela_linux_pci_bound(const struct pci_dev *device);
+/* Whether the owner of an attached function routes its MSI-X table, and
+ * how many vectors it has lines for (0 for none or no table). */
+bool stela_linux_pci_routes_msix(const struct pci_dev *device);
+int stela_linux_pci_msix_lines(struct pci_dev *device);
 void stela_linux_pci_shutdown(struct pci_dev *dev);
 void stela_linux_pci_remove_device(struct pci_dev *dev);
 
@@ -60,9 +64,19 @@ struct stela_linux_pci_function {
 	/* The expansion ROM BAR where the owner placed it, decoding off, which
 	 * the attach keeps as PCI_ROM_RESOURCE: size 0 for none. */
 	struct stela_linux_pci_region rom_bar;
+	/* Optional MSI-X, NULL where the owner routes none: set up to `vectors`
+	 * entries of the function's MSI-X table, each masked until its line is
+	 * enabled, on consecutive lines from *first_irq. Returns how many it set
+	 * up (fewer where its lines run out) or a negative errno. Called again
+	 * while enabled, it writes the same entries back, as after a reset.
+	 * `vectors` 0 sets up nothing and returns how many it could. */
+	int (*enable_msix)(void *context, unsigned int vectors, unsigned int *first_irq);
+	void (*disable_msix)(void *context);
 };
 
-_Static_assert(sizeof(struct stela_linux_pci_function) == 280, "Linux PCI function ABI");
+_Static_assert(sizeof(struct stela_linux_pci_function) == 296, "Linux PCI function ABI");
+_Static_assert(__builtin_offsetof(struct stela_linux_pci_function, enable_msix) == 280,
+	       "Linux PCI MSI-X ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_pci_function, rom_bar) == 256,
 	       "Linux PCI ROM BAR ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_pci_function, release_context) == 224,

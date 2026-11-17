@@ -889,7 +889,12 @@ bool pci_pme_capable(struct pci_dev *dev, pci_power_t state)
 }
 
 /* The entries of the function's MSI-X table, following
- * drivers/pci/msi/api.c. */
+ * drivers/pci/msi/api.c, which answers -EINVAL for a function without an
+ * MSI-X capability: no more than its owner has lines for, since a driver
+ * may ask for every entry it is told of (xe does). Where the owner routes
+ * no MSI-X table or has no line left, Linux sees the function as one
+ * without the capability, and a driver that takes MSI-X when it is offered
+ * takes its one MSI vector instead, said once. */
 int pci_msix_vec_count(struct pci_dev *dev)
 {
 	u8 capability = pci_find_capability(dev, PCI_CAP_ID_MSIX);
@@ -897,7 +902,13 @@ int pci_msix_vec_count(struct pci_dev *dev)
 
 	if (!capability || pci_read_config_word(dev, capability + PCI_MSIX_FLAGS, &control))
 		return -EINVAL;
-	return (control & PCI_MSIX_FLAGS_QSIZE) + 1;
+	int lines = stela_linux_pci_msix_lines(dev);
+
+	if (lines <= 0) {
+		stela_linux_unsupported("PCI MSI-X tables: a function's driver gets its one MSI vector");
+		return -EINVAL;
+	}
+	return min((control & PCI_MSIX_FLAGS_QSIZE) + 1, lines);
 }
 
 /* BAR mappings, following drivers/pci/iomap.c. A port range has no mapping
@@ -1197,7 +1208,7 @@ static void log_line(void *context, int level, const char *message)
 		warnings++;
 }
 
-static unsigned int port_mappings, bus_windows, resizes;
+static unsigned int port_mappings, bus_windows, resizes, msix_tables;
 
 static void unsupported(void *context, const char *operation)
 {
@@ -1208,6 +1219,8 @@ static void unsupported(void *context, const char *operation)
 		bus_windows++;
 	else if (!strcmp(operation, "resizing a PCI BAR: BARs keep the sizes the firmware gave"))
 		resizes++;
+	else if (!strcmp(operation, "PCI MSI-X tables: a function's driver gets its one MSI vector"))
+		msix_tables++;
 	else
 		assert(false);
 }
@@ -1315,15 +1328,16 @@ int main(void)
 	stela_linux_devres_release(&dev.dev);
 	assert(!atomic_read(&dev.enable_cnt));
 
-	/* PME# from D3hot and D3cold only; an MSI-X table of eight entries. */
+	/* PME# from D3hot and D3cold only; an MSI-X table of eight entries,
+	 * which is not offered, since the owner routes one message. */
 	*(u16 *)&config[0x50 + PCI_PM_PMC] = 0x18 << PCI_PM_CAP_PME_SHIFT;
 	assert(pci_pme_capable(&dev, PCI_D3hot) && pci_pme_capable(&dev, PCI_D3cold));
 	assert(!pci_pme_capable(&dev, PCI_D0) && !pci_pme_capable(&dev, PCI_D2));
-	assert(pci_msix_vec_count(&dev) == -EINVAL);
+	assert(pci_msix_vec_count(&dev) == -EINVAL && !msix_tables);
 	config[0x60] = PCI_CAP_ID_MSIX;
 	config[0x61] = 0;
 	*(u16 *)&config[0x60 + PCI_MSIX_FLAGS] = 7;
-	assert(pci_msix_vec_count(&dev) == 8);
+	assert(pci_msix_vec_count(&dev) == -EINVAL && msix_tables == 1);
 
 	/* No extended list, then a resizable BAR capability behind another:
 	 * BAR 2 offers 256 MiB to 8 GiB. No bus lists a window to grow into. */

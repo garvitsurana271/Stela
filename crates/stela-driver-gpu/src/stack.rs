@@ -243,10 +243,12 @@ const AMD_VULKAN: Option<crate::metal::native::Driver> = Some(crate::metal::amd:
 ))]
 const AMD_VULKAN: Option<crate::metal::native::Driver> = None;
 
-/// xe with the display code it shares with i915, and ANV's admission. Its
-/// Vulkan driver is not given yet, even in an image that holds ANV: ANV has
-/// run on no Intel GPU under Stela. Until then its GPU shows the frames
-/// another GPU draws, on the displays wired to it.
+/// xe with the display code it shares with i915, ANV's admission and ANV
+/// as its Vulkan driver when the image holds it. Whether its GPU serves the
+/// Metal device is [`metal_devices`]' choice: an integrated GPU does when no
+/// discrete GPU draws, and otherwise shows the frames another GPU draws on
+/// the displays wired to it. An image built without ANV's tools holds no
+/// ANV, and then its GPUs only show frames.
 #[cfg(feature = "xe-port")]
 pub static INTEL: GpuStack = GpuStack {
     vendor: Vendor::Intel,
@@ -268,7 +270,9 @@ pub static INTEL: GpuStack = GpuStack {
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::intel::ADMISSION),
-    #[cfg(all(feature = "metal-linked", not(test)))]
+    #[cfg(all(feature = "metal-linked", not(test), stela_vulkan_intel))]
+    vulkan: Some(crate::metal::intel::DRIVER),
+    #[cfg(all(feature = "metal-linked", not(test), not(stela_vulkan_intel)))]
     vulkan: None,
 };
 
@@ -631,7 +635,7 @@ mod tests {
 
     #[cfg(feature = "xe-port")]
     #[test]
-    fn intel_is_selected_only_for_a_device_of_xes_table_and_draws_nothing() {
+    fn intel_is_selected_only_for_a_device_of_xes_table() {
         // Tiger Lake's UHD Graphics, then an ID no table holds.
         let mut tiger_lake = adapter(0x8086);
         tiger_lake.device = 0x9a49;
@@ -640,6 +644,7 @@ mod tests {
         assert_eq!(intel.kernel.driver, "xe");
         assert_eq!(intel.kernel.dma_limit(&tiger_lake), (1 << 39) - 1);
         assert!((intel.kernel.integrated)(&tiger_lake));
+        // This test binary links no Vulkan driver, ANV included.
         assert!(!intel.draws());
         #[cfg(feature = "metal")]
         assert!(intel.metal.is_some());

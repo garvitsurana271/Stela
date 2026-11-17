@@ -106,8 +106,9 @@ pub enum Command {
     },
     /// Build ANV for this machine with the image's options and run it on an
     /// xe render node with no GPU behind it: device creation, a BRW compute
-    /// pipeline and one submission per platform xe binds, through Stela's
-    /// libdrm stand-in, each xe ioctl checked against Stela's xe.
+    /// pipeline and one submission for each device xe admits that Mesa's
+    /// Intel table lists, through Stela's libdrm stand-in, each xe ioctl
+    /// checked against Stela's xe.
     AnvTest {
         /// Maximum parallel native compiler processes.
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]

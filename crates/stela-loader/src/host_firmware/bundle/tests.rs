@@ -491,7 +491,7 @@ fn the_boot_images_drivers_and_the_bundle_name_the_same_gpu_ports() {
     let loader = include_str!("../../../Cargo.toml");
     let cli = include_str!("../../../../stela-cli/Cargo.toml");
     let release = include_str!("../../../../../.github/workflows/release.yml");
-    // The boot's drivers and bundle without features: no AMD port in any.
+    // The boot's drivers and bundle without features: no port in any.
     let drivers = ports_of(line(boot, "stela-drivers = "));
     assert_eq!(drivers, Ports::NONE);
     assert_eq!(ports_of(line(boot, "stela-loader = ")), drivers);
@@ -504,6 +504,29 @@ fn the_boot_images_drivers_and_the_bundle_name_the_same_gpu_ports() {
     let port = line(cli, "amdgpu-port = ");
     assert!(port.contains("\"stela-loader/amdgpu-port\""), "{port}");
     assert!(line(cli, "default = ").contains("\"amdgpu-port\""));
+    // The same for the Intel port: the image reads the firmware of each
+    // driver its feature turns on, and `stela` writes it.
+    let intel = line(boot, "intel = ");
+    let of = |entries: &str, owner: &str| {
+        ports_of(
+            &entries
+                .split(',')
+                .filter(|entry| entry.contains(owner))
+                .collect::<String>(),
+        )
+    };
+    let driven = Ports {
+        amd: false,
+        intel: true,
+        i915: false,
+    };
+    assert_eq!(of(intel, "stela-drivers/"), driven, "{intel}");
+    assert_eq!(of(intel, "stela-loader/"), driven, "{intel}");
+    assert_eq!(ports_of(line(cli, "intel-port = ")), driven);
+    assert!(line(cli, "default = ").contains("\"intel-port\""));
+    // The image `xtask boot build` makes outside a release turns both on.
+    let features = include_str!("../../../../../xtask/src/boot.rs");
+    assert!(features.contains("{ \"nvk\" } else { \"nvk,amdgpu,intel\" }"));
     // A release builds its image without the port (`STELA_RELEASE`, which
     // `xtask boot build` reads) and `stela` without its default features.
     assert!(release.contains("STELA_RELEASE: \"1\""));

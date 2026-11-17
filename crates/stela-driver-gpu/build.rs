@@ -7,6 +7,9 @@ mod anv_tables;
 #[cfg(feature = "i915-port")]
 #[path = "build/i915.rs"]
 mod i915;
+#[cfg(feature = "i915-port")]
+#[path = "build/i915_tables.rs"]
+mod i915_tables;
 #[cfg(feature = "linux-drm")]
 #[path = "build/image.rs"]
 mod image;

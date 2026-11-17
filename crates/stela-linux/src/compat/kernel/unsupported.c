@@ -17,55 +17,6 @@
 #include <stela/linux.h>
 #include <unsupported.h>
 
-/* Pages behind shmem files: shmem-backed GEM objects and TTM's backup of
- * buffers it swaps out. TTM allocates pages from its own pool and Stela never
- * reclaims them, so nothing needs them; a page asked for anyway is refused,
- * said once, with the error Linux gives when shmem has no page to give, which
- * each caller returns (a GEM object's pages fail, a buffer stays unswapped).
- * No shmem page is ever read in, so a truncation finds none and a writeout or
- * a dirty bit has no page to act on. */
-struct folio *shmem_read_folio_gfp(struct address_space *mapping, pgoff_t index, gfp_t gfp)
-{
-	(void)mapping;
-	(void)index;
-	(void)gfp;
-	stela_linux_unsupported("pages of a shmem file: they are refused");
-	return ERR_PTR(-ENOMEM);
-}
-
-struct page *shmem_read_mapping_page_gfp(struct address_space *mapping, pgoff_t index, gfp_t gfp)
-{
-	(void)mapping;
-	(void)index;
-	(void)gfp;
-	stela_linux_unsupported("pages of a shmem file: they are refused");
-	return ERR_PTR(-ENOMEM);
-}
-
-void shmem_truncate_range(struct inode *inode, loff_t start, uoff_t end)
-{
-	(void)inode;
-	(void)start;
-	(void)end;
-}
-
-struct swap_iocb;
-int shmem_writeout(struct folio *folio, struct swap_iocb **plug, struct list_head *folio_list)
-{
-	(void)folio;
-	(void)plug;
-	(void)folio_list;
-	stela_linux_unsupported("writing a shmem page out: it is refused");
-	return -EOPNOTSUPP;
-}
-
-bool folio_clear_dirty_for_io(struct folio *folio)
-{
-	(void)folio;
-	stela_linux_unsupported("writing a shmem page out: it is refused");
-	return false;
-}
-
 /* An address for a client's mapping of a shmem-backed object, which only a
  * client with a Linux address space asks for; Stela's clients map through
  * their owner. It is refused, said once, as Linux refuses an address it

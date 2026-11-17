@@ -508,6 +508,54 @@ bool stela_linux_unmap_writable_folio(struct folio *folio)
 				VM_SHARED | VM_WRITE);
 }
 
+/* A mapping placed in the calling task's own address space (the legacy
+ * GEM_MMAP ioctl). Stela's clients map through their owner
+ * (stela_linux_mmap), so the task has no address space to place it in: it
+ * is refused, said once, as Linux refuses a mapping it cannot place, and the
+ * ioctl fails. Nothing is then found at an address by find_vma. */
+unsigned long vm_mmap(struct file *file, unsigned long addr, unsigned long len, unsigned long prot,
+		      unsigned long flag, unsigned long offset)
+{
+	(void)file, (void)addr, (void)len, (void)prot, (void)flag, (void)offset;
+	stela_linux_unsupported("a mapping in the calling task's address space: clients map "
+				"through their owner");
+	return (unsigned long)-ENODEV;
+}
+
+struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
+{
+	(void)mm, (void)addr;
+	return NULL;
+}
+
+/* A file's mmap_prepare run for a VMA the caller already made (a dma-buf's
+ * mmap of its backing file). Clients map a dma-buf through its owner's
+ * stela_linux_mmap, so the nested mapping is refused, said once. */
+int compat_vma_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	(void)file, (void)vma;
+	stela_linux_unsupported("mapping a file inside another file's mapping");
+	return -ENODEV;
+}
+
+/* A client's own pages pinned for the device (userptr objects). Stela's
+ * clients have no Linux page tables to walk, so none is pinned: it is
+ * refused, said once, as Linux refuses an address with no page, and a
+ * userptr object fails to get its pages. */
+int pin_user_pages_fast(unsigned long start, int nr_pages, unsigned int gup_flags,
+			struct page **pages)
+{
+	(void)start, (void)nr_pages, (void)gup_flags, (void)pages;
+	stela_linux_unsupported("pinning a client's pages: clients have no Linux page tables");
+	return -EFAULT;
+}
+
+/* pin_user_pages_fast pins none, so none comes back here. */
+void unpin_user_pages(struct page **pages, unsigned long npages)
+{
+	(void)pages, (void)npages;
+}
+
 #ifdef STELA_LINUX_MAPPING_TEST
 #include <linux/fdtable.h>
 #include <linux/anon_inodes.h>

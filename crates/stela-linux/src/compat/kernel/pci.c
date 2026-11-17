@@ -476,6 +476,40 @@ int pci_resize_resource(struct pci_dev *dev, int resno, int size, int exclude_ba
 	return -ENOTSUPP;
 }
 
+/* drivers/pci/bus.c's: a resource placed in a free part of the bus's
+ * windows. No bus has a window here (pci_bus_resource_n), so a driver that
+ * places a resource the firmware left unplaced goes without it: i915 then
+ * leaves MCHBAR off, as when Linux finds no room. */
+int pci_bus_alloc_resource(struct pci_bus *bus, struct resource *res, resource_size_t size,
+			   resource_size_t align, resource_size_t min, unsigned long type_mask,
+			   resource_alignf alignf, void *alignf_data)
+{
+	(void)bus, (void)res, (void)size, (void)align, (void)min, (void)type_mask;
+	(void)alignf, (void)alignf_data;
+	stela_linux_unsupported("placing a resource the firmware left unplaced in a PCI bus window: "
+				"the driver goes without it");
+	return -EBUSY;
+}
+
+/* The end of the legacy BIOS area (arch/x86/include/asm/e820/types.h). */
+#define BIOS_END 0x00100000
+
+/* arch/x86/pci/i386.c's alignment of a resource placed in a bus window,
+ * which pci_bus_alloc_resource asks for; it places none. */
+resource_size_t pcibios_align_resource(void *data, const struct resource *res,
+				       const struct resource *empty_res, resource_size_t size,
+				       resource_size_t align)
+{
+	resource_size_t start = res->start;
+
+	(void)data, (void)empty_res, (void)size, (void)align;
+	if ((res->flags & IORESOURCE_IO) && (start & 0x300))
+		start = (start + 0x3ff) & ~(resource_size_t)0x3ff;
+	else if ((res->flags & IORESOURCE_MEM) && start < BIOS_END)
+		start = BIOS_END;
+	return start;
+}
+
 /* What a BAR's resize released, assigned again. pci_resize_resource refuses
  * every resize, so each BAR keeps the firmware's assignment and nothing is
  * unassigned: there is nothing to do. */
@@ -877,6 +911,18 @@ int pci_dev_present(const struct pci_device_id *ids)
 
 /* Whether the function can signal PME# from state, as its power management
  * capability says (PCI PM 1.2, 3.2.3), which drivers/pci/pci.c caches. */
+/* drivers/pci/pci.c: whether the function may enter D3cold. Nothing here
+ * puts a function or its bridge into D3cold, so only the flag changes. */
+void pci_d3cold_enable(struct pci_dev *dev)
+{
+	dev->no_d3cold = false;
+}
+
+void pci_d3cold_disable(struct pci_dev *dev)
+{
+	dev->no_d3cold = true;
+}
+
 bool pci_pme_capable(struct pci_dev *dev, pci_power_t state)
 {
 	u8 capability = pci_find_capability(dev, PCI_CAP_ID_PM);

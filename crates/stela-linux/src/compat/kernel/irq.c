@@ -436,6 +436,26 @@ void synchronize_irq(unsigned int irq)
 	mutex_unlock(&line->request_mutex);
 }
 
+/* Linux code here runs on one owner at a time and a line's primary handlers
+ * run in that owner's hard-IRQ scope, so none is in flight while the caller
+ * runs; what is left is whether a threaded handler of the line is active,
+ * which Linux answers with false. */
+bool synchronize_hardirq(unsigned int irq)
+{
+	struct irq_line *line = line_owner(irq, false);
+	struct requested *request;
+	bool idle = true;
+
+	if (!line)
+		return true;
+	mutex_lock(&line->request_mutex);
+	list_for_each_entry(request, &requests, node)
+		if (request->line == line && READ_ONCE(request->thread_active))
+			idle = false;
+	mutex_unlock(&line->request_mutex);
+	return idle;
+}
+
 /* Run a line's primary handlers. The caller is in a hard-IRQ scope. */
 static void run_actions(unsigned int irq)
 {

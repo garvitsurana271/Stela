@@ -5,6 +5,8 @@
  * keeps which pages back each mapping, for vmalloc_to_page and vfree. */
 #include <linux/llist.h>
 #include <linux/mm.h>
+#include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/overflow.h>
 #include <linux/rbtree.h>
 #include <linux/slab.h>
@@ -47,6 +49,53 @@ static struct area *area_of(const void *address)
 }
 
 /* Maps area's pages and records the mapping, or leaves nothing mapped. */
+/* mm/vmalloc.c's purge notifiers, kept in priority order: when no mapping
+ * space is left, Linux asks them to release mappings they cache and tries
+ * once more if they freed any. */
+static struct notifier_block *purge_notifiers;
+static DEFINE_MUTEX(purge_notifiers_mutex);
+
+int register_vmap_purge_notifier(struct notifier_block *nb)
+{
+	struct notifier_block **link = &purge_notifiers;
+
+	mutex_lock(&purge_notifiers_mutex);
+	while (*link && (*link)->priority >= nb->priority)
+		link = &(*link)->next;
+	nb->next = *link;
+	*link = nb;
+	mutex_unlock(&purge_notifiers_mutex);
+	return 0;
+}
+
+int unregister_vmap_purge_notifier(struct notifier_block *nb)
+{
+	struct notifier_block **link = &purge_notifiers;
+	int error = -ENOENT;
+
+	mutex_lock(&purge_notifiers_mutex);
+	for (; *link; link = &(*link)->next)
+		if (*link == nb) {
+			*link = nb->next;
+			error = 0;
+			break;
+		}
+	mutex_unlock(&purge_notifiers_mutex);
+	return error;
+}
+
+static unsigned long purge_cached_mappings(void)
+{
+	unsigned long freed = 0;
+
+	mutex_lock(&purge_notifiers_mutex);
+	for (struct notifier_block *nb = purge_notifiers; nb; nb = nb->next)
+		if (nb->notifier_call(nb, 0, &freed) & NOTIFY_STOP_MASK)
+			break;
+	mutex_unlock(&purge_notifiers_mutex);
+	return freed;
+}
+
 static void *map_area(struct area *area)
 {
 	const struct stela_linux_owner *owner = stela_linux_owner();
@@ -60,6 +109,8 @@ static void *map_area(struct area *area)
 	for (unsigned int i = 0; i < area->count; i++)
 		physical[i] = page_to_phys(area->pages[i]);
 	void *address = owner->services->map_pages(owner->context, physical, area->count);
+	if (!address && purge_cached_mappings())
+		address = owner->services->map_pages(owner->context, physical, area->count);
 	kfree(physical);
 	if (address) {
 		area->address = address;

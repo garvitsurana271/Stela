@@ -16,8 +16,9 @@
 //! For each device a process of its own (`metal.rs`) opens the Metal device
 //! over it as the boot does, which checks every Vulkan requirement the
 //! device has and compiles its internal kernels through ACO, and reports
-//! the Metal families it derives, or the requirement RADV lacks there, by
-//! which the GPU shows displays only. With `--corpus`, one device of each
+//! the Metal families it derives, or the requirements RADV lacks there,
+//! which must be those the port's rule leaves the GPU out for
+//! (`stela_driver_core::amd_metal`). With `--corpus`, one device of each
 //! graphics generation also compiles every function of the Metal
 //! libraries given through the device's compiler and ACO.
 //!
@@ -140,7 +141,7 @@ pub fn test(jobs: u16, corpus: &[PathBuf]) -> Result<()> {
     let llvm = air_llvm()?;
     let library = link_library(&build, &output, &link, &llvm)?;
     let mut failures = Vec::new();
-    let mut opened = 0;
+    let (mut opened, mut left_out) = (0, 0);
     let mut classes = Vec::new();
     let sweeps = sweep_devices(&devices);
     for shim_device in &devices {
@@ -179,6 +180,11 @@ pub fn test(jobs: u16, corpus: &[PathBuf]) -> Result<()> {
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
+                // What the port's rule says RADV lacks on this generation:
+                // a GPU it names anything for is not claimed.
+                let expected: Vec<&str> =
+                    stela_driver_core::amd_metal::lacking(generation(&shim_device.level)?)
+                        .collect();
                 // The corpus runs on one device of each generation.
                 let sweep = !corpus.is_empty() && sweeps.contains(&device);
                 match open_metal(
@@ -188,15 +194,33 @@ pub fn test(jobs: u16, corpus: &[PathBuf]) -> Result<()> {
                     if sweep { &corpus } else { &[] },
                     &output,
                 ) {
+                    Ok(Opened::Metal(_)) if !expected.is_empty() => failures.push(format!(
+                        "{device} ({name}): the Metal device opened, yet the port leaves its \
+                         generation out as lacking {} (stela-driver-core's amd_metal)",
+                        expected.join(", ")
+                    )),
                     Ok(Opened::Metal(lines)) => {
                         opened += 1;
-                        // A display-only generation compiles nothing.
+                        // A generation left out compiles nothing.
                         if sweep {
                             classes.push(shim_device.level.as_str());
                         }
                         lines.iter().for_each(|line| println!("  {line}"));
                     }
-                    Ok(Opened::DisplayOnly(line)) => println!("  {line}"),
+                    Ok(Opened::LeftOut(line, lacks)) if lacks == expected => {
+                        left_out += 1;
+                        println!("  {line}");
+                    }
+                    Ok(Opened::LeftOut(_, lacks)) => failures.push(format!(
+                        "{device} ({name}): RADV lacks {}, where the port's rule for its \
+                         generation (stela-driver-core's amd_metal) names {}",
+                        lacks.join(", "),
+                        if expected.is_empty() {
+                            String::from("nothing, so the port would claim it")
+                        } else {
+                            expected.join(", ")
+                        }
+                    )),
                     Err(error) => failures.push(format!("{device} ({name}): {error:#}")),
                 }
             }
@@ -219,7 +243,7 @@ pub fn test(jobs: u16, corpus: &[PathBuf]) -> Result<()> {
     );
     println!(
         "RADV ran on amdgpu's ioctls for {} devices, with no GPU; the Metal device opened on {opened} \
-         of them{}",
+         of them and the port leaves out the other {left_out}, as its rule says{}",
         devices.len(),
         if corpus.is_empty() {
             String::from(", no Metal libraries given to compile")
@@ -234,12 +258,21 @@ pub fn test(jobs: u16, corpus: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// The graphics generation of one of Mesa's levels: `GFX10_3` is 10.
+fn generation(level: &str) -> Result<u8> {
+    level
+        .strip_prefix("GFX")
+        .and_then(|rest| rest.split('_').next()?.parse().ok())
+        .with_context(|| format!("{level} names no graphics generation"))
+}
+
 /// What the Metal device did on a device.
 enum Opened {
     /// It opened: its report, the corpus's included.
     Metal(Vec<String>),
-    /// RADV lacks a requirement: the GPU shows displays only.
-    DisplayOnly(String),
+    /// RADV lacks requirements, named in the report's line: the port leaves
+    /// the GPU out.
+    LeftOut(String, Vec<String>),
 }
 
 /// Runs `metal.rs` in a process of its own over the shim showing `device`,
@@ -283,7 +316,14 @@ fn open_metal(
     };
     let stdout = child(None, &output.join(format!("{device}.metal.log")))?;
     if let Some(line) = stdout.lines().find(|line| line.starts_with(metal::REFUSED)) {
-        return Ok(Opened::DisplayOnly(line.to_owned()));
+        let lacks = line
+            .split_once(metal::LACKS)
+            .and_then(|(_, rest)| rest.strip_suffix(metal::LEFT_OUT))
+            .with_context(|| format!("the Metal device's refusal names no requirement: {line}"))?;
+        return Ok(Opened::LeftOut(
+            line.to_owned(),
+            lacks.split(", ").map(str::to_owned).collect(),
+        ));
     }
     let mut lines: Vec<String> = stdout
         .lines()

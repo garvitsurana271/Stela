@@ -3084,6 +3084,7 @@ dependencies = [
  "stela-cli",
  "stela-compiler",
  "stela-contracts",
+ "stela-driver-core",
  "stela-drivers",
  "stela-engine",
  "stela-formats",

@@ -10,8 +10,8 @@
 //! ACO), the AMD admission with amdgpu's family as amdgpu's query answers it
 //! on the shim's render node, and the Metal device over both
 //! (`Device::new`, which derives Metal's capabilities). A device that misses
-//! a requirement is reported as the boot reports it: the GPU then shows
-//! displays only.
+//! a requirement is reported with every requirement it lacks: the port
+//! leaves such a GPU out (`stela_driver_core::amd_metal`).
 //!
 //! Then each Metal library given is compiled function by function through
 //! the device's compiler, as the NVIDIA corpus sweep compiles with NAK
@@ -68,6 +68,10 @@ const RENDER_NODE: &CStr = c"/dev/dri/renderD128";
 /// What the parent finds in the child's output.
 pub(super) const OPENED: &str = "Metal device:";
 pub(super) const REFUSED: &str = "Metal device refused:";
+/// What follows [`REFUSED`]: the requirements the device lacks, by name,
+/// between these.
+pub(super) const LACKS: &str = "the Vulkan device lacks ";
+pub(super) const LEFT_OUT: &str = "; the port leaves such a GPU out";
 pub(super) const CORPUS: &str = "Metal corpus:";
 
 fn log(message: &str) {
@@ -263,10 +267,7 @@ pub fn run(library: &Path, linux: &Path, corpus: &[PathBuf]) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("RADV's instance did not start: {error:?}"))?;
     let (_, missing) = surveyed.context("RADV offers no device at the shim's PCI function")?;
     if !missing.is_empty() {
-        println!(
-            "{REFUSED} the Vulkan device lacks {}, so the GPU shows displays only",
-            missing.join(", ")
-        );
+        println!("{REFUSED} {LACKS}{}{LEFT_OUT}", missing.join(", "));
         return Ok(());
     }
     // A missing entry point stops the run before the backend opens.
@@ -282,7 +283,7 @@ pub fn run(library: &Path, linux: &Path, corpus: &[PathBuf]) -> Result<()> {
     let (backend, compiler) = match opened {
         Ok(opened) => opened,
         Err(Error::Unsupported(missing)) => {
-            println!("{REFUSED} the Vulkan device lacks {missing}, so the GPU shows displays only");
+            println!("{REFUSED} {LACKS}{missing}{LEFT_OUT}");
             return Ok(());
         }
         Err(error) => bail!("the Metal device's backend did not open: {error:?}"),

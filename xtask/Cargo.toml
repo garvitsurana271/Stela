@@ -12,6 +12,9 @@ publish = false
 stela-engine.workspace = true
 stela-contracts = { path = "../crates/stela-contracts", default-features = false }
 stela-formats = { path = "../crates/stela-formats", default-features = false }
+# Which AMD graphics generations serve the Metal device, which `gpu radv-test`
+# compares with what RADV reports.
+stela-driver-core = { path = "../crates/stela-driver-core" }
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true

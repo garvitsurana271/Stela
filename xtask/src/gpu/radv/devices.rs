@@ -537,6 +537,15 @@ mod tests {
                 "{compute} has no graphics RADV runs"
             );
         }
+        // The families amdgpu's table names that RADV runs no device for
+        // are those the port leaves out as having no Vulkan device.
+        let unrun: Vec<String> = linux_ids(&sources().ids)
+            .into_keys()
+            .filter(|chip| !chips.contains(&chip.as_str()))
+            .collect();
+        let mut left_out = stela_driver_core::amd_metal::NO_VULKAN_FAMILIES.to_vec();
+        left_out.sort_unstable();
+        assert_eq!(unrun, left_out);
         assert_eq!(
             devices
                 .iter()

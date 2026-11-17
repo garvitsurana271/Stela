@@ -11,6 +11,7 @@
 #include <linux/property.h>
 #include <linux/rcupdate.h>
 #include <linux/regmap.h>
+#include <linux/relay.h>
 #include <linux/sched/mm.h>
 #include <linux/seq_file.h>
 #include <linux/swap.h>
@@ -170,6 +171,14 @@ STELA_UNSUPPORTED(int, single_open, struct file *, int (*)(struct seq_file *, vo
 STELA_UNSUPPORTED(int, single_release, struct inode *, struct file *)
 STELA_UNSUPPORTED(ssize_t, seq_read, struct file *, char __user *, size_t, loff_t *)
 STELA_UNSUPPORTED(loff_t, seq_lseek, struct file *, loff_t, int)
+/* Relay channels, which carry i915's GuC log to user space: only its debugfs
+ * file opens one, and the other calls run only on an open channel. */
+STELA_UNSUPPORTED(struct rchan *, relay_open, const char *, struct dentry *, size_t, size_t,
+		  const struct rchan_callbacks *, void *)
+STELA_UNSUPPORTED(void, relay_close, struct rchan *)
+STELA_UNSUPPORTED(void, relay_flush, struct rchan *)
+STELA_UNSUPPORTED(size_t, relay_switch_subbuf, struct rchan_buf *, size_t)
+STELA_UNSUPPORTED(int, relay_buf_full, struct rchan_buf *)
 /* Platform devices, which need the platform bus: only HDMI audio codecs and
  * the partitions of a partitioned accelerator reach DRM as such. */
 STELA_UNSUPPORTED(struct platform_device *, platform_device_register_full,

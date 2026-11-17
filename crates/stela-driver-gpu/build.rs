@@ -1,13 +1,16 @@
 #[cfg(feature = "amdgpu-port")]
 #[path = "build/amdgpu.rs"]
 mod amdgpu;
+#[cfg(feature = "i915-port")]
+#[path = "build/i915.rs"]
+mod i915;
 #[cfg(feature = "linux-drm")]
 #[path = "build/image.rs"]
 mod image;
 #[cfg(feature = "linux-drm")]
 #[path = "build/imports.rs"]
 mod imports;
-#[cfg(any(feature = "nouveau-port", feature = "xe-port"))]
+#[cfg(any(feature = "nouveau-port", feature = "xe-port", feature = "i915-port"))]
 #[path = "build/kbuild.rs"]
 mod kbuild;
 #[cfg(feature = "linux-kernel")]
@@ -59,6 +62,8 @@ fn main() {
     amdgpu::tables();
     #[cfg(feature = "xe-port")]
     xe::tables();
+    #[cfg(feature = "i915-port")]
+    i915::tables();
     // Clippy reads Rust and links nothing, so it needs no C objects.
     println!("cargo:rerun-if-env-changed=CLIPPY_ARGS");
     #[cfg(feature = "linux-kernel")]
@@ -76,7 +81,8 @@ fn main() {
     linux.tests(&mut tests);
     #[cfg(feature = "linux-drm")]
     {
-        let drivers = vec![
+        #[allow(unused_mut)]
+        let mut drivers: Vec<image::Driver> = vec![
             #[cfg(feature = "nouveau-port")]
             nouveau::port(&linux),
             #[cfg(feature = "xe-port")]
@@ -84,6 +90,16 @@ fn main() {
             #[cfg(feature = "amdgpu-port")]
             amdgpu::port(&linux),
         ];
+        // i915 comes last: it keeps the display code it shares with xe apart
+        // from the archives built before it.
+        #[cfg(feature = "i915-port")]
+        {
+            let others = drivers
+                .iter()
+                .map(|driver| driver.archive.clone())
+                .collect::<Vec<_>>();
+            drivers.push(i915::port(&linux, &others));
+        }
         image::link(&linux, drivers);
     }
     #[cfg(feature = "linux-kernel")]

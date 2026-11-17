@@ -13,6 +13,8 @@ pub mod metal;
 
 #[cfg(feature = "amdgpu-port")]
 pub mod amdgpu;
+#[cfg(feature = "i915-port")]
+pub mod i915;
 #[cfg(feature = "xe-port")]
 pub mod xe;
 

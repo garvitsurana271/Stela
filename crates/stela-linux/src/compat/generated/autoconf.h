@@ -153,6 +153,18 @@
  * driver for them, so it names every device of the table. */
 #define CONFIG_DRM_XE_FORCE_PROBE "*"
 
+/* i915 with display, for the Intel GPUs before Xe2. Its entry depends on
+ * X86, which names Linux's x86 arch; Stela's arch compiles for x86-64 with
+ * x86's instructions and port I/O, so the dependency's reason holds, while
+ * X86 itself stays unset. Of what i915 keys to it, the stolen memory the
+ * arch's early quirks find is served; the chipset GTT driver of graphics
+ * before Sandy Bridge and the SoC sideband bus of Bay Trail and Cherry
+ * Trail are not built, as no driver here is handed those GPUs. Linux's
+ * default force probe: none. */
+#define CONFIG_DRM_I915 1
+#define CONFIG_DRM_I915_FORCE_PROBE ""
+#define CONFIG_DRM_I915_USERPTR 1
+
 /* The drivers' parameter and scheduling defaults, as Linux's Kconfig sets them. */
 #define CONFIG_DRM_I915_REQUEST_TIMEOUT 20000
 #define CONFIG_DRM_I915_FENCE_TIMEOUT 10000

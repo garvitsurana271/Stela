@@ -2329,7 +2329,10 @@ pub unsafe fn probe_observed(
                 Some((gpu.address, companion.path().ok()?))
             })
             .collect();
-        devices.atrm = gpu_methods::atrm(session, &devices.gpus, &devices.gpu_companions);
+        // ATRM's image serves amdgpu alone: an image without it asks none.
+        if cfg!(feature = "amdgpu-port") {
+            devices.atrm = gpu_methods::atrm(session, &devices.gpus, &devices.gpu_companions);
+        }
     }
     attach_broadcom_bluetooth(
         broadcom_bluetooth,

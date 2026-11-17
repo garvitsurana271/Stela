@@ -229,7 +229,11 @@ pub(super) fn power_on_ports(acpi: &'static HostAcpi, source: &'static Source, t
             )),
         }
     }
-    atpx_power_on(acpi, source, &mut topology, tsc_hz);
+    // Only amdgpu drives a GPU that ATPX powers: an image without it leaves
+    // the GPU as firmware left it.
+    if cfg!(feature = "amdgpu") {
+        atpx_power_on(acpi, source, &mut topology, tsc_hz);
+    }
 }
 
 /// A hybrid laptop's discrete AMD GPU off with no power resources of its

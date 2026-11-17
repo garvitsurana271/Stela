@@ -329,28 +329,6 @@ int pcie_get_mps(struct pci_dev *dev)
 	return 128 << FIELD_GET(PCI_EXP_DEVCTL_PAYLOAD, ctl);
 }
 
-/* The largest read request the function issues, following
- * drivers/pci/pci.c. */
-int pcie_get_readrq(struct pci_dev *dev)
-{
-	u16 ctl;
-
-	pcie_capability_read_word(dev, PCI_EXP_DEVCTL, &ctl);
-	return 128 << FIELD_GET(PCI_EXP_DEVCTL_READRQ, ctl);
-}
-
-/* Sets the largest read request, following drivers/pci/pci.c under its
- * default bus configuration (no clamp to the payload size) and a host
- * bridge that lets requests grow (no_inc_mrrs unset). */
-int pcie_set_readrq(struct pci_dev *dev, int rq)
-{
-	if (rq < 128 || rq > 4096 || !is_power_of_2((unsigned long)rq))
-		return -EINVAL;
-	return pcibios_err_to_errno(pcie_capability_clear_and_set_word(
-		dev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_READRQ,
-		(u16)FIELD_PREP(PCI_EXP_DEVCTL_READRQ, (unsigned int)(ffs(rq) - 8))));
-}
-
 /* Atomic operation requests, following drivers/pci/pci.c: every port up to
  * the root must route them. A function's bus here has no bridge above it in
  * Linux's view, so, as Linux answers for a function without a root port, the
@@ -1391,14 +1369,6 @@ int main(void)
 	assert(pci_pcie_type(&dev) == PCI_EXP_TYPE_ENDPOINT && dev.pcie_mpss == 1);
 	assert(pcie_get_speed_cap(&dev) == PCIE_SPEED_8_0GT);
 	assert(pcie_get_width_cap(&dev) == PCIE_LNK_X16 && pcie_get_mps(&dev) == 256);
-	/* The read request size: 128 bytes, then 512 as si.c asks; the payload
-	 * field beside it stays. Sizes PCIe cannot encode are refused. */
-	assert(pcie_get_readrq(&dev) == 128);
-	assert(!pcie_set_readrq(&dev, 512) && pcie_get_readrq(&dev) == 512);
-	assert(*(u16 *)&config[0x70 + PCI_EXP_DEVCTL] == (2 << 12 | 1 << 5));
-	assert(pcie_set_readrq(&dev, 384) == -EINVAL && pcie_set_readrq(&dev, 8192) == -EINVAL);
-	assert(pcie_set_readrq(&dev, 64) == -EINVAL && pcie_get_readrq(&dev) == 512);
-	*(u16 *)&config[0x70 + PCI_EXP_DEVCTL] = 1 << 5;
 	/* An endpoint has no slot registers: they read as zero. */
 	u16 word = 0xffff;
 	*(u16 *)&config[0x70 + PCI_EXP_SLTCTL] = 0x1234;

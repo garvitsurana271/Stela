@@ -963,7 +963,9 @@ struct Host {
     image: Arc<kernel_work::ReadOnlyImage>,
     random: RefCell<Seeded>,
     environment: Cell<*const Environment>,
-    /// The memory BARs Stela claimed, which are all Linux may map.
+    /// The memory BARs Stela claimed and the graphics stolen memory the
+    /// firmware reserved for a claimed GPU: all the device memory Linux may
+    /// map.
     bars: Vec<Range<u64>>,
     /// Device mappings' sizes in pages, by address.
     devices: RefCell<BTreeMap<u64, usize>>,
@@ -1185,12 +1187,13 @@ impl Platform for Host {
         }
     }
 
-    fn map_pages(&self, physical: &[u64]) -> Option<*mut c_void> {
-        self.map(
-            physical.len(),
-            |page| physical[page as usize],
-            Cache::WriteBack,
-        )
+    fn map_pages(&self, physical: &[u64], write_combining: bool) -> Option<*mut c_void> {
+        let cache = if write_combining {
+            Cache::WriteCombining
+        } else {
+            Cache::WriteBack
+        };
+        self.map(physical.len(), |page| physical[page as usize], cache)
     }
 
     unsafe fn unmap_pages(&self, address: *mut c_void, count: usize) {
@@ -2634,7 +2637,10 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
     }
     let bars = claimed
         .iter()
-        .flat_map(|claimed| claimed.bars.iter().cloned())
+        .flat_map(|claimed| {
+            let stolen = claimed.stolen.map(|(base, size)| base..base + size);
+            claimed.bars.iter().cloned().chain(stolen)
+        })
         .collect();
     let clock = work.service_clock().map_err(environment_error)?;
     let epoch = clock.epoch().map_err(environment_error)?;

@@ -61,13 +61,6 @@ const OPEN: super::image::Open = &[
         "reopening a file without a VFS path",
         &["stela_linux_reopen_unowned_path"],
     ),
-    // A client's CPU mapping of an object (remap_io_sg, from the GTT and
-    // the mmap-offset fault handlers), and the kernel's mapping of an object
-    // without pages of its own (vmap_pfn: stolen memory).
-    (
-        "client page tables and mappings of frames",
-        &["apply_to_page_range", "zap_special_vma_range", "vmap_pfn"],
-    ),
     // The GuC log's relay channel, which only debugfs opens.
     (
         "relay channels",

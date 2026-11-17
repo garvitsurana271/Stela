@@ -54,6 +54,9 @@ static inline bool pgtable_l5_enabled(void)
 /* A 4 KiB entry's PAT bit is where a large entry's PSE bit is. */
 #define _PAGE_PAT	(_AT(pteval_t, 1) << 7)
 #define _PAGE_NX	(_AT(pteval_t, 1) << 63)
+/* The bits that select an entry's memory type through the PAT, which a
+ * remap keeps from the mapping it copies (i915's remap_io_mapping). */
+#define _PAGE_CACHE_MASK	(_PAGE_PWT | _PAGE_PCD | _PAGE_PAT)
 
 /* Original x86-64 pure value encodings, not page-table access authority.
  * pgtable_types.h selects this KNL mask for its 64-bit entry format. */

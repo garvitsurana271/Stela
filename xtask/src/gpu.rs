@@ -95,6 +95,12 @@ pub enum Command {
         /// Textures currently must refuse explicitly; no GPU work is submitted.
         #[arg(long, num_args = 2, requires = "llvm_library", value_names = ["TRIANGLE", "TEXTURE"])]
         render_inputs: Vec<PathBuf>,
+        /// Sweep these AIR modules from Apple's `metal -c` through the Metal
+        /// compiler, with NAK's options and with BRW's for each Intel
+        /// compiler generation, and compile each kernel by that compiler: a
+        /// census of the shader corpus. No GPU work is submitted.
+        #[arg(long, num_args = 1.., requires = "llvm_library", value_name = "MODULE")]
+        metal_corpus: Vec<PathBuf>,
     },
     /// Compile NVK, NIR and NAK's C for `stela.efi` against Stela's C library,
     /// with ANV and BRW when this host has the tools their build runs, and
@@ -170,6 +176,7 @@ pub fn run(command: Command) -> Result<()> {
             air_fp_profile,
             threadgroup_inputs,
             render_inputs,
+            metal_corpus,
         } => mesa::build(mesa::BuildOptions {
             jobs,
             require_all_targets,
@@ -180,6 +187,7 @@ pub fn run(command: Command) -> Result<()> {
             fp_profile: air_fp_profile.unwrap_or_default(),
             threadgroup_inputs: &threadgroup_inputs,
             render_inputs: &render_inputs,
+            metal_corpus: &metal_corpus,
         }),
         // `stela.efi` carries the kext it links against each boot's kernel.
         Command::Nvk { jobs } => build_nvk(jobs),

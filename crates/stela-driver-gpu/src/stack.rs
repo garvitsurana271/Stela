@@ -74,13 +74,45 @@ pub enum ResetState {
 }
 
 impl ResetState {
-    /// Why a lost device's reopen waits, `None` where it may run: while the
-    /// driver resets the GPU, the open of a new device, its first work and
-    /// every close wait for the reset's end, in the turn every client waits
-    /// on. The lost device stays, the connection that asked says why, and
-    /// the next one asks again.
-    pub fn holds_reopen(self) -> Option<&'static str> {
-        (self == Self::Resetting).then_some("its kernel driver is still resetting the GPU")
+    /// Why a lost device's reopen is refused, `None` where it may run: the
+    /// driver still resets the GPU after [`ResetWait`] waited for it. The
+    /// open of a new device, its first work and every close would wait for
+    /// the reset's end, in the turn every client waits on.
+    pub fn refuses_reopen(self) -> Option<&'static str> {
+        (self == Self::Resetting).then_some(RESET_DID_NOT_END)
+    }
+}
+
+/// The seconds a lost device's reopen waits for its kernel driver's reset
+/// of the GPU to end: the driver's own job timeout (10 s for amdgpu's
+/// graphics queues) and a full reset of the GPU with its firmware reloaded
+/// fit well within it.
+pub const RESET_WAIT_SECONDS: u64 = 30;
+
+const RESET_DID_NOT_END: &str = "its kernel driver's reset of the GPU did not end within 30 s";
+
+/// How long a lost device's reopen has waited for the driver's reset of
+/// the GPU. While the reset runs, a reopen waits: no new device is opened,
+/// the lost one stays, and the connection that asked says why. That is no
+/// failed reopen. Once the reset ran [`RESET_WAIT_SECONDS`], the reopen
+/// runs and is refused ([`ResetState::refuses_reopen`]), as any reopen that
+/// fails.
+#[derive(Debug, Default)]
+pub struct ResetWait {
+    since: Option<u64>,
+}
+
+impl ResetWait {
+    /// Why the reopen waits now, `None` where it runs: `state` is what the
+    /// watch answers at `now`, in ticks of `hz` a second.
+    pub fn wait(&mut self, state: Option<ResetState>, now: u64, hz: u64) -> Option<&'static str> {
+        if state != Some(ResetState::Resetting) {
+            self.since = None;
+            return None;
+        }
+        let since = *self.since.get_or_insert(now);
+        (now.saturating_sub(since) < hz.saturating_mul(RESET_WAIT_SECONDS))
+            .then_some("its kernel driver is still resetting the GPU")
     }
 }
 
@@ -749,10 +781,28 @@ mod tests {
         flags.set(1 | 1 << 5);
         assert_eq!((reset.state)(&mut answer, 7), Some(ResetState::Resetting));
         assert_eq!(asked[..2], [(0xc010_6442, 1, 0), (0xc010_6442, 4, 7)]);
-        // A lost device reopens once the reset ended, not during it.
-        assert_eq!(ResetState::Running.holds_reopen(), None);
-        assert_eq!(ResetState::Reset.holds_reopen(), None);
-        assert!(ResetState::Resetting.holds_reopen().is_some());
+        // A lost device's reopen waits while the reset runs, at most
+        // RESET_WAIT_SECONDS, and runs once it ended.
+        let mut wait = ResetWait::default();
+        let resetting = Some(ResetState::Resetting);
+        assert!(wait.wait(resetting, 100, 10).is_some());
+        assert!(wait.wait(resetting, 100 + 299, 10).is_some());
+        assert_eq!(wait.wait(resetting, 100 + 300, 10), None);
+        // A reopen past the wait is refused while the reset still runs.
+        assert_eq!(
+            ResetState::Resetting.refuses_reopen(),
+            Some(RESET_DID_NOT_END)
+        );
+        assert!(RESET_DID_NOT_END.contains(&alloc::format!("{RESET_WAIT_SECONDS} s")));
+        for ended in [ResetState::Running, ResetState::Reset] {
+            assert_eq!(wait.wait(Some(ended), 1000, 10), None);
+            assert_eq!(ended.refuses_reopen(), None);
+        }
+        // A later reset waits from its own start; a watch that answers
+        // nothing holds nothing back; without a clock no wait is made.
+        assert!(wait.wait(resetting, 5000, 10).is_some());
+        assert_eq!(wait.wait(None, 5001, 10), None);
+        assert_eq!(ResetWait::default().wait(resetting, 7, 0), None);
         let mut refuse = |_: u32, _: *mut c_void| -22;
         assert_eq!((reset.watch)(&mut refuse), None);
         assert_eq!((reset.state)(&mut refuse, 7), None);

@@ -65,6 +65,11 @@ pub mod wire;
 /// Opens a new device for the GPU after a loss.
 pub type Reopen<B, C> = Box<dyn FnMut() -> Result<Device<B, C>, Error> + Send>;
 
+/// Why a lost device's reopen waits, asked before each one: `Some` while it
+/// must not run yet, as while a kernel driver still resets the GPU. A wait
+/// is no failed reopen.
+pub type ReopenWait = Box<dyn FnMut() -> Option<&'static str> + Send>;
+
 /// What the platform sets up on a device [`Reopen`] made, before it serves.
 pub type Prepare<B, C> = Box<dyn FnMut(&mut Device<B, C>) + Send>;
 
@@ -380,6 +385,7 @@ pub struct Service<B: Backend, C: Compiler> {
     /// The read-back the call served now started.
     read_back_started: Option<StartedReadBack>,
     reopen: Option<Reopen<B, C>>,
+    reopen_wait: Option<ReopenWait>,
     prepare: Option<Prepare<B, C>>,
     /// Lost devices a reopened one replaced, oldest first, each dropped
     /// once its backend's idle steps end ([`Self::retire_step`]).
@@ -411,6 +417,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             read_back_from: None,
             read_back_started: None,
             reopen: None,
+            reopen_wait: None,
             prepare: None,
             replaced: Vec::new(),
             keep_lost: false,
@@ -420,6 +427,14 @@ impl<B: Backend, C: Compiler> Service<B, C> {
     /// Serves a new device from `reopen` once a lost one's connections close.
     pub fn with_reopen(mut self, reopen: Reopen<B, C>) -> Self {
         self.reopen = Some(reopen);
+        self
+    }
+
+    /// Asks `wait` before each reopen of a lost device, which waits while it
+    /// answers a reason: the connection that asked reports it, and the next
+    /// connection or close asks again.
+    pub fn with_reopen_wait(mut self, wait: ReopenWait) -> Self {
+        self.reopen_wait = Some(wait);
         self
     }
 
@@ -524,6 +539,14 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 .values()
                 .any(|connection| !connection.objects.is_empty())
         {
+            return;
+        }
+        if self.reopen.is_none() {
+            return;
+        }
+        if let Some(reason) = self.reopen_wait.as_mut().and_then(|wait| wait()) {
+            self.refused
+                .push(format!("the lost device waits to reopen: {reason}"));
             return;
         }
         let (Some(reopen), Ok(epoch)) = (self.reopen.as_mut(), self.epoch.next()) else {

@@ -206,6 +206,47 @@ fn a_lost_device_reopens_once_its_last_connection_closes() {
     assert_eq!(service.device().current_allocated_size(), 4096);
 }
 
+/// While the platform says a reopen must wait, as while a kernel driver
+/// still resets the GPU, no new device is opened and the lost one stays;
+/// each connection or close that asked says why, and none counts as a
+/// reopen that failed. The first ask after the wait reopens.
+#[test]
+fn a_lost_device_waits_to_reopen_while_the_platform_holds_it() {
+    static REOPENED: AtomicUsize = AtomicUsize::new(0);
+    static WAITS: AtomicUsize = AtomicUsize::new(2);
+    let mut service = service()
+        .with_reopen(Box::new(|| {
+            REOPENED.fetch_add(1, Ordering::Relaxed);
+            Ok(device_on(MockBackend::new()))
+        }))
+        .with_reopen_wait(Box::new(|| {
+            (WAITS.load(Ordering::Relaxed) > 0).then(|| {
+                WAITS.fetch_sub(1, Ordering::Relaxed);
+                "its kernel driver is still resetting the GPU"
+            })
+        }));
+    let held = connect(&mut service);
+    service.device().mark_lost();
+    service.disconnect(held).unwrap();
+    assert_eq!(REOPENED.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        service.connect().unwrap_err().status,
+        Status::DeviceLost,
+        "a client waits with the lost device while the reopen waits"
+    );
+    assert_eq!(REOPENED.load(Ordering::Relaxed), 0);
+    assert!(service.device().is_lost());
+    let refused = core::mem::take(&mut service.refused);
+    assert_eq!(refused.len(), 2);
+    assert!(refused.iter().all(|reason| reason
+        == "the lost device waits to reopen: its kernel driver is still resetting the GPU"));
+    // The wait ended: the next client gets a new device.
+    let next = connect(&mut service);
+    assert_eq!(REOPENED.load(Ordering::Relaxed), 1);
+    assert!(!service.device().is_lost());
+    cpu_buffer(&mut service, next, 4096, StorageMode::Shared);
+}
+
 /// Why a lost device did not come back is reported by the connections
 /// that tried to reopen it: a refused connection serves no call, so the
 /// reason waited, unreported, for a call that never came.

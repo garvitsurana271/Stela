@@ -34,7 +34,7 @@ use stela_drivers::gpu::metal::{
     timing::{ExitWatch, Totals},
     vulkan::physical::PciBusInfo,
 };
-use stela_drivers::gpu::stack::ResetState;
+use stela_drivers::gpu::stack::{ResetState, ResetWait};
 use stela_linux::{
     client::Run,
     function::{dma_quarantine_status, quarantined_functions},
@@ -1145,18 +1145,31 @@ fn service(
     // A lost device's channels are gone, so the next client gets a new one,
     // opened on the service's stack as the first was.
     let service = service.with_reopen(Box::new(move || {
-        // Not while the kernel driver resets the GPU: the connection that
-        // asked reports why, and the next one asks again.
-        if let Some(held) = watch
+        // Not while the kernel driver still resets the GPU once the wait
+        // below ended: that reopen fails, as any that cannot open.
+        if let Some(refused) = watch
             .as_ref()
             .and_then(client::ResetWatch::state)
-            .and_then(ResetState::holds_reopen)
+            .and_then(ResetState::refuses_reopen)
         {
-            return Err(Error::Unsupported(held));
+            return Err(Error::Unsupported(refused));
         }
         // SAFETY: as above.
         unsafe { reopen(loader, Box::new(Exporter), compiler, &gpu) }
     }));
+    // While the kernel driver resets the GPU, a reopen waits, at most
+    // `RESET_WAIT_SECONDS`: the connection that asked reports why, and the
+    // next one asks again. A wait is no failed reopen.
+    let service = match watch {
+        Some(watch) => {
+            let mut wait = ResetWait::default();
+            service.with_reopen_wait(Box::new(move || {
+                let hz = installed().map_or(0, |gpu| gpu.tsc_hz);
+                wait.wait(watch.state(), host::rdtsc(), hz)
+            }))
+        }
+        None => service,
+    };
     // A driver that loses its device only with a GPU its kernel driver
     // reset, whose release would wait for that reset's end, keeps the lost
     // device unreleased, as an open whose first submission hung leaves it.

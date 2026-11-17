@@ -4,9 +4,10 @@
 //! (the Linux environment, the DRM ioctl path, the Metal device, the AIR
 //! compiler, the gate) is shared and reads a vendor only through this.
 //!
-//! [`GpuStack::select`] chooses by PCI vendor. Whether a device of that
-//! vendor is driven is then the kernel driver's own ID table's answer, when
-//! Linux matches the function against the registered driver.
+//! [`GpuStack::select`] chooses by PCI vendor and the kernel drivers' own ID
+//! tables, as Linux's driver core binds a function: to the first registered
+//! driver whose table holds it. A vendor with two drivers lists them in
+//! their registration order.
 use crate::{Adapter, Vendor};
 use core::ffi::c_void;
 
@@ -156,6 +157,8 @@ pub static STACKS: &[&GpuStack] = &[
     &AMD,
     #[cfg(feature = "xe-port")]
     &INTEL,
+    #[cfg(feature = "i915-port")]
+    &INTEL_I915,
 ];
 
 /// nouveau with GSP firmware, NVK and NAK.
@@ -269,6 +272,39 @@ pub static INTEL: GpuStack = GpuStack {
     vulkan: None,
 };
 
+/// i915 with its display code. It registers after xe, so a device both
+/// tables hold (Tiger Lake to Meteor Lake, DG1, DG2) is xe's, as Linux binds
+/// it with xe registered first and probing every device of its table; i915
+/// drives the devices of the rest of its table that ANV opens: Skylake to
+/// Ice Lake (`crate::i915::admits`). For now it drives displays only: ANV's
+/// CPU mappings of i915's objects fault through Linux page tables Stela's
+/// clients do not have (`remap_io_sg`), and the Intel admission knows xe's
+/// devices only.
+#[cfg(feature = "i915-port")]
+pub static INTEL_I915: GpuStack = GpuStack {
+    vendor: Vendor::Intel,
+    kernel: Kernel {
+        driver: "i915",
+        admits: crate::i915::admits,
+        // GTTMMADR (`i915_reg.h` `GTTMMADR_BAR`), BAR 0 from Gen3 on.
+        registers: |_| 0,
+        resets_itself: false,
+        // The platform's `dma_mask_size` (`i915_pci.c`), which
+        // `i915_set_dma_info` sets as the mask.
+        dma_bits: crate::i915::dma_bits,
+        // The platform's `is_dgfx`.
+        integrated: crate::i915::integrated,
+        probed_integrated: None,
+        chip: crate::i915::query::chip,
+        memory_bytes: crate::i915::query::memory_bytes,
+        reset: None,
+    },
+    #[cfg(feature = "metal")]
+    metal: None,
+    #[cfg(all(feature = "metal-linked", not(test)))]
+    vulkan: None,
+};
+
 /// Brings Linux up and registers every kernel driver built into the image,
 /// stopping at the first stage that fails. Linux then matches each presented
 /// function against the registered drivers' own ID tables, so one image
@@ -329,16 +365,22 @@ impl GpuStack {
         claim_rank(self.draws(), self.kernel.table_integrated(adapter))
     }
 
-    /// The stack for `adapter`: its vendor's, when that stack's kernel
-    /// driver holds the device. Otherwise why Stela drives it with none.
+    /// The stack for `adapter`: the first of its vendor's, in registration
+    /// order, whose kernel driver holds the device. Otherwise why Stela
+    /// drives it with none: the last of those drivers' answers.
     pub fn select(adapter: &Adapter) -> Result<&'static GpuStack, &'static str> {
-        let stack = STACKS
+        let mut refusal = None;
+        for stack in STACKS
             .iter()
             .copied()
-            .find(|stack| stack.vendor == adapter.vendor)
-            .ok_or_else(|| adapter.unavailable_reason())?;
-        (stack.kernel.admits)(adapter)?;
-        Ok(stack)
+            .filter(|stack| stack.vendor == adapter.vendor)
+        {
+            match (stack.kernel.admits)(adapter) {
+                Ok(()) => return Ok(stack),
+                Err(why) => refusal = Some(why),
+            }
+        }
+        Err(refusal.unwrap_or_else(|| adapter.unavailable_reason()))
     }
 }
 
@@ -549,7 +591,7 @@ mod tests {
         for vendor in [
             #[cfg(not(feature = "amdgpu-port"))]
             0x1002,
-            #[cfg(not(feature = "xe-port"))]
+            #[cfg(not(any(feature = "xe-port", feature = "i915-port")))]
             0x8086,
             // ASPEED's BMC display and a vendor no stack names.
             0x1a03,
@@ -599,21 +641,88 @@ mod tests {
         assert!(!intel.draws());
         #[cfg(feature = "metal")]
         assert!(intel.metal.is_some());
+        // An Intel GPU no driver is handed has the answer of any GPU
+        // without a driver.
         let unknown = adapter(0x8086);
         assert_eq!(
             GpuStack::select(&unknown).err(),
-            crate::xe::admits(&unknown).err()
+            Some(unknown.unavailable_reason())
         );
-        assert!(crate::xe::admits(&unknown).is_err());
+    }
+
+    /// Linux's rule for a device both Intel tables hold: the first
+    /// registered driver whose table holds it binds, and xe registers first
+    /// (`build/xe.rs` ordinal 33, `build/i915.rs` 35) with every device of
+    /// its table probed. So xe drives Tiger Lake to Meteor Lake, DG1 and
+    /// DG2, i915 drives the rest of its table, and no device either table
+    /// admits is left without a driver.
+    #[cfg(all(feature = "xe-port", feature = "i915-port"))]
+    #[test]
+    fn intel_devices_go_to_xe_first_then_to_i915() {
+        let with = |device| Adapter {
+            device,
+            ..adapter(0x8086)
+        };
+        // xe's devices are xe's or no driver's: i915 takes none of them.
+        let mut xe = 0;
+        for &(device, ..) in crate::xe::DEVICES {
+            let adapter = with(device);
+            match GpuStack::select(&adapter) {
+                Ok(stack) => {
+                    assert!(core::ptr::eq(stack, &INTEL), "{device:04x}");
+                    xe += 1;
+                }
+                Err(why) => {
+                    assert!(crate::xe::admits(&adapter).is_err(), "{device:04x}");
+                    assert_eq!(why, adapter.unavailable_reason());
+                }
+            }
+        }
+        let mut i915 = 0;
+        for &(device, ..) in crate::i915::DEVICES {
+            let adapter = with(device);
+            match GpuStack::select(&adapter) {
+                Ok(stack) if core::ptr::eq(stack, &INTEL) => {}
+                Ok(stack) => {
+                    assert!(core::ptr::eq(stack, &INTEL_I915), "{device:04x}");
+                    assert_eq!(crate::i915::admits(&adapter), Ok(()));
+                    i915 += 1;
+                }
+                // Every Intel GPU no driver is handed has the one answer.
+                Err(why) => assert_eq!(why, adapter.unavailable_reason(), "{device:04x}"),
+            }
+        }
+        // The devices ANV opens: xe's from Tiger Lake on, i915's Skylake to
+        // Ice Lake.
+        assert_eq!((xe, i915), (138, 118));
+        // Skylake and Ice Lake are i915's, Tiger Lake is xe's.
+        for (device, driver) in [(0x1916, "i915"), (0x8a56, "i915"), (0x9a49, "xe")] {
+            let stack = GpuStack::select(&with(device)).unwrap();
+            assert_eq!(stack.kernel.driver, driver);
+        }
+        // i915's GPUs drive displays only.
+        assert!(!INTEL_I915.draws());
+        #[cfg(feature = "metal")]
+        assert!(INTEL_I915.metal.is_none());
+        // Broadwell, Haswell, i830, the IDs Mesa leaves out and Nova Lake,
+        // which xe names no GuC image for, are no driver's.
+        for device in [0x1616, 0x0416, 0x3577, 0x8a70, 0x4c80, 0xd750] {
+            let adapter = with(device);
+            assert_eq!(
+                GpuStack::select(&adapter).err(),
+                Some(adapter.unavailable_reason()),
+                "{device:04x}"
+            );
+        }
     }
 
     #[test]
-    fn each_vendor_has_one_stack_and_a_usable_dma_mask() {
+    fn each_driver_has_one_stack_and_a_usable_dma_mask() {
         for (index, stack) in STACKS.iter().enumerate() {
             assert!(
                 STACKS[..index]
                     .iter()
-                    .all(|other| other.vendor != stack.vendor)
+                    .all(|other| other.kernel.driver != stack.kernel.driver)
             );
             let adapter = adapter(stack.vendor.pci_id());
             let bits = (stack.kernel.dma_bits)(&adapter);

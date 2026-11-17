@@ -1342,7 +1342,9 @@ const XE_PLATFORMS: &[XePlatform] = &[
     ),
     (
         "Rocket Lake",
-        &[0x4c80, 0x4c8a, 0x4c8b, 0x4c8c, 0x4c90, 0x4c9a],
+        // Without 4c80, which Mesa's table leaves out: no Vulkan driver
+        // opens it, so xe is not handed it.
+        &[0x4c8a, 0x4c8b, 0x4c8c, 0x4c90, 0x4c9a],
         [
             Some("i915/tgl_guc_70.bin"),
             Some("i915/tgl_huc.bin"),

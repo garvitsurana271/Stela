@@ -24,24 +24,18 @@ pub fn force_probed(device: u16) -> bool {
         .is_ok_and(|index| DEVICES[index].2)
 }
 
-/// Whether xe binds the adapter: its PCI ID table holds the device and its
-/// firmware table names a GuC image for the device's platform. Intel
-/// graphics before Tiger Lake are i915's, which Stela does not have. A
-/// platform xe lists before its GuC image is released (at the pinned Linux:
-/// Nova Lake and Crescent Island) ends xe's probe with "No GuC firmware
-/// defined for platform", as on Linux, so it is refused before the claim and
-/// keeps the firmware's screen.
+/// Whether xe is handed the adapter: its PCI ID table holds the device, its
+/// firmware table names a GuC image for the device's platform, and ANV
+/// opens the device ([`crate::anv::opens`]). Intel graphics before Tiger
+/// Lake are i915's. A platform xe lists before its GuC image is released
+/// (at the pinned Linux: Nova Lake and Crescent Island) ends xe's probe with
+/// "No GuC firmware defined for platform", as on Linux. A GPU not handed
+/// over is not claimed, keeps the firmware's screen and is reported as any
+/// GPU without a driver is.
 pub fn admits(adapter: &Adapter) -> Result<(), &'static str> {
-    if mask_bits(adapter.device).is_none() {
-        return Err(
-            "xe's PCI ID table does not hold this Intel GPU (Ice Lake and older need i915, which is not ported to Stela)",
-        );
-    }
     match firmware(adapter.device) {
-        Some(Firmware { guc: Some(_), .. }) => Ok(()),
-        _ => Err(
-            "xe's firmware table names no GuC image for this Intel GPU's platform, so xe's probe would stop as Linux's does (No GuC firmware defined for platform)",
-        ),
+        Some(Firmware { guc: Some(_), .. }) if crate::anv::opens(adapter.device) => Ok(()),
+        _ => Err(adapter.unavailable_reason()),
     }
 }
 
@@ -389,8 +383,13 @@ mod tests {
             let mut inventory = Inventory::default();
             let required = recipes::require_xe(&mut inventory, *device);
             if admits(&adapter(*device)).is_err() {
-                // Refused before any claim; no files are selected for it.
-                assert!(files.guc.is_none(), "{device:04x} ({name})");
+                // Not claimed: xe names no GuC image for it, or ANV does
+                // not open it. No files are selected for it.
+                assert!(
+                    files.guc.is_none() || !crate::anv::opens(*device),
+                    "{device:04x} ({name})"
+                );
+                assert!(required.is_err(), "{device:04x} ({name})");
                 continue;
             }
             admitted += 1;
@@ -416,6 +415,36 @@ mod tests {
             );
         }
         assert!(admitted >= 130, "{admitted}");
+    }
+
+    #[test]
+    fn a_device_anv_does_not_open_is_not_handed_to_xe() {
+        let adapter = |device| Adapter {
+            address: crate::bus::pci::Address {
+                segment: 0,
+                bus: 0,
+                device: 2,
+                function: 0,
+            },
+            vendor: crate::Vendor::Intel,
+            device,
+            class: [3, 0, 0],
+        };
+        // Every device xe is handed is one ANV opens, at Gen12 or later.
+        for (device, ..) in PLATFORMS {
+            if admits(&adapter(*device)).is_ok() {
+                assert!(
+                    crate::anv::version(*device).is_some_and(|version| version >= 12),
+                    "{device:04x}"
+                );
+            }
+        }
+        // One Rocket Lake ID is in xe's table with a GuC image and not in
+        // Mesa's table: ANV would open no device on it.
+        assert!(platform(0x4c80).is_some());
+        assert!(firmware(0x4c80).unwrap().guc.is_some());
+        assert!(admits(&adapter(0x4c80)).is_err());
+        assert_eq!(admits(&adapter(0x4c8a)), Ok(()));
     }
 
     #[test]

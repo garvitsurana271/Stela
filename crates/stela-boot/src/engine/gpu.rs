@@ -317,7 +317,7 @@ fn atrm_image(adapter: &gpu::Adapter, integrated: bool) -> Option<&'static [u8]>
     let discrete = match AmdGpu::of(adapter.device) {
         AmdGpu::Named(..) => Some(true),
         AmdGpu::Discovered => None,
-        AmdGpu::LeftToRadeon => return None,
+        AmdGpu::LeftToRadeon | AmdGpu::LeftOut(_) => return None,
     };
     // SAFETY: stored once by the census before any claim and never freed.
     let atrm = unsafe { ATRM.load(Ordering::Acquire).as_ref() }?;

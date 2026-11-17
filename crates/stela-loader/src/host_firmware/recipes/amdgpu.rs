@@ -10,7 +10,10 @@
 use super::{Artifact, Consumer, Error, GSP_REVISION, LINUX_FIRMWARE, Recipe, Request};
 use crate::host_firmware::requirements::Inventory;
 use alloc::format;
-use stela_driver_core::firmware::{Requirement, Target};
+use stela_driver_core::{
+    amd_metal,
+    firmware::{Requirement, Target},
+};
 
 /// linux-firmware's notice for its `amdgpu` directory (`WHENCE`: "Licence:
 /// Redistributable. See LICENSE.amdgpu for details.").
@@ -38,52 +41,57 @@ const fn file(member: &'static str, length: usize, sha256: &'static str) -> Reci
     }
 }
 
-/// Each family of `enum amd_asic_type` with the names its files start with
-/// (`<name>_` or `<name>.bin`), as its blocks' sources choose them: the
-/// family's own name, and the names a revision or a board picks within it.
+/// Each family of `enum amd_asic_type` with its graphics generation and
+/// the names its files start with (`<name>_` or `<name>.bin`), as its
+/// blocks' sources choose them: the family's own name, and the names a
+/// revision or a board picks within it. The generation is the oldest
+/// graphics block the family's IP block list holds (`gfx_v6_0` in `si.c`,
+/// `gfx_v7_*` in `cik.c`, `gfx_v8_*` in `vi.c`, `gfx_v9_0` and later
+/// through discovery), which decides whether Stela drives the family
+/// ([`left_out`]).
 /// Southern Islands load `si58_mc.bin` on boards with that memory
 /// (`gmc_v6_0.c`), Hainan `banks_k_2_smc.bin` on one board (`si_dpm.c`),
 /// and Tahiti, Pitcairn and Verde the video encoder's `vce_1_0_0.bin`
 /// (`amdgpu_vce.c`). Raven loads Raven 2's and Picasso's files by revision,
 /// Renoir Green Sardine's, Cyan Skillfish its second revision's
 /// (`amdgpu_ucode_legacy_naming`).
-const CHIPS: &[(&str, &[&str])] = &[
-    ("TAHITI", &["tahiti", "si58", "vce_1_0_0"]),
-    ("PITCAIRN", &["pitcairn", "si58", "vce_1_0_0"]),
-    ("VERDE", &["verde", "si58", "vce_1_0_0"]),
-    ("OLAND", &["oland", "si58"]),
-    ("HAINAN", &["hainan", "si58", "banks_k_2"]),
-    ("BONAIRE", &["bonaire"]),
-    ("KAVERI", &["kaveri"]),
-    ("KABINI", &["kabini"]),
-    ("HAWAII", &["hawaii"]),
-    ("MULLINS", &["mullins"]),
-    ("TOPAZ", &["topaz"]),
-    ("TONGA", &["tonga"]),
-    ("FIJI", &["fiji"]),
-    ("CARRIZO", &["carrizo"]),
-    ("STONEY", &["stoney"]),
-    ("POLARIS10", &["polaris10"]),
-    ("POLARIS11", &["polaris11"]),
-    ("POLARIS12", &["polaris12"]),
-    ("VEGAM", &["vegam"]),
-    ("VEGA10", &["vega10"]),
-    ("VEGA12", &["vega12"]),
-    ("VEGA20", &["vega20"]),
-    ("RAVEN", &["raven", "raven2", "picasso"]),
-    ("ARCTURUS", &["arcturus"]),
-    ("RENOIR", &["renoir", "green_sardine"]),
-    ("ALDEBARAN", &["aldebaran"]),
-    ("NAVI10", &["navi10"]),
-    ("CYAN_SKILLFISH", &["cyan_skillfish", "cyan_skillfish2"]),
-    ("NAVI14", &["navi14"]),
-    ("NAVI12", &["navi12"]),
-    ("SIENNA_CICHLID", &["sienna_cichlid"]),
-    ("NAVY_FLOUNDER", &["navy_flounder"]),
-    ("VANGOGH", &["vangogh"]),
-    ("DIMGREY_CAVEFISH", &["dimgrey_cavefish"]),
-    ("BEIGE_GOBY", &["beige_goby"]),
-    ("YELLOW_CARP", &["yellow_carp"]),
+const CHIPS: &[(&str, u8, &[&str])] = &[
+    ("TAHITI", 6, &["tahiti", "si58", "vce_1_0_0"]),
+    ("PITCAIRN", 6, &["pitcairn", "si58", "vce_1_0_0"]),
+    ("VERDE", 6, &["verde", "si58", "vce_1_0_0"]),
+    ("OLAND", 6, &["oland", "si58"]),
+    ("HAINAN", 6, &["hainan", "si58", "banks_k_2"]),
+    ("BONAIRE", 7, &["bonaire"]),
+    ("KAVERI", 7, &["kaveri"]),
+    ("KABINI", 7, &["kabini"]),
+    ("HAWAII", 7, &["hawaii"]),
+    ("MULLINS", 7, &["mullins"]),
+    ("TOPAZ", 8, &["topaz"]),
+    ("TONGA", 8, &["tonga"]),
+    ("FIJI", 8, &["fiji"]),
+    ("CARRIZO", 8, &["carrizo"]),
+    ("STONEY", 8, &["stoney"]),
+    ("POLARIS10", 8, &["polaris10"]),
+    ("POLARIS11", 8, &["polaris11"]),
+    ("POLARIS12", 8, &["polaris12"]),
+    ("VEGAM", 8, &["vegam"]),
+    ("VEGA10", 9, &["vega10"]),
+    ("VEGA12", 9, &["vega12"]),
+    ("VEGA20", 9, &["vega20"]),
+    ("RAVEN", 9, &["raven", "raven2", "picasso"]),
+    ("ARCTURUS", 9, &["arcturus"]),
+    ("RENOIR", 9, &["renoir", "green_sardine"]),
+    ("ALDEBARAN", 9, &["aldebaran"]),
+    ("NAVI10", 9, &["navi10"]),
+    ("CYAN_SKILLFISH", 9, &["cyan_skillfish", "cyan_skillfish2"]),
+    ("NAVI14", 9, &["navi14"]),
+    ("NAVI12", 9, &["navi12"]),
+    ("SIENNA_CICHLID", 9, &["sienna_cichlid"]),
+    ("NAVY_FLOUNDER", 9, &["navy_flounder"]),
+    ("VANGOGH", 9, &["vangogh"]),
+    ("DIMGREY_CAVEFISH", 9, &["dimgrey_cavefish"]),
+    ("BEIGE_GOBY", 9, &["beige_goby"]),
+    ("YELLOW_CARP", 9, &["yellow_carp"]),
 ];
 
 /// The IP blocks whose files amdgpu names after the version discovery
@@ -110,6 +118,20 @@ pub enum AmdGpu {
     Discovered,
     /// amdgpu leaves it to an older driver.
     LeftToRadeon,
+    /// Its table names the device, of this family, which Stela leaves out:
+    /// RADV's device on it cannot serve the Metal device ([`left_out`]).
+    /// It is not claimed, so it loads no file.
+    LeftOut(&'static str),
+}
+
+/// Whether Stela leaves the family `chip` out, as its Vulkan device cannot
+/// serve the Metal device (`stela_driver_core::amd_metal`): no device of
+/// it is claimed, and none of its files is pinned.
+pub fn left_out(chip: &str) -> bool {
+    CHIPS
+        .iter()
+        .find(|(known, ..)| *known == chip)
+        .is_some_and(|(_, generation, _)| !amd_metal::serves(chip, *generation))
 }
 
 impl AmdGpu {
@@ -119,6 +141,7 @@ impl AmdGpu {
             return Self::LeftToRadeon;
         }
         match DEVICES.binary_search_by_key(&device, |(id, _)| *id) {
+            Ok(index) if left_out(DEVICES[index].1) => Self::LeftOut(DEVICES[index].1),
             Ok(index) => Self::Named(
                 DEVICES[index].1,
                 QUIRKS
@@ -138,8 +161,8 @@ impl AmdGpu {
         let family = |chip: &str| {
             CHIPS
                 .iter()
-                .find(|(known, _)| *known == chip)
-                .is_some_and(|(_, stems)| stems.iter().any(|stem| named(name, stem)))
+                .find(|(known, ..)| *known == chip)
+                .is_some_and(|(_, _, stems)| stems.iter().any(|stem| named(name, stem)))
         };
         match self {
             Self::Named(chip, quirk) => family(chip) || quirk.is_some_and(family),
@@ -147,10 +170,10 @@ impl AmdGpu {
                 versioned(name)
                     || CHIPS
                         .iter()
-                        .filter(|(chip, _)| !DEVICES.iter().any(|(_, named)| named == chip))
-                        .any(|(chip, _)| family(chip))
+                        .filter(|(chip, ..)| !DEVICES.iter().any(|(_, named)| named == chip))
+                        .any(|(chip, ..)| family(chip))
             }
-            Self::LeftToRadeon => false,
+            Self::LeftToRadeon | Self::LeftOut(_) => false,
         }
     }
 
@@ -267,8 +290,8 @@ pub fn discovered_may_load(ips: &[DiscoveredIp], member: &str) -> bool {
         listed(11, graphics)
             && CHIPS
                 .iter()
-                .find(|(known, _)| *known == chip)
-                .is_some_and(|(_, stems)| stems.iter().any(|stem| named(name, stem)))
+                .find(|(known, ..)| *known == chip)
+                .is_some_and(|(_, _, stems)| stems.iter().any(|stem| named(name, stem)))
     })
 }
 
@@ -326,10 +349,19 @@ pub fn amd_gpu_family(device: u16) -> Option<&'static str> {
 /// `device`.
 pub fn require_amdgpu(inventory: &mut Inventory, device: u16) -> Result<(), Error> {
     let gpu = AmdGpu::of(device);
-    if gpu == AmdGpu::LeftToRadeon {
-        return Err(Error(format!(
-            "{device:04x} is left by amdgpu to an older driver"
-        )));
+    match gpu {
+        AmdGpu::LeftToRadeon => {
+            return Err(Error(format!(
+                "{device:04x} is left by amdgpu to an older driver"
+            )));
+        }
+        AmdGpu::LeftOut(chip) => {
+            return Err(Error(format!(
+                "{device:04x} ({chip}) is left out: its Vulkan device cannot serve the Metal \
+                 device"
+            )));
+        }
+        AmdGpu::Named(..) | AmdGpu::Discovered => {}
     }
     for recipe in gpu.files() {
         inventory.observe(Requirement {
@@ -345,118 +377,9 @@ pub fn require_amdgpu(inventory: &mut Inventory, device: u16) -> Result<(), Erro
 // GSP_REVISION; `tests::amdgpu_*` compare it with both.
 
 /// Every file amdgpu's built units declare (`MODULE_FIRMWARE`) that
-/// linux-firmware holds at the pin, by name.
+/// linux-firmware holds at the pin, by name, but those only families Stela
+/// leaves out load ([`left_out`]).
 pub const AMDGPU: &[Recipe] = &[
-    file(
-        "amdgpu/aldebaran_ip_discovery.bin",
-        732,
-        "0634acf566946df7036b92dc351e0781e091a1c14c24979e49c5e7cb81a702ef",
-    ),
-    file(
-        "amdgpu/aldebaran_mec.bin",
-        268736,
-        "40b0107fbc753e2a1a43b427f5604bd18422debac848d4e2aee439fae8683734",
-    ),
-    file(
-        "amdgpu/aldebaran_mec2.bin",
-        268736,
-        "40b0107fbc753e2a1a43b427f5604bd18422debac848d4e2aee439fae8683734",
-    ),
-    file(
-        "amdgpu/aldebaran_rlc.bin",
-        46060,
-        "b6e8e0cf0e8b7b14259f87e0ef4a403bdde9cf3aa5267b45cc7a0e57b5a130f7",
-    ),
-    file(
-        "amdgpu/aldebaran_sdma.bin",
-        34304,
-        "186150f420312a9b1397c77e8c42922ab4472e3a75f696551cc2642bd51fe5a7",
-    ),
-    file(
-        "amdgpu/aldebaran_sjt_mec.bin",
-        268736,
-        "79577e20bb218a0c20dbabb5bbcc1088292188e9024b9287a29af58fb52a434b",
-    ),
-    file(
-        "amdgpu/aldebaran_sjt_mec2.bin",
-        268736,
-        "79577e20bb218a0c20dbabb5bbcc1088292188e9024b9287a29af58fb52a434b",
-    ),
-    file(
-        "amdgpu/aldebaran_smc.bin",
-        242688,
-        "4667e9a32b1d2476b74cab83dbd9bb50cdaf9a11e80857123a2df13f2c35b19c",
-    ),
-    file(
-        "amdgpu/aldebaran_sos.bin",
-        446208,
-        "9ad8e3b966c7db77e9b4fce0f93c383e422d8954dcb574a695016495c353fadd",
-    ),
-    file(
-        "amdgpu/aldebaran_ta.bin",
-        140288,
-        "f592449eaa6b35b235bfa27316c3d18077a253c8427d08577ff22913fb9cf7e4",
-    ),
-    file(
-        "amdgpu/aldebaran_vcn.bin",
-        423936,
-        "cc30645fe70fe2bf0027a69a6044163f02a8c596ef6209dd36d450a60febb4c3",
-    ),
-    file(
-        "amdgpu/arcturus_asd.bin",
-        168448,
-        "cd2f1d9c15608b626958ae30cf78b15b672a44b4fba8e909919c2ff749f87be1",
-    ),
-    file(
-        "amdgpu/arcturus_gpu_info.bin",
-        316,
-        "9a363362a39afc92e0072b012d0147276d552c88042429f3298801c412372b1a",
-    ),
-    file(
-        "amdgpu/arcturus_ip_discovery.bin",
-        936,
-        "7a6c5236bfa65be8cb9e149a6457fd103c5b52ec19a732767cd420daaa644088",
-    ),
-    file(
-        "amdgpu/arcturus_mec.bin",
-        268576,
-        "c8d04701db13000ed4097e4044a020ee4467a769b0702b26135c5746e2c63254",
-    ),
-    file(
-        "amdgpu/arcturus_rlc.bin",
-        48044,
-        "82ec445ef3859a42ecbdcfb4d9ab2cbbeffd1ea1e5519f41a17f67a58038f970",
-    ),
-    file(
-        "amdgpu/arcturus_sdma.bin",
-        17664,
-        "985902486050dc4b04bd74ca5fd7f60378ceb8079311f069046f593cf36f8d17",
-    ),
-    file(
-        "amdgpu/arcturus_smc.bin",
-        270698,
-        "a7e794e585a20617d872e24d754e266f05c3e9615b38bb407a7f3a4dc581b27d",
-    ),
-    file(
-        "amdgpu/arcturus_sos.bin",
-        199248,
-        "026c5d1641ccbcebd39b522591ab1f45bb3e879f3bb8cc6f1d15d17672bbc52f",
-    ),
-    file(
-        "amdgpu/arcturus_ta.bin",
-        127744,
-        "f816775626a75eb42394b76f8842a0fbb5a63c38c41731c66e23acb6573765a0",
-    ),
-    file(
-        "amdgpu/arcturus_vcn.bin",
-        423936,
-        "420d44b15d8c44bbd874034805fc29c9ce29ca88051cdb3649273e3a89c8a997",
-    ),
-    file(
-        "amdgpu/banks_k_2_smc.bin",
-        61932,
-        "bcdaef2cbec1b21d8d83d6e03d245ccee7fd3052b4a0ab88601b4dad392991dd",
-    ),
     file(
         "amdgpu/beige_goby_ce.bin",
         263296,
@@ -516,66 +439,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/beige_goby_vcn.bin",
         582800,
         "2f3cbd54cc9fad35665c06079f61e175dae3dca34d971bfeb73e4ab3efd7bf65",
-    ),
-    file(
-        "amdgpu/bonaire_ce.bin",
-        8832,
-        "d776b5e6867d2c9588fe64aa34045f5bbf699c3275acbce1fcd4fa7c3fcaf6c2",
-    ),
-    file(
-        "amdgpu/bonaire_k_smc.bin",
-        130796,
-        "05f9770e850182a554f2ca383b380b43be036a9573ea31d256d424204e64bf5c",
-    ),
-    file(
-        "amdgpu/bonaire_mc.bin",
-        32336,
-        "a2d2dfe6e7cea4be2186c5a0ba84392fe3df7709b3058da8d8ca41ca49b0814a",
-    ),
-    file(
-        "amdgpu/bonaire_me.bin",
-        8832,
-        "206aafa0549bdb4f47c6dc53ec040056ea109ba9e8a8c472c9e8a4d2a2cfe959",
-    ),
-    file(
-        "amdgpu/bonaire_mec.bin",
-        17024,
-        "83347869ce7981552f33cae2e68969371a2942368f09433588e10ff8a518dc7b",
-    ),
-    file(
-        "amdgpu/bonaire_pfp.bin",
-        8832,
-        "829c5148945eb3a46e1f9a5aa64f813f0ace11b1a82f90993c6a3f3ee458f7ca",
-    ),
-    file(
-        "amdgpu/bonaire_rlc.bin",
-        8448,
-        "2f6d653e9be6063072d29c553988e41c2be3aad7a0dfdc892f8c637f5608ba81",
-    ),
-    file(
-        "amdgpu/bonaire_sdma.bin",
-        4456,
-        "638602157d38a25e584e81710c9c3a36731c52599d92e010b77dd53890dc662a",
-    ),
-    file(
-        "amdgpu/bonaire_sdma1.bin",
-        4456,
-        "8bb8fc3280153dbc9dc545d3ec046fa38361be5acf7e6f956aa0fd57196c84b8",
-    ),
-    file(
-        "amdgpu/bonaire_smc.bin",
-        130796,
-        "80291f6bff0a72e097a5e1f74bca1844be3123957ee9662cd53cbfb5aca4903e",
-    ),
-    file(
-        "amdgpu/bonaire_uvd.bin",
-        232752,
-        "30eed8d680321bdc6213409a4a882442049b2a559eadb9ee2554d53b0cfb96c9",
-    ),
-    file(
-        "amdgpu/bonaire_vce.bin",
-        101072,
-        "fb768657d70c8674c1c48a284e5299ab2877ac2420957ea4b36c75f7f5997869",
     ),
     file(
         "amdgpu/carrizo_ce.bin",
@@ -1508,241 +1371,6 @@ pub const AMDGPU: &[Recipe] = &[
         "5b32a9f1ee1176babe56910fa1fa52df938b60665febbeab1ce0ee38cb4d5c98",
     ),
     file(
-        "amdgpu/hainan_ce.bin",
-        8832,
-        "04027c3a7c875aaf581ca438ae5ff93ec90002e0e057dc107e7b47048331ee3c",
-    ),
-    file(
-        "amdgpu/hainan_k_smc.bin",
-        61876,
-        "e50e10e4b21152b325ad9df47ea820333e133903285cfcbfcfc52a3499a5a44b",
-    ),
-    file(
-        "amdgpu/hainan_mc.bin",
-        31996,
-        "569273128c7c7d0d6422d95279155ddd9edb2b2aec02af52aa159ba400509c5a",
-    ),
-    file(
-        "amdgpu/hainan_me.bin",
-        8832,
-        "87617358bb876187786c422c3456fef1d072e6532382ecace0847259045131cb",
-    ),
-    file(
-        "amdgpu/hainan_pfp.bin",
-        8832,
-        "5bbb13eb48f3c87751e607958cd286ce2c9758c461cbe63a28e2f4e498a10789",
-    ),
-    file(
-        "amdgpu/hainan_rlc.bin",
-        8448,
-        "c7044ddb5dbc132966e570337939c2fed4c8458b246c1b79b3c8bd7424955859",
-    ),
-    file(
-        "amdgpu/hainan_smc.bin",
-        61444,
-        "dcaa1baa473ee6b2b9f07c6e416fbd486624c200cc398de6a98eb4756be8f352",
-    ),
-    file(
-        "amdgpu/hawaii_ce.bin",
-        8832,
-        "173ff0d1633fa0e0a22e0b7e92780b4ec9bb0a72346f0c0ccd8ffe899078763a",
-    ),
-    file(
-        "amdgpu/hawaii_k_smc.bin",
-        130796,
-        "13e0ca77d40f44e1c8940e8337ad9a71dd93342ecf7a122073c21dd6d3afb7fc",
-    ),
-    file(
-        "amdgpu/hawaii_mc.bin",
-        32796,
-        "96bff75bd1e3c232461c20a1c0317634974908f808114a177333fc303d2885b5",
-    ),
-    file(
-        "amdgpu/hawaii_me.bin",
-        8832,
-        "fef325182b041b97fd9b1cb92b0d8556b6d399a83fc74f1d1114b4e3f590eb8d",
-    ),
-    file(
-        "amdgpu/hawaii_mec.bin",
-        17024,
-        "50fbc59d7474bb2a7b8901fa5cab4046f2c4e727aaea62bb754c0e296cdb1d13",
-    ),
-    file(
-        "amdgpu/hawaii_pfp.bin",
-        8832,
-        "d0194b0a8856b57c8464bb09214fe8f66ea28ba8d979359b30efb50579d62447",
-    ),
-    file(
-        "amdgpu/hawaii_rlc.bin",
-        8448,
-        "ab3b064e173667e1a58f4d200102f10e4aebddf7e4e003cde1e79657301910a7",
-    ),
-    file(
-        "amdgpu/hawaii_sdma.bin",
-        4456,
-        "638602157d38a25e584e81710c9c3a36731c52599d92e010b77dd53890dc662a",
-    ),
-    file(
-        "amdgpu/hawaii_sdma1.bin",
-        4456,
-        "8bb8fc3280153dbc9dc545d3ec046fa38361be5acf7e6f956aa0fd57196c84b8",
-    ),
-    file(
-        "amdgpu/hawaii_smc.bin",
-        130796,
-        "a281f69e608fe0492458164380729655d86abd34280fe9d1cd35f07f7fb57236",
-    ),
-    file(
-        "amdgpu/hawaii_uvd.bin",
-        232752,
-        "30eed8d680321bdc6213409a4a882442049b2a559eadb9ee2554d53b0cfb96c9",
-    ),
-    file(
-        "amdgpu/hawaii_vce.bin",
-        101072,
-        "fb768657d70c8674c1c48a284e5299ab2877ac2420957ea4b36c75f7f5997869",
-    ),
-    file(
-        "amdgpu/kabini_ce.bin",
-        8832,
-        "938d3f602ce9029ac6188bda2eea036c3b68572a50ff407374e6e43b0865f374",
-    ),
-    file(
-        "amdgpu/kabini_me.bin",
-        8832,
-        "bf462933ee4a6412b20c41f5bdf9ce1240c31ee691b3206348d00a6d024189d2",
-    ),
-    file(
-        "amdgpu/kabini_mec.bin",
-        17024,
-        "aeffabb7bdd3d4dfe9f26f3f7dc5ac5d0eb34d435c978fca1a924ed45bb584b0",
-    ),
-    file(
-        "amdgpu/kabini_pfp.bin",
-        8832,
-        "11e6b126b1528374ee5d763edbf13b4966a35169e9ac8028f735e617cbf4211f",
-    ),
-    file(
-        "amdgpu/kabini_rlc.bin",
-        10496,
-        "e7a72f8987b43f83b03ba26ea343990b31bce829ace043be22f00a0375a811fe",
-    ),
-    file(
-        "amdgpu/kabini_sdma.bin",
-        4456,
-        "638602157d38a25e584e81710c9c3a36731c52599d92e010b77dd53890dc662a",
-    ),
-    file(
-        "amdgpu/kabini_sdma1.bin",
-        4456,
-        "8bb8fc3280153dbc9dc545d3ec046fa38361be5acf7e6f956aa0fd57196c84b8",
-    ),
-    file(
-        "amdgpu/kabini_uvd.bin",
-        232752,
-        "30eed8d680321bdc6213409a4a882442049b2a559eadb9ee2554d53b0cfb96c9",
-    ),
-    file(
-        "amdgpu/kabini_vce.bin",
-        101072,
-        "fb768657d70c8674c1c48a284e5299ab2877ac2420957ea4b36c75f7f5997869",
-    ),
-    file(
-        "amdgpu/kaveri_ce.bin",
-        8832,
-        "938d3f602ce9029ac6188bda2eea036c3b68572a50ff407374e6e43b0865f374",
-    ),
-    file(
-        "amdgpu/kaveri_me.bin",
-        8832,
-        "bf462933ee4a6412b20c41f5bdf9ce1240c31ee691b3206348d00a6d024189d2",
-    ),
-    file(
-        "amdgpu/kaveri_mec.bin",
-        17024,
-        "e86d5846f8433bc682b7dbdf2a4563ec1c527e223ca77460ef15294507b9ba32",
-    ),
-    file(
-        "amdgpu/kaveri_mec2.bin",
-        17024,
-        "f3250bc60e0ff24a80830ebda428fc781d641395e5977d84588694d803cd993a",
-    ),
-    file(
-        "amdgpu/kaveri_pfp.bin",
-        8832,
-        "ec115b371676408ba4eaadb63381b066469ab85a11f1b96eb29782334c702017",
-    ),
-    file(
-        "amdgpu/kaveri_rlc.bin",
-        10496,
-        "17eb4bfc2fca9b61bb01a8e4b8ffac06146f08fdc8182105ecbda0c24ae128a1",
-    ),
-    file(
-        "amdgpu/kaveri_sdma.bin",
-        4456,
-        "638602157d38a25e584e81710c9c3a36731c52599d92e010b77dd53890dc662a",
-    ),
-    file(
-        "amdgpu/kaveri_sdma1.bin",
-        4456,
-        "8bb8fc3280153dbc9dc545d3ec046fa38361be5acf7e6f956aa0fd57196c84b8",
-    ),
-    file(
-        "amdgpu/kaveri_uvd.bin",
-        232752,
-        "30eed8d680321bdc6213409a4a882442049b2a559eadb9ee2554d53b0cfb96c9",
-    ),
-    file(
-        "amdgpu/kaveri_vce.bin",
-        101072,
-        "fb768657d70c8674c1c48a284e5299ab2877ac2420957ea4b36c75f7f5997869",
-    ),
-    file(
-        "amdgpu/mullins_ce.bin",
-        8832,
-        "938d3f602ce9029ac6188bda2eea036c3b68572a50ff407374e6e43b0865f374",
-    ),
-    file(
-        "amdgpu/mullins_me.bin",
-        8832,
-        "bf462933ee4a6412b20c41f5bdf9ce1240c31ee691b3206348d00a6d024189d2",
-    ),
-    file(
-        "amdgpu/mullins_mec.bin",
-        17024,
-        "aeffabb7bdd3d4dfe9f26f3f7dc5ac5d0eb34d435c978fca1a924ed45bb584b0",
-    ),
-    file(
-        "amdgpu/mullins_pfp.bin",
-        8832,
-        "11e6b126b1528374ee5d763edbf13b4966a35169e9ac8028f735e617cbf4211f",
-    ),
-    file(
-        "amdgpu/mullins_rlc.bin",
-        10496,
-        "21e4d2973b8388864fb489a3c7cbbc55a13b787b884027ff79bb4cd71ed86ce1",
-    ),
-    file(
-        "amdgpu/mullins_sdma.bin",
-        4456,
-        "638602157d38a25e584e81710c9c3a36731c52599d92e010b77dd53890dc662a",
-    ),
-    file(
-        "amdgpu/mullins_sdma1.bin",
-        4456,
-        "8bb8fc3280153dbc9dc545d3ec046fa38361be5acf7e6f956aa0fd57196c84b8",
-    ),
-    file(
-        "amdgpu/mullins_uvd.bin",
-        232752,
-        "30eed8d680321bdc6213409a4a882442049b2a559eadb9ee2554d53b0cfb96c9",
-    ),
-    file(
-        "amdgpu/mullins_vce.bin",
-        101072,
-        "fb768657d70c8674c1c48a284e5299ab2877ac2420957ea4b36c75f7f5997869",
-    ),
-    file(
         "amdgpu/navi10_asd.bin",
         209408,
         "e0474d0afa4c284d6429c384fb4a6a88576e302d04444549fe5c2c02be89f665",
@@ -2033,46 +1661,6 @@ pub const AMDGPU: &[Recipe] = &[
         "2f3cbd54cc9fad35665c06079f61e175dae3dca34d971bfeb73e4ab3efd7bf65",
     ),
     file(
-        "amdgpu/oland_ce.bin",
-        8832,
-        "04027c3a7c875aaf581ca438ae5ff93ec90002e0e057dc107e7b47048331ee3c",
-    ),
-    file(
-        "amdgpu/oland_k_smc.bin",
-        62692,
-        "4f2a8d297f5e2628af679f2d9fc967bfd0dbe7549dc8d865fce300de154adfb7",
-    ),
-    file(
-        "amdgpu/oland_mc.bin",
-        31996,
-        "c7ea90b96507193d7cdfcda50145ea69f67bb38804664bfd4490e790f483002a",
-    ),
-    file(
-        "amdgpu/oland_me.bin",
-        8832,
-        "87617358bb876187786c422c3456fef1d072e6532382ecace0847259045131cb",
-    ),
-    file(
-        "amdgpu/oland_pfp.bin",
-        8832,
-        "1beadbc0b81464c8a85b9e2d981fb83f03ec11c365034332a978b94a6785148f",
-    ),
-    file(
-        "amdgpu/oland_rlc.bin",
-        8448,
-        "012b8e872a0d6dbd718d5fcba462ba088ac39289dd6b8b66cce886698ff9314b",
-    ),
-    file(
-        "amdgpu/oland_smc.bin",
-        62260,
-        "e235555bbb2440a55fd321c7d3400971561b82cf4ba831da7c30225a31c02eed",
-    ),
-    file(
-        "amdgpu/oland_uvd.bin",
-        219928,
-        "f3e166c905343b5cc04663354f492aededf0c99d32dd39e7ff18d5b88d4d96e5",
-    ),
-    file(
         "amdgpu/picasso_asd.bin",
         197120,
         "e84bcd8bc22af833006d5d0d1df85dc155d8288dae03dbafc68146106f7ba55c",
@@ -2136,46 +1724,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/picasso_vcn.bin",
         369376,
         "d376048d547b418effa4f357a4d1cddd418d101874f6a679144ab4df069f3aeb",
-    ),
-    file(
-        "amdgpu/pitcairn_ce.bin",
-        8832,
-        "04027c3a7c875aaf581ca438ae5ff93ec90002e0e057dc107e7b47048331ee3c",
-    ),
-    file(
-        "amdgpu/pitcairn_k_smc.bin",
-        61712,
-        "7a5a05c16936d9918759a51ec2caed0db65de64e5957efb6dcb32a2bbefaeebe",
-    ),
-    file(
-        "amdgpu/pitcairn_mc.bin",
-        31644,
-        "620ba6469d8c0fe6948733d1a7743d8b96585bcb98d8ee118adaed45e9aa46f9",
-    ),
-    file(
-        "amdgpu/pitcairn_me.bin",
-        8832,
-        "87617358bb876187786c422c3456fef1d072e6532382ecace0847259045131cb",
-    ),
-    file(
-        "amdgpu/pitcairn_pfp.bin",
-        8832,
-        "aabdb871219fe135cb125c4e38adababdd27a02519324f5534abc00f46b24b5b",
-    ),
-    file(
-        "amdgpu/pitcairn_rlc.bin",
-        8448,
-        "929f722b65558862b24569f1397ba1f9db2ef301b66440533ebed0a2195ee92c",
-    ),
-    file(
-        "amdgpu/pitcairn_smc.bin",
-        61280,
-        "c0b51d6622328248cbd32fdd44f7037ec9e31dd77cbf91d28f74dac705d9b3cd",
-    ),
-    file(
-        "amdgpu/pitcairn_uvd.bin",
-        219928,
-        "f3e166c905343b5cc04663354f492aededf0c99d32dd39e7ff18d5b88d4d96e5",
     ),
     file(
         "amdgpu/polaris10_ce.bin",
@@ -2958,11 +2506,6 @@ pub const AMDGPU: &[Recipe] = &[
         "73c29e1c1714ebc95d2221ba56e187910902891593010653bf9518937e414a59",
     ),
     file(
-        "amdgpu/si58_mc.bin",
-        32488,
-        "5c97da8a26fd772be3a0f4dd7c244074e55b41d18cf4fff2d4a96640070fec9b",
-    ),
-    file(
         "amdgpu/sienna_cichlid_ce.bin",
         263296,
         "156769265ed26c8cb14902a13e14871732245daeffb793bdf394c1bd3de76f00",
@@ -3106,41 +2649,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/stoney_vce.bin",
         166816,
         "e763aa4f281bc7b2f8b435bb95601e691cc1a7737c10aaa27e59a9b15e94cfdb",
-    ),
-    file(
-        "amdgpu/tahiti_ce.bin",
-        8832,
-        "04027c3a7c875aaf581ca438ae5ff93ec90002e0e057dc107e7b47048331ee3c",
-    ),
-    file(
-        "amdgpu/tahiti_mc.bin",
-        31776,
-        "d33b357cce7af8eabea0fa22197131e7a337fd4201a8cff96ad288cd882af533",
-    ),
-    file(
-        "amdgpu/tahiti_me.bin",
-        8832,
-        "87617358bb876187786c422c3456fef1d072e6532382ecace0847259045131cb",
-    ),
-    file(
-        "amdgpu/tahiti_pfp.bin",
-        8832,
-        "aabdb871219fe135cb125c4e38adababdd27a02519324f5534abc00f46b24b5b",
-    ),
-    file(
-        "amdgpu/tahiti_rlc.bin",
-        8448,
-        "46da3468097bb48a24ba47d0cc883695752d8e4f1d333c8a8bdb6e339894bac3",
-    ),
-    file(
-        "amdgpu/tahiti_smc.bin",
-        63932,
-        "6fa1ebd7df9eabfe5764e3f4f1791bfb87a0c9ba970698680bf276b71e5cfa51",
-    ),
-    file(
-        "amdgpu/tahiti_uvd.bin",
-        219928,
-        "d10f2a580ad40f44aa5c76c41e9cc3639d2d96f940a57c45e2af1bd7a67c1e7f",
     ),
     file(
         "amdgpu/tonga_ce.bin",
@@ -3316,11 +2824,6 @@ pub const AMDGPU: &[Recipe] = &[
         "amdgpu/vangogh_vcn.bin",
         575056,
         "3d282b29bff2ea1833e00cfb08bb6dd9b379f7e58090e0e87aaccb4c2a35d732",
-    ),
-    file(
-        "amdgpu/vce_1_0_0.bin",
-        48680,
-        "7afc816dd95c5d88345e870ca6ebf58550ecc49f74fd56c081ec2c1863fd0200",
     ),
     file(
         "amdgpu/vcn_3_1_2.bin",
@@ -3663,46 +3166,6 @@ pub const AMDGPU: &[Recipe] = &[
         "b063be1f8093b41f527eecc7c592ff92c06d1c9bd5d2b4560e9dcd065f49898a",
     ),
     file(
-        "amdgpu/verde_ce.bin",
-        8832,
-        "04027c3a7c875aaf581ca438ae5ff93ec90002e0e057dc107e7b47048331ee3c",
-    ),
-    file(
-        "amdgpu/verde_k_smc.bin",
-        63804,
-        "48bab82eaad44d35f02c63d284056c2c0f8b9cfef9c98cc13df360f0cdd05a8f",
-    ),
-    file(
-        "amdgpu/verde_mc.bin",
-        32044,
-        "879c3e9460b7d278258bd5e3cd99fba53be81d4f5cc2556e7eb5efc29f236313",
-    ),
-    file(
-        "amdgpu/verde_me.bin",
-        8832,
-        "7bcda47e186e575668e51a6fd02c086ad122f7d79e69f3b57a109b11fb11e073",
-    ),
-    file(
-        "amdgpu/verde_pfp.bin",
-        8832,
-        "a76ae8ae9e7c32118247a23fdc53086f1c91026dca87b732d39893b33873158e",
-    ),
-    file(
-        "amdgpu/verde_rlc.bin",
-        8448,
-        "50c69aef44d0047e49b124937edd001d5828b3fa3e00aceebc78af48a5760fa0",
-    ),
-    file(
-        "amdgpu/verde_smc.bin",
-        61776,
-        "80cdfc6f4adbc91727aea014c5f8d7a8a421aedbf9cc49652735fb4dd5c41109",
-    ),
-    file(
-        "amdgpu/verde_uvd.bin",
-        219928,
-        "4f6dc67613c6ed73e8b32727a39d7d00e2b60a51348cdeb74e842b69791b3432",
-    ),
-    file(
         "amdgpu/vpe_2_0_0.bin",
         34688,
         "7792566da5e7c94b84e20678807b74f78c64482ff2522afce65d70c57cec8ed4",
@@ -3783,7 +3246,6 @@ pub const AMDGPU: &[Recipe] = &[
 /// at the pin, nor at its newest commit of 2026-11-16: a GPU whose IP blocks
 /// ask for one of them fails amdgpu's probe there, as on Linux.
 pub const UNPUBLISHED: &[&str] = &[
-    "amdgpu/aldebaran_cap.bin",
     "amdgpu/cyan_skillfish_gpu_info.bin",
     "amdgpu/dcn_4_2_1_dmcub.bin",
     "amdgpu/gc_11_0_0_toc.bin",

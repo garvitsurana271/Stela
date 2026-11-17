@@ -1,9 +1,9 @@
 use super::*;
 
 /// amdgpu's recipes whose bytes another holds, and the bundle's files and
-/// bytes with the AMD port: 648 files, 260.0 MiB.
-const AMD_SHARED: usize = 128;
-const AMD_TOTAL: (usize, usize) = (648, 272_649_034);
+/// bytes with the AMD port: 567 files, 254.1 MiB.
+const AMD_SHARED: usize = 95;
+const AMD_TOTAL: (usize, usize) = (567, 266_471_680);
 use stela_driver_core::firmware::{Provenance, Resource, Target};
 
 #[test]

@@ -7,6 +7,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Whether only families Stela leaves out load the file `member`: one
+/// named after such a family and after no family it drives.
+fn left_out_file(member: &str) -> bool {
+    let Some(name) = member.strip_prefix("amdgpu/") else {
+        return false;
+    };
+    let names = |(_, _, stems): &(&str, u8, &[&str])| stems.iter().any(|stem| named(name, stem));
+    CHIPS.iter().any(|chip| left_out(chip.0) && names(chip))
+        && !CHIPS.iter().any(|chip| !left_out(chip.0) && names(chip))
+}
+
 fn names(gpu: AmdGpu) -> Vec<&'static str> {
     gpu.files().map(|recipe| recipe.image.member).collect()
 }
@@ -33,8 +44,11 @@ fn files_are_pinned_once_in_name_order_under_the_amdgpu_notice() {
             "{member}"
         );
         assert!(!UNPUBLISHED.contains(&member), "{member}");
+        // No file only a family Stela leaves out loads is pinned.
+        assert!(!left_out_file(member), "{member}");
     }
     assert!(UNPUBLISHED.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(!UNPUBLISHED.iter().any(|member| left_out_file(member)));
     // A request is answered by its exact name and amdgpu's target only.
     let request = |name: &str, hardware: &str| {
         let json = serde_json::json!({"schema":1,"complete":true,"requirements":[{
@@ -71,7 +85,7 @@ fn every_file_is_one_some_device_may_load() {
     // Each of a family's names matches one of its files, pinned or not
     // published (Cyan Skillfish's first revision has only an unpublished
     // `gpu_info`).
-    for (chip, stems) in CHIPS {
+    for (chip, _, stems) in CHIPS.iter().filter(|(chip, ..)| !left_out(chip)) {
         for stem in *stems {
             assert!(
                 AMDGPU
@@ -91,7 +105,7 @@ fn tables_are_sorted_and_every_family_has_its_names() {
     assert!(LEFT_TO_RADEON.windows(2).all(|pair| pair[0] < pair[1]));
     for (device, chip) in DEVICES.iter().chain(QUIRKS) {
         assert!(
-            CHIPS.iter().any(|(known, _)| known == chip),
+            CHIPS.iter().any(|(known, ..)| known == chip),
             "{device:04x} {chip}"
         );
         assert!(
@@ -148,17 +162,6 @@ fn a_device_gets_the_files_amdgpu_may_ask_it_for() {
     let quirked = names(AmdGpu::of(0x67ff));
     assert!(quirked.contains(&"amdgpu/polaris11_mc.bin"));
     assert!(quirked.contains(&"amdgpu/polaris10_mc.bin"));
-    // Tahiti: its files, the 0x58 memory's and the video encoder's.
-    let tahiti = names(AmdGpu::of(0x6798));
-    for member in [
-        "amdgpu/tahiti_mc.bin",
-        "amdgpu/si58_mc.bin",
-        "amdgpu/vce_1_0_0.bin",
-    ] {
-        assert!(tahiti.contains(&member), "{member}");
-    }
-    assert!(!tahiti.contains(&"amdgpu/banks_k_2_smc.bin"));
-    assert!(names(AmdGpu::of(0x6660)).contains(&"amdgpu/banks_k_2_smc.bin"));
     // Raven by ID loads Raven 2's and Picasso's by revision, not Renoir's.
     let raven = names(AmdGpu::of(0x15dd));
     for member in [
@@ -185,11 +188,92 @@ fn a_device_gets_the_files_amdgpu_may_ask_it_for() {
 }
 
 #[test]
+fn a_family_whose_vulkan_device_cannot_serve_metal_is_left_out() {
+    // Southern Islands (GFX6), Sea Islands (GFX7) and the compute
+    // accelerators RADV opens no device on: named, never given a file.
+    for (device, chip) in [
+        (0x6798, "TAHITI"),
+        (0x6660, "HAINAN"),
+        (0x6649, "BONAIRE"),
+        (0x1304, "KAVERI"),
+        (0x9830, "KABINI"),
+        (0x67b0, "HAWAII"),
+        (0x9850, "MULLINS"),
+        (0x738c, "ARCTURUS"),
+        (0x7408, "ALDEBARAN"),
+    ] {
+        let gpu = AmdGpu::of(device);
+        assert_eq!(gpu, AmdGpu::LeftOut(chip), "{device:04x}");
+        assert_eq!(gpu.family(), None);
+        assert_eq!(gpu.files().count(), 0);
+        assert!(require_amdgpu(&mut Inventory::default(), device).is_err());
+        assert!(require_amdgpu_discovered(&mut Inventory::default(), device, &[]).is_err());
+    }
+    // The families left out are those of the generations before the first
+    // that serves, and the accelerators; every later family is driven.
+    let out: Vec<&str> = CHIPS
+        .iter()
+        .filter(|(chip, ..)| left_out(chip))
+        .map(|(chip, ..)| *chip)
+        .collect();
+    assert_eq!(
+        out,
+        [
+            "TAHITI",
+            "PITCAIRN",
+            "VERDE",
+            "OLAND",
+            "HAINAN",
+            "BONAIRE",
+            "KAVERI",
+            "KABINI",
+            "HAWAII",
+            "MULLINS",
+            "ARCTURUS",
+            "ALDEBARAN"
+        ]
+    );
+    for (chip, generation, _) in CHIPS {
+        assert_eq!(
+            left_out(chip),
+            *generation < amd_metal::FIRST_GENERATION
+                || amd_metal::NO_VULKAN_FAMILIES.contains(chip),
+            "{chip}"
+        );
+    }
+    // Their files, and those alone, are no longer pinned: a file a driven
+    // family shares stays.
+    for member in [
+        "amdgpu/tahiti_mc.bin",
+        "amdgpu/si58_mc.bin",
+        "amdgpu/vce_1_0_0.bin",
+        "amdgpu/banks_k_2_smc.bin",
+        "amdgpu/kaveri_sdma.bin",
+        "amdgpu/arcturus_sos.bin",
+    ] {
+        assert!(left_out_file(member), "{member}");
+        assert!(AMDGPU.iter().all(|recipe| recipe.image.member != member));
+    }
+    for member in [
+        "amdgpu/topaz_mc.bin",
+        "amdgpu/polaris10_mc.bin",
+        "amdgpu/vega20_sos.bin",
+        "amdgpu/gc_10_3_6_pfp.bin",
+        "other/tahiti_mc.bin",
+    ] {
+        assert!(!left_out_file(member), "{member}");
+    }
+    // Topaz, the first family of GFX8, is driven.
+    assert_eq!(AmdGpu::of(0x6900), AmdGpu::Named("TOPAZ", None));
+}
+
+#[test]
 fn the_largest_set_fits_one_boots_firmware() {
     let mut largest = (0, 0);
     for gpu in DEVICES
         .iter()
         .map(|(device, _)| AmdGpu::of(*device))
+        .filter(|gpu| !matches!(gpu, AmdGpu::LeftOut(_)))
         .chain([AmdGpu::Discovered])
     {
         let mut inventory = Inventory::default();
@@ -305,8 +389,52 @@ fn the_device_tables_are_amdgpus() {
         .map(|rest| String::from(rest.split([' ', ',', '\t']).next().unwrap()))
         .filter(|name| name != "IP_DISCOVERY" && name != "LAST")
         .collect();
-    let ours: Vec<String> = CHIPS.iter().map(|(chip, _)| String::from(*chip)).collect();
+    let ours: Vec<String> = CHIPS.iter().map(|(chip, ..)| String::from(*chip)).collect();
     assert_eq!(ours, families, "amd_asic_type changed");
+    // Each family's graphics generation: the oldest graphics block of the
+    // source that sets its IP blocks (`amdgpu_device_ip_early_init`), which
+    // is discovery's for the families no case names.
+    let device = fs::read_to_string(amd.join("amdgpu/amdgpu_device.c")).unwrap();
+    let oldest = |list: &str| -> u8 {
+        fs::read_to_string(amd.join(alloc::format!("amdgpu/{list}.c")))
+            .unwrap()
+            .split("&gfx_v")
+            .skip(1)
+            .filter_map(|rest| rest.split('_').next()?.parse().ok())
+            .min()
+            .unwrap_or_else(|| panic!("{list}.c adds no graphics block"))
+    };
+    let mut generations = BTreeMap::new();
+    let (mut pending, mut default) = (Vec::new(), None);
+    for line in between(&device, "static int amdgpu_device_ip_early_init(", "\n}\n").lines() {
+        let line = line.trim();
+        if let Some(chip) = line
+            .strip_prefix("case CHIP_")
+            .and_then(|rest| rest.strip_suffix(':'))
+        {
+            pending.push(String::from(chip));
+        } else if let Some((call, _)) = line.split_once("_set_ip_blocks(adev)") {
+            let list = call
+                .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .next()
+                .unwrap();
+            if pending.is_empty() {
+                default = Some(oldest(list));
+                break;
+            }
+            for chip in pending.drain(..) {
+                generations.insert(chip, oldest(list));
+            }
+        }
+    }
+    let default = default.expect("a default IP block list");
+    for (chip, generation, _) in CHIPS {
+        assert_eq!(
+            *generation,
+            generations.get(*chip).copied().unwrap_or(default),
+            "{chip}'s graphics generation"
+        );
+    }
 }
 
 /// Sources of amdgpu that declare files but that Stela's Kconfig profile
@@ -405,10 +533,15 @@ fn every_file_amdgpus_built_units_declare_is_pinned_or_unpublished() {
         };
         names.insert(name);
     }
+    // The files only a family Stela leaves out loads are declared by
+    // units amdgpu builds for the others too (`amdgpu_uvd.c`), and are
+    // pinned nowhere.
+    assert!(names.iter().any(|name| left_out_file(name)));
     let ours: BTreeSet<String> = AMDGPU
         .iter()
         .map(|recipe| String::from(recipe.image.member))
         .chain(UNPUBLISHED.iter().map(|name| String::from(*name)))
+        .chain(names.iter().filter(|name| left_out_file(name)).cloned())
         .collect();
     let missing: Vec<_> = names.difference(&ours).collect();
     let extra: Vec<_> = ours.difference(&names).collect();
@@ -424,7 +557,7 @@ fn every_file_amdgpus_built_units_declare_is_pinned_or_unpublished() {
             .chain([AmdGpu::Discovered])
             .any(|gpu| gpu.may_load(name));
         assert!(
-            loaded || name.ends_with("/ip_discovery.bin"),
+            loaded || name.ends_with("/ip_discovery.bin") || left_out_file(name),
             "{name} is no device's"
         );
     }
@@ -441,7 +574,7 @@ fn every_legacy_name_is_a_familys() {
     );
     for literal in naming.split("return \"").skip(1) {
         let name = literal.split('"').next().unwrap();
-        let covered = CHIPS.iter().any(|(_, stems)| {
+        let covered = CHIPS.iter().any(|(_, _, stems)| {
             stems.iter().any(|stem| {
                 name == *stem || name.strip_prefix(stem).is_some_and(|r| r.starts_with('_'))
             })
@@ -553,15 +686,15 @@ fn every_discovered_file_is_attributed_to_a_block_or_a_family() {
             || DISCOVERED_CHIPS.iter().any(|(chip, _)| {
                 CHIPS
                     .iter()
-                    .find(|(known, _)| known == chip)
-                    .is_some_and(|(_, stems)| stems.iter().any(|stem| named(name, stem)))
+                    .find(|(known, ..)| known == chip)
+                    .is_some_and(|(_, _, stems)| stems.iter().any(|stem| named(name, stem)))
             });
         assert!(attributed, "{member}");
     }
     // Every family only discovery reaches has its graphics version here.
-    for (chip, _) in CHIPS
+    for (chip, ..) in CHIPS
         .iter()
-        .filter(|(chip, _)| !DEVICES.iter().any(|(_, named)| named == chip))
+        .filter(|(chip, ..)| !DEVICES.iter().any(|(_, named)| named == chip))
     {
         assert!(
             DISCOVERED_CHIPS.iter().any(|(known, _)| known == chip),

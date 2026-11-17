@@ -5683,7 +5683,7 @@ fn a_usb_made_without_an_nvidia_gpu_needs_no_firmware_step() {
     }
     assert_eq!(lines[0], lines[1]);
     let size = if cfg!(feature = "amdgpu-port") {
-        "260.0 MiB"
+        "254.1 MiB"
     } else {
         "177.0 MiB"
     };

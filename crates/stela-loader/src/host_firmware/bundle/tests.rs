@@ -518,7 +518,7 @@ fn the_boot_images_drivers_and_the_bundle_name_the_same_gpu_ports() {
     let driven = Ports {
         amd: false,
         intel: true,
-        i915: false,
+        i915: true,
     };
     assert_eq!(of(intel, "stela-drivers/"), driven, "{intel}");
     assert_eq!(of(intel, "stela-loader/"), driven, "{intel}");

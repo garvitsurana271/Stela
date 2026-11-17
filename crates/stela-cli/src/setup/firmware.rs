@@ -417,9 +417,9 @@ pub(super) fn bundle_summary() -> String {
 #[cfg(test)]
 pub(super) const BUILT_BUNDLE: (usize, &str) =
     match (cfg!(feature = "amdgpu-port"), cfg!(feature = "intel-port")) {
-        (true, true) => (596, "264.1"),
+        (true, true) => (601, "264.2"),
         (true, false) => (567, "254.1"),
-        (false, true) => (117, "187.0"),
+        (false, true) => (122, "187.0"),
         (false, false) => (88, "177.0"),
     };
 

@@ -102,7 +102,7 @@ pub fn run(fix: bool, low_memory: bool) -> Result<()> {
             "-p",
             "stela-driver-gpu",
             "--features",
-            "metal-linked,nouveau-port,amdgpu-port,xe-port",
+            "metal-linked,nouveau-port,amdgpu-port,xe-port,i915-port",
         ]),
     ];
     let mut nvk_clippy = uefi([BOOT[0], BOOT[1], "--features", "nvk"]);

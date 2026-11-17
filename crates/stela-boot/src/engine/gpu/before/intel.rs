@@ -1,5 +1,5 @@
-//! The Intel stacks' parts of the claim: xe's and the display code's needs
-//! of the boot, in an image built with the Intel port.
+//! The Intel stacks' parts of the claim: xe's, i915's and the display
+//! code's needs of the boot, in an image built with the Intel port.
 use super::{Before, Identified, Observed, Searched, on_usb, select_firmware};
 use crate::output;
 use alloc::{format, vec::Vec};
@@ -65,6 +65,105 @@ pub(super) static XE: Before = Before {
     },
     settle: |_, _, _| Ok(()),
 };
+
+/// i915: the platform is the PCI device ID's, as in i915's own table, and
+/// its file is that platform's display microcontroller program, which i915
+/// starts without. Its probe reads the host bridge (`i915_gmch.c`) and the
+/// stolen memory Linux's x86 early quirks find; the display code takes the
+/// PC's Video BIOS Table as xe's does.
+pub(super) static I915: Before = Before {
+    admits: |adapter, catalog| {
+        on_usb(
+            &i915_files(adapter.device)?,
+            &format!("{:04x}", adapter.device),
+            catalog,
+        )
+    },
+    identify: |mut observed, catalog| {
+        let adapter = observed.adapter;
+        // Register 0 identifies nothing here; the read proves the window.
+        observed
+            .registers
+            .read32(0)
+            .map_err(ServiceError::Mapping)?;
+        let platform = gpu::i915::handed(adapter.device)
+            .ok_or(ServiceError::Refused("i915 is not handed the GPU"))?;
+        let inventory = i915_files(adapter.device)?;
+        let target = inventory
+            .requests()
+            .first()
+            .ok_or(ServiceError::Refused(
+                "the GPU has no pinned firmware recipe",
+            ))?
+            .view()
+            .target;
+        let table = video_bios_table(&mut observed, target);
+        let name = format!("{:04x}", adapter.device);
+        let mut searched = chipset_bridges(&observed, "i915");
+        searched.extend(host_bridge(&observed));
+        let stolen = graphics_stolen(&mut observed);
+        Ok(Identified {
+            firmware: select_firmware(&inventory, &name, catalog, table.map(|table| (table, VBT)))?,
+            identity: None,
+            chip: Some(platform.name),
+            // As xe's (`intel_bios.c`).
+            parameters: table.map(|_| format!("i915.vbt_firmware={VBT}")),
+            searched,
+            stolen,
+        })
+    },
+    settle: |_, _, _| Ok(()),
+};
+
+/// The functions of the host bridge's device, with the configuration the
+/// scan read, which i915 reads through `pci_get_domain_bus_and_slot(0, 0,
+/// 0)` (`i915_gmch_bridge_setup` fails the probe without it).
+fn host_bridge(observed: &Observed<'_>) -> Vec<Searched> {
+    let address = observed.adapter.address;
+    let functions: Vec<_> = observed
+        .chipset
+        .iter()
+        .filter(|function| function.configuration.is_some())
+        .map(|function| searched(function, function.configuration))
+        .collect();
+    if address.segment != 0 || functions.is_empty() {
+        output::arguments(format_args!(
+            "GPU {address}: no host bridge was read at 0000:00:00.0, so i915's probe fails at \
+             its bridge setup\n"
+        ));
+    }
+    functions
+}
+
+/// The graphics memory the firmware reserved for the GPU, by the method
+/// Linux's early quirks name for the device, with one line saying what was
+/// found or why none is reported.
+fn graphics_stolen(observed: &mut Observed<'_>) -> Option<(u64, u64)> {
+    use gpu::i915::stolen::{self, Absent};
+    let address = observed.adapter.address;
+    let config = observed.function.config();
+    let mut read = |offset: u16| config.read32(offset).ok();
+    let found = stolen::method(observed.adapter.device)
+        .ok_or(Absent::NoMethod)
+        .and_then(|method| stolen::find(method, &mut read));
+    match found {
+        Ok(found) => {
+            output::arguments(format_args!(
+                "GPU {address}: graphics stolen memory of {} KiB at {:#x}\n",
+                found.size / 1024,
+                found.base
+            ));
+            Some((found.base, found.size))
+        }
+        Err(why) => {
+            output::arguments(format_args!(
+                "GPU {address}: no graphics stolen memory is reported ({why:?}): i915 runs \
+                 without it\n"
+            ));
+            None
+        }
+    }
+}
 
 /// The PCI-to-ISA bridges of the GPU's segment, with one line each. The
 /// display code names the PCH by the bridge's IDs (`intel_pch.c` searches
@@ -194,5 +293,14 @@ fn xe_files(device: u16) -> Result<Inventory, ServiceError> {
     let mut inventory = Inventory::default();
     stela_loader::host_firmware::recipes::require_xe(&mut inventory, device)
         .map_err(|_| ServiceError::Refused("the GPU has no pinned xe firmware recipe"))?;
+    Ok(inventory)
+}
+
+/// The file i915's display code asks for on the Intel GPU with PCI device
+/// ID `device`.
+fn i915_files(device: u16) -> Result<Inventory, ServiceError> {
+    let mut inventory = Inventory::default();
+    stela_loader::host_firmware::recipes::require_i915(&mut inventory, device)
+        .map_err(|_| ServiceError::Refused("the GPU has no pinned i915 firmware recipe"))?;
     Ok(inventory)
 }

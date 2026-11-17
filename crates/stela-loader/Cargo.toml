@@ -16,6 +16,7 @@ default = ["std"]
 # its driver, and a test keeps those lists one.
 amdgpu-port = []
 xe-port = []
+i915-port = []
 # Without `std` only the kernel boot-bundle builder (`boot_bundle` and the
 # formats it reads) is built, for `stela.efi`.
 std = ["stela-soc-data/std",

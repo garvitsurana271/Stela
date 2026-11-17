@@ -255,6 +255,7 @@ enum Consumer {
     Wifi,
     Nouveau,
     Xe,
+    I915,
     Amdgpu,
 }
 
@@ -1513,9 +1514,14 @@ const XE_GSC_OPTIONAL: [&str; 2] = ["Panther Lake", "Wildcat Lake"];
 /// when it is missing, on every platform that names it: a display
 /// microcontroller program (`intel_dmc.c` runs the display without its
 /// power states) and the GSC image of Battlemage and later. A GuC or HuC
-/// image is always needed: `xe_uc_init` fails without either. Other drivers'
+/// image is always needed: `xe_uc_init` fails without either. i915's files,
+/// display microcontroller programs only, are all optional. Other drivers'
 /// files are all needed.
 pub fn optional(request: &Request) -> bool {
+    // i915's only files are display microcontroller programs.
+    if request.target.driver == I915_TARGET.driver {
+        return select_i915(request).is_some();
+    }
     if select_xe(request).is_none() {
         return false;
     }
@@ -1549,6 +1555,161 @@ pub fn require_xe(inventory: &mut Inventory, device: u16) -> Result<(), Error> {
             minimum_bytes: 1,
         })?;
     }
+    Ok(())
+}
+
+/// A display microcontroller program of linux-firmware's `i915` directory
+/// that only i915 loads, under the directory's notice.
+const fn i915_dmc(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
+    Recipe {
+        image: Artifact {
+            source: LINUX_FIRMWARE,
+            revision: XE_REVISION,
+            member,
+            length,
+            sha256,
+        },
+        license: &I915_LICENSE,
+        consumer: Consumer::I915,
+    }
+}
+
+/// What i915's display code loads on the platforms i915 drives in Stela:
+/// the display microcontroller programs `intel_dmc.c` names for Skylake to
+/// Ice Lake. i915 loads no GuC or HuC there under its default `enable_guc`
+/// (`intel_uc.c` uses them from Gen12 on).
+pub const I915: &[Recipe] = &[
+    i915_dmc(
+        "i915/skl_dmc_ver1_27.bin",
+        8928,
+        "d3b6dc1a39bb2aeb37a1179f2b4e8145c24986da78c533571a5712dc91ec3f61",
+    ),
+    i915_dmc(
+        "i915/bxt_dmc_ver1_07.bin",
+        8380,
+        "b4036e7698130c7a59637e543f6c614495c7076666104a2079d011f0923455f5",
+    ),
+    i915_dmc(
+        "i915/kbl_dmc_ver1_04.bin",
+        8840,
+        "2cde41c3e5ad181423bcc3e98ff9c49f743c88f18646af4d0b3c3a9664b831a1",
+    ),
+    i915_dmc(
+        "i915/glk_dmc_ver1_04.bin",
+        8800,
+        "412d3a3ed68908b983ff16cfe496e969c9fd31f94283e0872d7e5413c7bee504",
+    ),
+    i915_dmc(
+        "i915/icl_dmc_ver1_09.bin",
+        25952,
+        "aafad1967679baa36e971e5331da73eea31c68239416432df83e71332755dc01",
+    ),
+];
+
+/// The platforms i915 drives in Stela, Skylake to Ice Lake and their Atom
+/// lines, each by the name of its `enum intel_platform` entry without the
+/// `INTEL_` prefix, with the PCI device IDs i915's table gives it and the
+/// display microcontroller program `dmc_firmware_default` names for it. A
+/// device xe's table also holds is xe's and is not listed, and neither is
+/// one no Vulkan driver here opens: graphics before Skylake, and an ID
+/// Mesa's table leaves out.
+type I915Platform = (&'static str, &'static [u16], &'static str);
+pub const I915_PLATFORMS: &[I915Platform] = &[
+    (
+        "SKYLAKE",
+        &[
+            0x1902, 0x1906, 0x190a, 0x190b, 0x190e, 0x1912, 0x1913, 0x1915, 0x1916, 0x1917, 0x191a,
+            0x191b, 0x191d, 0x191e, 0x1921, 0x1923, 0x1926, 0x1927, 0x192a, 0x192b, 0x192d, 0x1932,
+            0x193a, 0x193b, 0x193d,
+        ],
+        "i915/skl_dmc_ver1_27.bin",
+    ),
+    (
+        "BROXTON",
+        &[0x0a84, 0x1a84, 0x1a85, 0x5a84, 0x5a85],
+        "i915/bxt_dmc_ver1_07.bin",
+    ),
+    ("GEMINILAKE", &[0x3184, 0x3185], "i915/glk_dmc_ver1_04.bin"),
+    (
+        "KABYLAKE",
+        &[
+            0x5902, 0x5906, 0x5908, 0x590a, 0x590b, 0x590e, 0x5912, 0x5913, 0x5915, 0x5916, 0x5917,
+            0x591a, 0x591b, 0x591c, 0x591d, 0x591e, 0x5921, 0x5923, 0x5926, 0x5927, 0x593b, 0x87c0,
+        ],
+        "i915/kbl_dmc_ver1_04.bin",
+    ),
+    (
+        "COFFEELAKE",
+        &[
+            0x3e90, 0x3e91, 0x3e92, 0x3e93, 0x3e94, 0x3e96, 0x3e98, 0x3e99, 0x3e9a, 0x3e9b, 0x3e9c,
+            0x3ea0, 0x3ea1, 0x3ea2, 0x3ea3, 0x3ea4, 0x3ea5, 0x3ea6, 0x3ea7, 0x3ea8, 0x3ea9, 0x87ca,
+        ],
+        "i915/kbl_dmc_ver1_04.bin",
+    ),
+    (
+        "COMETLAKE",
+        &[
+            0x9b21, 0x9b41, 0x9ba2, 0x9ba4, 0x9ba5, 0x9ba8, 0x9baa, 0x9bac, 0x9bc2, 0x9bc4, 0x9bc5,
+            0x9bc6, 0x9bc8, 0x9bca, 0x9bcc, 0x9be6, 0x9bf6,
+        ],
+        "i915/kbl_dmc_ver1_04.bin",
+    ),
+    (
+        "ICELAKE",
+        &[
+            0x8a50, 0x8a51, 0x8a52, 0x8a53, 0x8a54, 0x8a56, 0x8a57, 0x8a58, 0x8a59, 0x8a5a, 0x8a5b,
+            0x8a5c, 0x8a5d, 0x8a71,
+        ],
+        "i915/icl_dmc_ver1_09.bin",
+    ),
+    (
+        "ELKHARTLAKE",
+        &[0x4541, 0x4551, 0x4555, 0x4557, 0x4570, 0x4571],
+        "i915/icl_dmc_ver1_09.bin",
+    ),
+    (
+        "JASPERLAKE",
+        &[0x4e51, 0x4e55, 0x4e57, 0x4e61, 0x4e71],
+        "i915/icl_dmc_ver1_09.bin",
+    ),
+];
+
+/// The binding i915's files take: Linux's names, as for xe's.
+pub const I915_TARGET: Target<'static> = Target {
+    driver: "i915",
+    hardware: "intel",
+    revision: "linux-firmware",
+    board: None,
+};
+
+/// i915's request for a file, by the name the driver gives it.
+fn select_i915(request: &Request) -> Option<&'static Recipe> {
+    if request.target.hardware != I915_TARGET.hardware
+        || request.target.revision != I915_TARGET.revision
+    {
+        return None;
+    }
+    I915.iter()
+        .find(|recipe| recipe.image.member == request.name)
+}
+
+/// The platform of [`I915_PLATFORMS`] that holds `device`.
+pub fn i915_platform(device: u16) -> Option<&'static I915Platform> {
+    I915_PLATFORMS
+        .iter()
+        .find(|(_, devices, _)| devices.contains(&device))
+}
+
+/// Requires the file i915 asks for on `device`, its platform's display
+/// microcontroller program, when `device` is one i915 drives in Stela.
+pub fn require_i915(inventory: &mut Inventory, device: u16) -> Result<(), Error> {
+    let (_, _, dmc) = i915_platform(device)
+        .ok_or_else(|| Error(format!("{device:04x} is no Intel GPU i915 drives in Stela")))?;
+    inventory.observe(Requirement {
+        name: dmc,
+        target: I915_TARGET,
+        minimum_bytes: 1,
+    })?;
     Ok(())
 }
 
@@ -2062,6 +2223,7 @@ pub fn recipe(request: &Request) -> Option<&'static Recipe> {
         "realtek-wifi" => select_realtek_wifi(request),
         "nouveau" => select_gsp(request),
         "xe" => select_xe(request),
+        "i915" => select_i915(request),
         "amdgpu" => amdgpu::select(request),
         _ => None,
     }
@@ -2391,6 +2553,57 @@ mod tests {
             assert_eq!(intel_gpu_platform(device), None);
             assert!(require_xe(&mut Inventory::default(), device).is_err());
         }
+    }
+
+    #[test]
+    fn i915_platforms_name_pinned_optional_display_programs_only() {
+        let mut named = Vec::new();
+        let mut seen = Vec::new();
+        for (platform, devices, dmc) in I915_PLATFORMS {
+            assert!(!devices.is_empty(), "{platform}");
+            for device in *devices {
+                assert!(!seen.contains(device), "{platform} {device:04x}");
+                seen.push(*device);
+                // xe's devices are not i915's.
+                assert!(
+                    require_xe(&mut Inventory::default(), *device).is_err(),
+                    "{device:04x}"
+                );
+                let mut inventory = Inventory::default();
+                require_i915(&mut inventory, *device).unwrap();
+                let requests = inventory.requests();
+                assert_eq!(requests.len(), 1, "{platform}");
+                assert_eq!(requests[0].name, *dmc);
+                assert_eq!(requests[0].target.driver, "i915");
+                let recipe = recipe(&requests[0]).unwrap();
+                assert!(matches!(recipe.consumer, Consumer::I915));
+                assert!(optional(&requests[0]), "{dmc}");
+                named.push(recipe.image.member);
+            }
+        }
+        // Every pinned file serves a platform.
+        for recipe in I915 {
+            assert!(
+                named.contains(&recipe.image.member),
+                "{}",
+                recipe.image.member
+            );
+        }
+        // Skylake's, and none for Tiger Lake (xe's), Broadwell or Ironlake.
+        assert_eq!(i915_platform(0x1916).unwrap().2, "i915/skl_dmc_ver1_27.bin");
+        for device in [0x9a49, 0x1616, 0x0046] {
+            assert!(
+                require_i915(&mut Inventory::default(), device).is_err(),
+                "{device:04x}"
+            );
+        }
+        // An xe request by an i915 file's name is no i915 recipe.
+        let request = Request::from(Requirement {
+            name: "i915/skl_dmc_ver1_27.bin",
+            target: XE_TARGET,
+            minimum_bytes: 1,
+        });
+        assert!(recipe(&request).is_none());
     }
 
     #[test]

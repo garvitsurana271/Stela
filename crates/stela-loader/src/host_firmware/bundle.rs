@@ -33,16 +33,19 @@ pub const TARGET: driver::Target<'static> = driver::Target {
 };
 
 /// Which GPU ports a build runs, and so whose firmware its bundle holds:
-/// the AMD (amdgpu) and Intel (xe) ports, which a release leaves out with
-/// their drivers. The boot image enables this crate's `amdgpu-port` and
-/// `xe-port` exactly where it enables those drivers
+/// the AMD (amdgpu) and Intel (xe, i915) ports, which a release leaves out
+/// with their drivers. The boot image enables this crate's `amdgpu-port`,
+/// `xe-port` and `i915-port` exactly where it enables those drivers
 /// (`crates/stela-boot/Cargo.toml`), and `stela` where it is built with the
 /// same features (`crates/stela-cli/Cargo.toml`), so a stick holds the
 /// files of its image's drivers and no others.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ports {
     pub amd: bool,
+    /// xe, for Tiger Lake and later.
     pub intel: bool,
+    /// i915, for Skylake to Ice Lake.
+    pub i915: bool,
 }
 
 impl Ports {
@@ -50,16 +53,19 @@ impl Ports {
     pub const BUILT: Self = Self {
         amd: cfg!(feature = "amdgpu-port"),
         intel: cfg!(feature = "xe-port"),
+        i915: cfg!(feature = "i915-port"),
     };
     /// A build without the ports, as a release is.
     pub const NONE: Self = Self {
         amd: false,
         intel: false,
+        i915: false,
     };
     /// A build with every port.
     pub const ALL: Self = Self {
         amd: true,
         intel: true,
+        i915: true,
     };
 }
 
@@ -69,11 +75,12 @@ enum Port {
     Always,
     Amd,
     Intel,
+    I915,
 }
 
 /// Every recipe family, in the order a volume short of room keeps them: the
 /// small network and Bluetooth files first, the GPU's large images last.
-const ALL: [(&str, &[Recipe], Port); 11] = [
+const ALL: [(&str, &[Recipe], Port); 12] = [
     (
         "Wi-Fi regulatory database",
         recipes::REGULATORY,
@@ -92,6 +99,7 @@ const ALL: [(&str, &[Recipe], Port); 11] = [
     ("Intel Bluetooth", recipes::INTEL_RSA, Port::Always),
     ("AMD GPU", recipes::AMDGPU, Port::Amd),
     ("Intel graphics", recipes::XE, Port::Intel),
+    ("Older Intel graphics", recipes::I915, Port::I915),
     ("NVIDIA GSP-RM", recipes::GSP, Port::Always),
 ];
 
@@ -102,6 +110,7 @@ pub fn families_for(ports: Ports) -> impl Iterator<Item = (&'static str, &'stati
             Port::Always => true,
             Port::Amd => ports.amd,
             Port::Intel => ports.intel,
+            Port::I915 => ports.i915,
         })
         .map(|&(name, recipes, _)| (name, recipes))
 }
@@ -454,12 +463,12 @@ pub fn select_for(functions: &[Pci], ports: Ports) -> Selection {
             continue;
         }
         if function.vendor == 0x8086 && function.class == 0x03 {
-            if !ports.intel {
-                continue;
-            }
-            // The devices xe drives; another Intel GPU has no driver here
-            // and so no files.
-            if recipes::require_xe(&mut inventory, function.device).is_ok() {
+            // The devices xe drives, in a build with xe, and those i915
+            // drives, in a build with i915; another Intel GPU has no driver
+            // here and so no files.
+            if (ports.intel && recipes::require_xe(&mut inventory, function.device).is_ok())
+                || (ports.i915 && recipes::require_i915(&mut inventory, function.device).is_ok())
+            {
                 selection.plan(&inventory, &why);
             }
             continue;

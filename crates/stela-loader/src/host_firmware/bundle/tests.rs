@@ -5,9 +5,10 @@ const BASE: (usize, usize) = (88, 185_584_904);
 /// What each port adds to the bundle, as files and bytes, and how many of
 /// its recipes hold another's bytes. amdgpu: 479 files, 77.1 MiB; `mec2`
 /// and `mec` of most families and a revision's files that did not change
-/// are one file. xe: 29 files, 10.0 MiB.
+/// are one file. xe: 29 files, 10.0 MiB. i915: 5 files, 59.5 KiB.
 const AMD: (usize, usize, usize) = (479, 80_886_776, 93);
 const INTEL: (usize, usize, usize) = (29, 10_480_332, 0);
+const I915: (usize, usize, usize) = (5, 60_900, 0);
 use stela_driver_core::firmware::{Provenance, Resource, Target};
 
 #[test]
@@ -31,7 +32,11 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     // The RTL8168H and RTL8168M share a file, as the RTL9151A and RTL9151AS
     // do; each port adds its own files.
     let mut expected = (BASE.0, BASE.1, 2);
-    for (built, port) in [(Ports::BUILT.amd, AMD), (Ports::BUILT.intel, INTEL)] {
+    for (built, port) in [
+        (Ports::BUILT.amd, AMD),
+        (Ports::BUILT.intel, INTEL),
+        (Ports::BUILT.i915, I915),
+    ] {
         if built {
             expected = (
                 expected.0 + port.0,
@@ -266,22 +271,45 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
         }
         assert!(card.unknown.is_empty());
     }
-    // With the Intel port. A Tiger Lake GPU (xe's table): its GuC, HuC and
-    // DMC. An Ice Lake GPU, which xe does not drive, selects nothing and is
-    // not named as lacking files: no driver here would read them.
-    let tiger_lake = select_for(
-        &[pci(0x8086, 0x9a49, 0x03), pci(0x8086, 0x8a56, 0x03)],
-        Ports::ALL,
-    );
+    // With the Intel ports. A Tiger Lake GPU (xe's table): its GuC, HuC and
+    // DMC. An Ice Lake GPU, which i915 drives: its display program. A
+    // Broadwell GPU, which no driver here drives, selects nothing and is not
+    // named as lacking files: no driver here would read them.
+    let intel = [
+        pci(0x8086, 0x9a49, 0x03),
+        pci(0x8086, 0x8a56, 0x03),
+        pci(0x8086, 0x1616, 0x03),
+    ];
+    let both = select_for(&intel, Ports::ALL);
     let mut expected: Vec<&str> = USB.to_vec();
     expected.extend([
+        "i915/icl_dmc_ver1_09.bin",
         "i915/tgl_dmc_ver2_12.bin",
         "i915/tgl_guc_70.bin",
         "i915/tgl_huc.bin",
     ]);
     expected.sort_unstable();
-    assert_eq!(members(&tiger_lake), expected);
-    assert!(tiger_lake.unknown.is_empty());
+    assert_eq!(members(&both), expected);
+    assert!(both.unknown.is_empty());
+    // Each driver's files only with its port.
+    let xe_only = select_for(
+        &intel,
+        Ports {
+            i915: false,
+            ..Ports::ALL
+        },
+    );
+    assert!(!members(&xe_only).contains(&"i915/icl_dmc_ver1_09.bin"));
+    assert!(members(&xe_only).contains(&"i915/tgl_guc_70.bin"));
+    let i915_only = select_for(
+        &intel,
+        Ports {
+            intel: false,
+            ..Ports::ALL
+        },
+    );
+    assert!(members(&i915_only).contains(&"i915/icl_dmc_ver1_09.bin"));
+    assert!(!members(&i915_only).contains(&"i915/tgl_guc_70.bin"));
     // An NVIDIA display chip no recipe covers is named once.
     let old = select(&[pci(0x10de, 0x1b80, 0x03), pci(0x10de, 0x1b80, 0x03)]);
     assert_eq!(old.unknown, ["pci 10de:1b80"]);
@@ -445,6 +473,7 @@ fn ports_of(line: &str) -> Ports {
     Ports {
         amd: line.contains("amdgpu-port\""),
         intel: line.contains("xe-port\""),
+        i915: line.contains("i915-port\""),
     }
 }
 
@@ -540,6 +569,6 @@ fn a_build_without_the_ports_bundles_none_of_their_firmware() {
     );
     assert_eq!(
         built.iter().any(|artifact| intel(artifact.member)),
-        Ports::BUILT.intel
+        Ports::BUILT.intel || Ports::BUILT.i915
     );
 }

@@ -1112,7 +1112,11 @@ impl MemoryExporter for Exporter {
     }
 }
 
-fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
+fn service(
+    gpu: &Gpu,
+    stack: u64,
+    watch: Option<client::ResetWatch>,
+) -> Result<Arc<Shared>, OpenError> {
     let driver = gpu.stack.vulkan.as_ref().ok_or(Error::Invalid(
         "the GPU's stack drives displays only: it has no Vulkan driver",
     ))?;
@@ -1140,9 +1144,18 @@ fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
     let gpu = *gpu;
     // A lost device's channels are gone, so the next client gets a new one,
     // opened on the service's stack as the first was.
-    // SAFETY: as above.
-    let service = service.with_reopen(Box::new(move || unsafe {
-        reopen(loader, Box::new(Exporter), compiler, &gpu)
+    let service = service.with_reopen(Box::new(move || {
+        // Not while the kernel driver resets the GPU: the connection that
+        // asked reports why, and the next one asks again.
+        if let Some(held) = watch
+            .as_ref()
+            .and_then(client::ResetWatch::state)
+            .and_then(ResetState::holds_reopen)
+        {
+            return Err(Error::Unsupported(held));
+        }
+        // SAFETY: as above.
+        unsafe { reopen(loader, Box::new(Exporter), compiler, &gpu) }
     }));
     // A driver that loses its device only with a GPU its kernel driver
     // reset, whose release would wait for that reset's end, keeps the lost
@@ -1340,7 +1353,7 @@ fn open_gpu(
     let mut opened = None;
     run(top, &mut || {
         construct(constructed);
-        opened = Some(service(&target, top));
+        opened = Some(service(&target, top, watch));
     });
     match opened? {
         Ok(service) => {

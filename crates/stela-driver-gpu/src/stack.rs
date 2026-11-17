@@ -73,6 +73,17 @@ pub enum ResetState {
     Resetting,
 }
 
+impl ResetState {
+    /// Why a lost device's reopen waits, `None` where it may run: while the
+    /// driver resets the GPU, the open of a new device, its first work and
+    /// every close wait for the reset's end, in the turn every client waits
+    /// on. The lost device stays, the connection that asked says why, and
+    /// the next one asks again.
+    pub fn holds_reopen(self) -> Option<&'static str> {
+        (self == Self::Resetting).then_some("its kernel driver is still resetting the GPU")
+    }
+}
+
 /// One vendor's stack.
 pub struct GpuStack {
     pub vendor: Vendor,
@@ -739,6 +750,10 @@ mod tests {
         flags.set(1 | 1 << 5);
         assert_eq!((reset.state)(&mut answer, 7), Some(ResetState::Resetting));
         assert_eq!(asked[..2], [(0xc010_6442, 1, 0), (0xc010_6442, 4, 7)]);
+        // A lost device reopens once the reset ended, not during it.
+        assert_eq!(ResetState::Running.holds_reopen(), None);
+        assert_eq!(ResetState::Reset.holds_reopen(), None);
+        assert!(ResetState::Resetting.holds_reopen().is_some());
         let mut refuse = |_: u32, _: *mut c_void| -22;
         assert_eq!((reset.watch)(&mut refuse), None);
         assert_eq!((reset.state)(&mut refuse, 7), None);

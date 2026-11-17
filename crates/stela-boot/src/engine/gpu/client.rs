@@ -1725,7 +1725,8 @@ pub(in crate::engine) fn vram_bytes(service: u32) -> Option<u64> {
 /// A kernel driver's watch for resets on a file of its own, made before a
 /// GPU's first work ([`stela_drivers::gpu::stack::Reset`]). Its file stays
 /// open for the boot: closing a file of a GPU in reset waits for the
-/// reset's end.
+/// reset's end. A lost device's reopen asks it too.
+#[derive(Clone, Copy)]
 pub(super) struct ResetWatch {
     fd: c_int,
     context: u32,

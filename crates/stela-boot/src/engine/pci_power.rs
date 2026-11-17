@@ -238,8 +238,9 @@ pub(super) fn power_on_ports(acpi: &'static HostAcpi, source: &'static Source, t
 /// above. Linux sees both GPUs before amdgpu's `ATPX` handler starts
 /// (`amdgpu_atpx_detect` counts two display functions), so this runs only
 /// where the scan found fewer than two display functions and a port that
-/// is no empty hot-plug slot is still empty. Nothing is logged where the
-/// namespace has no `ATPX`.
+/// is no empty hot-plug slot is still empty. Nothing is logged where no
+/// display function's companion, and no device below such a port's, holds
+/// `ATPX`.
 fn atpx_power_on(
     acpi: &'static HostAcpi,
     source: &'static Source,
@@ -256,11 +257,12 @@ fn atpx_power_on(
     if empty.is_empty() {
         return;
     }
+    let (scan, ports) = (topology.clone(), empty.clone());
     let path = match acpi.firmware(
         "ATPX power-on",
         "the discrete GPU stays as firmware left it",
         true,
-        gpu_methods::atpx_power_on,
+        move |session| gpu_methods::atpx_power_on(session, &scan, &ports),
     ) {
         Some(Ok(AtpxPower::On(path))) => path,
         Some(Ok(AtpxPower::Absent)) | None => return,

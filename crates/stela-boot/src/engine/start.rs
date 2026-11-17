@@ -1510,7 +1510,7 @@ fn open_gpus(
     // bounded firmware call.
     #[cfg(feature = "nvk")]
     if let Some(acpi) = acpi {
-        let adapters = adapters.clone();
+        let (adapters, companions) = (adapters.clone(), companions.clone());
         acpi.firmware(
             "GPU ACPI data",
             "GSP-RM gets none of it",
@@ -1518,8 +1518,6 @@ fn open_gpus(
             move |session| gpu::acpi_backlight::load(session, &adapters, &companions),
         );
     }
-    #[cfg(not(feature = "nvk"))]
-    let _ = companions;
     let claiming = host::rdtsc();
     let claimed = work.call_owned(60_000_000, move || {
         // The firmware's memory is read through the ACPI owner: a GPU's
@@ -1589,7 +1587,7 @@ fn open_gpus(
         #[cfg(feature = "nvk")]
         heap_bytes,
     };
-    gpu::amd_acpi_methods(acpi, &claimed);
+    gpu::amd_acpi_methods(acpi, &claimed, found.clone(), companions);
     // Store the claim's lines before Linux starts, so the USB keeps them
     // even when the start never returns.
     output::flush_log();

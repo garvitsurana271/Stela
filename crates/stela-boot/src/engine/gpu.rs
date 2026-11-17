@@ -2330,10 +2330,16 @@ pub(super) fn panel_brightness(
 }
 
 /// Where an AMD GPU was claimed, name once each of AMD's graphics ACPI
-/// methods the namespace holds, which amdgpu calls only where Linux builds
+/// methods a display function's companion holds, of the `companions` the
+/// census found for `adapters`, which amdgpu calls only where Linux builds
 /// its ACPI support and Stela's profile does not, and what it does without
 /// it (`stela_drivers::probe::gpu_methods`).
-pub(super) fn amd_acpi_methods(acpi: Option<&'static super::aml::HostAcpi>, claimed: &[Claimed]) {
+pub(super) fn amd_acpi_methods(
+    acpi: Option<&'static super::aml::HostAcpi>,
+    claimed: &[Claimed],
+    adapters: Vec<gpu::Adapter>,
+    companions: Vec<(stela_drivers::bus::pci::Address, String)>,
+) {
     use stela_drivers::probe::gpu_methods::{self, METHODS};
     if !claimed
         .iter()
@@ -2343,8 +2349,9 @@ pub(super) fn amd_acpi_methods(acpi: Option<&'static super::aml::HostAcpi>, clai
     }
     let Some(acpi) = acpi else { return };
     let then = "amdgpu runs without AMD's graphics ACPI methods";
-    let Some(Ok(found)) = acpi.firmware("AMD graphics methods", then, false, gpu_methods::find)
-    else {
+    let Some(found) = acpi.firmware("AMD graphics methods", then, false, move |session| {
+        gpu_methods::find(session, &adapters, &companions)
+    }) else {
         return;
     };
     for (method, path) in found {

@@ -2315,14 +2315,10 @@ pub unsafe fn probe_observed(
                 .push((address, class, d3cold::POWERED_OFF_PORT));
         }
     }
-    // ATRM, read while the census's bridges name each function's companion.
-    #[cfg(feature = "native-acpi")]
-    if let Some(session) = services.and_then(|services| services.acpi()) {
-        devices.atrm = gpu_methods::atrm(session, &bridges, &devices.classes);
-    }
     attach_usb4_hosts(usb4_hosts, services, &bridges, handoff, &mut devices);
     // Each display controller's companion, once every bridge above it is
-    // known.
+    // known, found once: GSP-RM's ACPI data and AMD's graphics methods are
+    // read on it, ATRM here.
     #[cfg(feature = "native-acpi")]
     if let Some(session) = services.and_then(NativeServices::acpi) {
         devices.gpu_companions = devices
@@ -2333,6 +2329,7 @@ pub unsafe fn probe_observed(
                 Some((gpu.address, companion.path().ok()?))
             })
             .collect();
+        devices.atrm = gpu_methods::atrm(session, &devices.gpus, &devices.gpu_companions);
     }
     attach_broadcom_bluetooth(
         broadcom_bluetooth,

@@ -12,8 +12,20 @@
 //!   its port has no power resources of its own.
 //! - `ATPX`'s mux switching and runtime power-off, `ATIF` and `ATCS` are not
 //!   called: [`METHODS`] says what amdgpu does without them.
-use super::native::{Bridge, companion};
+//!
+//! Each method is looked for where amdgpu looks: on the ACPI companion of a
+//! display function of class VGA or other display, the first in census
+//! order that holds it (`amdgpu_atrm_get_bios`, `amdgpu_atpx_detect`,
+//! `amdgpu_acpi_detect`). The companion is the one Linux's
+//! `acpi_pci_find_companion` gives the function, found once per display
+//! function by the census (`Devices::gpu_companions`), which GSP-RM's ACPI
+//! data is read from too. A method under a device that is no display
+//! function's companion, as a firmware's node for a GPU the PC does not
+//! have, is never called.
+use super::d3cold::Topology;
+use super::native::companion;
 use crate::bus::pci::Address;
+use crate::gpu::Adapter;
 use crate::platform::acpi::{Argument, Error, Handle, Session, Value};
 use alloc::{string::String, vec::Vec};
 
@@ -36,18 +48,47 @@ pub const METHODS: [(&str, &str); 3] = [
     ),
 ];
 
-/// The first device path holding each of [`METHODS`], in that order.
-pub fn find(session: &Session) -> Result<Vec<(&'static str, String)>, Error> {
-    let devices = session.all_devices()?;
-    Ok(METHODS
+/// Whether amdgpu looks for AMD's methods on a display function of `class`:
+/// VGA or other display, not a 3D controller.
+fn asked(class: [u8; 3]) -> bool {
+    class[0] == 3 && matches!(class[1], 0 | 0x80)
+}
+
+/// The first of `adapters`, in census order, that amdgpu asks and whose
+/// ACPI companion, of the `companions` the census found, holds `method`.
+fn holder<'a>(
+    session: &'a Session,
+    adapters: &[Adapter],
+    companions: &[(Address, String)],
+    method: &str,
+) -> Option<(Address, Handle<'a>)> {
+    adapters
+        .iter()
+        .filter(|adapter| asked(adapter.class))
+        .find_map(|adapter| {
+            let (_, path) = companions
+                .iter()
+                .find(|(function, _)| *function == adapter.address)?;
+            let device = session.handle(path).ok()?;
+            device.child(method).ok()?;
+            Some((adapter.address, device))
+        })
+}
+
+/// The path of the display function's companion that holds each of
+/// [`METHODS`], in that order.
+pub fn find(
+    session: &Session,
+    adapters: &[Adapter],
+    companions: &[(Address, String)],
+) -> Vec<(&'static str, String)> {
+    METHODS
         .iter()
         .filter_map(|&(method, _)| {
-            devices
-                .iter()
-                .find(|device| device.child(method).is_ok())
-                .map(|device| (method, device.path().unwrap_or_default()))
+            let (_, device) = holder(session, adapters, companions, method)?;
+            Some((method, device.path().unwrap_or_default()))
         })
-        .collect())
+        .collect()
 }
 
 /// `ATRM_BIOS_PAGE` and the 256 KiB `amdgpu_atrm_get_bios` reads at most.
@@ -65,23 +106,16 @@ pub struct Atrm {
     pub image: Vec<u8>,
 }
 
-/// `ATRM` as `amdgpu_atrm_get_bios` reads it: the first display function
-/// of `displays` (class VGA or other display, in census order) whose ACPI
-/// companion holds the method, called for each 4 KiB piece until one comes
-/// back short or the call fails, at most 256 KiB.
+/// `ATRM` as `amdgpu_atrm_get_bios` reads it: on the first display
+/// function whose companion holds the method ([`holder`]), called for each
+/// 4 KiB piece until one comes back short or the call fails, at most
+/// 256 KiB.
 pub(super) fn atrm(
     session: &Session,
-    bridges: &[Bridge],
-    displays: &[(Address, [u8; 3])],
+    adapters: &[Adapter],
+    companions: &[(Address, String)],
 ) -> Option<Atrm> {
-    let (owner, method) = displays
-        .iter()
-        .filter(|(_, class)| class[0] == 3 && matches!(class[1], 0 | 0x80))
-        .find_map(|&(address, _)| {
-            let device = companion(session, address, bridges)?;
-            device.child("ATRM").ok()?;
-            Some((address, device))
-        })?;
+    let (owner, method) = holder(session, adapters, companions, "ATRM")?;
     Some(Atrm {
         owner,
         path: method.path().unwrap_or_default(),
@@ -126,7 +160,8 @@ const MS_HYBRID_GFX_SUPPORTED: u32 = 1 << 14;
 /// What powering the discrete GPU on through `ATPX` did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AtpxPower {
-    /// The namespace has no `ATPX`.
+    /// No display function's companion, and no device below an empty
+    /// port's, holds `ATPX`.
     Absent,
     /// `ATPX` at this path does not control the discrete GPU's power.
     NoPowerControl(String),
@@ -188,15 +223,48 @@ pub fn atpx_controls_power(device: Handle<'_>) -> Result<bool, Error> {
     Ok(control)
 }
 
-/// Turn the discrete GPU on through the first `ATPX` in the namespace that
-/// controls its power: `struct atpx_power_control` of 3 bytes with state 1,
+/// The device holding the `ATPX` that powers a discrete GPU off the bus,
+/// before the census: the companion of a display function the scan found,
+/// as amdgpu takes it, else a device below the companion of one of `ports`,
+/// the empty ports the GPU may be behind, where its own companion holds
+/// the method and the function does not answer yet.
+fn atpx_holder<'a>(
+    session: &'a Session,
+    topology: &Topology,
+    ports: &[Address],
+) -> Result<Option<Handle<'a>>, Error> {
+    let bridges = topology.bridges();
+    let shown = topology
+        .found()
+        .iter()
+        .filter(|(_, class)| asked(*class))
+        .find_map(|&(address, _)| {
+            let device = companion(session, address, bridges)?;
+            device.child("ATPX").ok()?;
+            Some(device)
+        });
+    if shown.is_some() {
+        return Ok(shown);
+    }
+    let devices = session.all_devices()?;
+    Ok(ports.iter().find_map(|&port| {
+        let mut below = companion(session, port, bridges)?.path().ok()?;
+        below.push('.');
+        devices.iter().copied().find(|device| {
+            device.path().is_ok_and(|path| path.starts_with(&below)) && device.child("ATPX").is_ok()
+        })
+    }))
+}
+
+/// Turn the discrete GPU on through the `ATPX` that controls its power
+/// ([`atpx_holder`]): `struct atpx_power_control` of 3 bytes with state 1,
 /// as `amdgpu_atpx_set_discrete_state(atpx, ATPX_DISCRETE_GPU)`.
-pub fn atpx_power_on(session: &Session) -> Result<AtpxPower, Error> {
-    let Some(device) = session
-        .all_devices()?
-        .into_iter()
-        .find(|device| device.child("ATPX").is_ok())
-    else {
+pub fn atpx_power_on(
+    session: &Session,
+    topology: &Topology,
+    ports: &[Address],
+) -> Result<AtpxPower, Error> {
+    let Some(device) = atpx_holder(session, topology, ports)? else {
         return Ok(AtpxPower::Absent);
     };
     let path = device.path().unwrap_or_default();

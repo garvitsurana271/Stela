@@ -10,7 +10,7 @@ Subject: [PATCH] aco: start a program with no debug callback, so an error a
  1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/src/amd/compiler/aco_ir.h b/src/amd/compiler/aco_ir.h
-index 4082a95..e7ac8f3 100644
+index 4082a9519ed49ee6600c0af2745a2d511fc6154a..e7ac8f3c340b26acc2eb1e1c0939cc18615574e7 100644
 --- a/src/amd/compiler/aco_ir.h
 +++ b/src/amd/compiler/aco_ir.h
 @@ -2394,8 +2394,8 @@ public:
@@ -24,6 +24,3 @@ index 4082a95..e7ac8f3 100644
     } debug;
  
     void allocateRange(unsigned amount)
--- 
-2.56.1
-

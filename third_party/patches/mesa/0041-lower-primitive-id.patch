@@ -9,7 +9,7 @@ Subject: [PATCH] radv: lower a fragment shader's primitive ID given as NIR to
  1 file changed, 4 insertions(+), 3 deletions(-)
 
 diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
-index 1523756..0bc34c3 100644
+index 15237565bd9674c31e568570ce6323fd2b21d284..0bc34c35222bb10cff729b6ff872066313d8787f 100644
 --- a/src/amd/vulkan/radv_shader.c
 +++ b/src/amd/vulkan/radv_shader.c
 @@ -491,11 +491,12 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct

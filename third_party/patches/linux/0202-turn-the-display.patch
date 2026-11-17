@@ -6,8 +6,8 @@ Subject: [PATCH] fix(nouveau): turn the display off and free every channel
  removal
 
 ---
- drivers/gpu/drm/nouveau/nouveau_drm.c          | 33 +++++++++++++++++++++++++++++++++
- .../drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c  | 13 ++++++-------
+ drivers/gpu/drm/nouveau/nouveau_drm.c         | 33 +++++++++++++++++++
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c | 13 ++++----
  2 files changed, 39 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/gpu/drm/nouveau/nouveau_drm.c b/drivers/gpu/drm/nouveau/nouveau_drm.c

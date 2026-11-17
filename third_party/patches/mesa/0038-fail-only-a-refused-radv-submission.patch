@@ -17,7 +17,7 @@ the kernel lost still loses the device.
  2 files changed, 195 insertions(+), 1 deletion(-)
 
 diff --git a/src/amd/vulkan/radv_queue.c b/src/amd/vulkan/radv_queue.c
-index 44090de..9c84c6f 100644
+index 44090def7390a68785cda0e346b58b7cad67ff86..9c84c6f4484f271d77c0002ff2a27dd5d749fe75 100644
 --- a/src/amd/vulkan/radv_queue.c
 +++ b/src/amd/vulkan/radv_queue.c
 @@ -18,12 +18,16 @@
@@ -235,7 +235,7 @@ index 44090de..9c84c6f 100644
  
  enum amd_ip_type
 diff --git a/src/amd/vulkan/radv_queue.h b/src/amd/vulkan/radv_queue.h
-index c9865f4..94356b4 100644
+index c9865f4d7aefaaa086e625a53e4d2bbb954d16ab..94356b46dac59184e80ce568df8649164f510ef9 100644
 --- a/src/amd/vulkan/radv_queue.h
 +++ b/src/amd/vulkan/radv_queue.h
 @@ -12,6 +12,7 @@
@@ -297,6 +297,3 @@ index c9865f4..94356b4 100644
  VK_DEFINE_HANDLE_CASTS(radv_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)
  
  static inline struct radv_device *
--- 
-2.56.1
-

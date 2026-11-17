@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: kiki <duarduar707@gmail.com>
-Date: Tue, 17 Nov 2026 07:43:35 +0700
+Date: Tue, 17 Nov 2026 00:43:35 +0000
 Subject: [PATCH] fix(nouveau): without ACPI, GSP-RM's system info gets the
  _DOD display IDs and JT and NVOP capabilities boot read from the GPU's ACPI
  companion, where it got none and knew no internal panel
@@ -10,7 +10,7 @@ Subject: [PATCH] fix(nouveau): without ACPI, GSP-RM's system info gets the
  1 file changed, 47 insertions(+)
 
 diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c
-index a6dbdbb8e008aacd5b3535559332b762d96955bb..7650027f4d84fe3bc65d3b61c79be28110c7983a 100644
+index db099a25f8718f7ee18190b41d42b8b42882af8a..2791263045934170f65fb5095e7b0e2223a299c4 100644
 --- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c
 +++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/gsp.c
 @@ -14,6 +14,11 @@

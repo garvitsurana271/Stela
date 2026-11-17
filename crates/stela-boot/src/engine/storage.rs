@@ -2374,7 +2374,7 @@ pub unsafe fn open(
             core::mem::take(&mut devices.gpus)
         },
         gpu_companions: core::mem::take(&mut devices.gpu_companions),
-        isa_bridges: core::mem::take(&mut devices.isa_bridges),
+        chipset: core::mem::take(&mut devices.chipset),
         usb,
         usb_disks,
         disks: host_disks,
@@ -2718,9 +2718,9 @@ pub struct Opened {
     pub gpus: alloc::vec::Vec<stela_drivers::gpu::Adapter>,
     /// Each display controller's ACPI companion path, where probe found one.
     pub gpu_companions: alloc::vec::Vec<(stela_drivers::bus::pci::Address, alloc::string::String)>,
-    /// The PCI-to-ISA bridges probe read, which a GPU's kernel driver may
-    /// name the chipset by.
-    pub isa_bridges: alloc::vec::Vec<stela_drivers::probe::IsaBridge>,
+    /// The PCI-to-ISA bridges and host bridge functions probe read, which a
+    /// GPU's kernel driver may name the chipset by or read.
+    pub chipset: alloc::vec::Vec<stela_drivers::probe::ChipsetFunction>,
     /// The xHCI controllers' topology owners, polled for hotplug.
     pub usb: super::usb::HostUsb,
     /// Whole disks for the guest's USB mass storage, in option order.

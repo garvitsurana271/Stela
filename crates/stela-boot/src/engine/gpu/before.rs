@@ -16,7 +16,7 @@ use stela_drivers::{
         self, Catalog, ErrorKind as FirmwareError, Image, Provenance, Provider, Requirement,
         Resource,
     },
-    gpu::{self, Vendor, stack::GpuStack},
+    gpu::{self, stack::GpuStack},
     probe::{NativeServices, ServiceError},
 };
 use stela_linux::catalogue::{FirmwareTarget, PciFirmware};
@@ -36,7 +36,18 @@ pub(super) struct Identified {
     pub(super) parameters: Option<String>,
     /// Other functions the driver's probe searches for and reads the
     /// identity of. Linux is shown them for searches only.
-    pub(super) searched: Vec<stela_linux::function::Identity>,
+    pub(super) searched: Vec<Searched>,
+    /// The graphics memory the firmware reserved for the GPU, as Linux's
+    /// x86 early quirks find it, by base and size.
+    pub(super) stolen: Option<(u64, u64)>,
+}
+
+/// A function shown to Linux for a probe's searches, with the
+/// configuration the scan read for it, if the probe reads any.
+#[derive(Clone)]
+pub(super) struct Searched {
+    pub(super) identity: stela_linux::function::Identity,
+    pub(super) configuration: Option<[u8; 256]>,
 }
 
 /// The function as a stack's part may read it before its reset.
@@ -44,7 +55,7 @@ pub(super) struct Observed<'a> {
     pub(super) services: &'a dyn NativeServices,
     pub(super) adapter: &'a gpu::Adapter,
     /// The PCI-to-ISA bridges the probe read.
-    pub(super) isa_bridges: &'a [stela_drivers::probe::IsaBridge],
+    pub(super) chipset: &'a [stela_drivers::probe::ChipsetFunction],
     /// Its configuration, for reads only.
     pub(super) function: &'a mut Function<OwnedConfig>,
     /// The first page of the stack's register BAR, mapped read-only.
@@ -72,10 +83,10 @@ pub(super) struct Before {
 
 /// The part for `stack`'s kernel driver, if the boot has one.
 pub(super) fn of(stack: &GpuStack) -> Option<&'static Before> {
-    match stack.vendor {
-        Vendor::Nvidia => Some(&NOUVEAU),
-        Vendor::Amd => Some(&AMDGPU),
-        Vendor::Intel => Some(&XE),
+    match stack.kernel.driver {
+        "nouveau" => Some(&NOUVEAU),
+        "amdgpu" => Some(&AMDGPU),
+        "xe" => Some(&XE),
         _ => None,
     }
 }
@@ -107,6 +118,7 @@ static NOUVEAU: Before = Before {
             chip: Some(chip.name),
             parameters: None,
             searched: Vec::new(),
+            stolen: None,
         })
     },
     settle: |services, registers, identified| match identified
@@ -158,6 +170,7 @@ static AMDGPU: Before = Before {
             chip: recipes::amd_gpu_family(adapter.device),
             parameters: None,
             searched: Vec::new(),
+            stolen: None,
         })
     },
     settle: |_, _, _| Ok(()),
@@ -201,7 +214,8 @@ static XE: Before = Before {
             // The display code asks the firmware service for the table this
             // parameter names before it looks anywhere else (`intel_bios.c`).
             parameters: table.map(|_| format!("xe.vbt_firmware={VBT}")),
-            searched: chipset_bridges(&observed),
+            searched: chipset_bridges(&observed, "xe"),
+            stolen: None,
         })
     },
     settle: |_, _, _| Ok(()),
@@ -211,12 +225,15 @@ static XE: Before = Before {
 /// display code names the PCH by the bridge's IDs (`intel_pch.c` searches
 /// the class) and takes its panel power sequencer and port map from that;
 /// with none it detects no PCH.
-fn chipset_bridges(observed: &Observed<'_>) -> Vec<stela_linux::function::Identity> {
+fn chipset_bridges(observed: &Observed<'_>, driver: &str) -> Vec<Searched> {
     let address = observed.adapter.address;
     let bridges: Vec<_> = observed
-        .isa_bridges
+        .chipset
         .iter()
-        .filter(|bridge| bridge.identity.address.segment == address.segment)
+        .filter(|bridge| {
+            bridge.identity.address.segment == address.segment
+                && bridge.identity.class[..2] == [0x06, 0x01]
+        })
         .collect();
     if bridges.is_empty() {
         output::arguments(format_args!(
@@ -226,23 +243,34 @@ fn chipset_bridges(observed: &Observed<'_>) -> Vec<stela_linux::function::Identi
     bridges
         .into_iter()
         .map(|bridge| {
-            let (at, class) = (bridge.identity.address, bridge.identity.class);
             output::arguments(format_args!(
-                "GPU {address}: PCI-to-ISA bridge {at} {:04x}:{:04x} is shown to xe for its \
+                "GPU {address}: PCI-to-ISA bridge {} {:04x}:{:04x} is shown to {driver} for its \
                  chipset search\n",
-                bridge.identity.vendor, bridge.identity.device
+                bridge.identity.address, bridge.identity.vendor, bridge.identity.device
             ));
-            stela_linux::function::Identity {
-                bus: u32::from(at.bus),
-                devfn: u32::from(at.device << 3 | at.function),
-                vendor: bridge.identity.vendor,
-                device: bridge.identity.device,
-                subsystem_vendor: bridge.subsystem_vendor,
-                subsystem_device: bridge.subsystem_device,
-                class_revision: u32::from_be_bytes([class[0], class[1], class[2], bridge.revision]),
-            }
+            searched(bridge, None)
         })
         .collect()
+}
+
+/// How Linux is shown a chipset function the scan read.
+fn searched(
+    function: &stela_drivers::probe::ChipsetFunction,
+    configuration: Option<[u8; 256]>,
+) -> Searched {
+    let (at, class) = (function.identity.address, function.identity.class);
+    Searched {
+        identity: stela_linux::function::Identity {
+            bus: u32::from(at.bus),
+            devfn: u32::from(at.device << 3 | at.function),
+            vendor: function.identity.vendor,
+            device: function.identity.device,
+            subsystem_vendor: function.subsystem_vendor,
+            subsystem_device: function.subsystem_device,
+            class_revision: u32::from_be_bytes([class[0], class[1], class[2], function.revision]),
+        },
+        configuration,
+    }
 }
 
 /// The name the display code asks for the PC's Video BIOS Table by.

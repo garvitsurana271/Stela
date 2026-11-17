@@ -1525,7 +1525,9 @@ pub(super) struct Claimed {
     /// The words of Linux's command line its driver needs for it.
     parameters: Option<String>,
     /// Other functions its driver searches for, published before it.
-    searched: Vec<stela_linux::function::Identity>,
+    searched: Vec<before::Searched>,
+    /// The graphics memory the firmware reserved for it.
+    stolen: Option<(u64, u64)>,
     placement: Placement,
     bars: Vec<Range<u64>>,
     name: String,
@@ -1545,7 +1547,7 @@ fn claim(
     services: &dyn NativeServices,
     stack: &'static GpuStack,
     adapter: &gpu::Adapter,
-    isa_bridges: &[stela_drivers::probe::IsaBridge],
+    chipset: &[stela_drivers::probe::ChipsetFunction],
     line: u32,
     gop: crate::pci_io::ScreenOwner,
     catalog: Arc<Catalog>,
@@ -1721,7 +1723,7 @@ fn claim(
         before::Observed {
             services,
             adapter,
-            isa_bridges,
+            chipset,
             function,
             registers: &registers,
             register_bar: &resources[registers_at],
@@ -1873,6 +1875,7 @@ fn claim(
         firmware: identified.firmware,
         parameters: identified.parameters,
         searched: identified.searched,
+        stolen: identified.stolen,
         placement,
         bars,
         name: format!("{address}"),
@@ -1996,7 +1999,7 @@ pub(super) struct Refused {
 pub(super) fn claim_all(
     services: &dyn NativeServices,
     adapters: &[gpu::Adapter],
-    isa_bridges: &[stela_drivers::probe::IsaBridge],
+    chipset: &[stela_drivers::probe::ChipsetFunction],
     gop: Result<crate::pci_io::ScreenOwner, String>,
     catalog: Option<&Arc<Catalog>>,
 ) -> (Vec<Claimed>, Vec<Refused>) {
@@ -2067,7 +2070,7 @@ pub(super) fn claim_all(
                     services,
                     stack,
                     adapter,
-                    isa_bridges,
+                    chipset,
                     claimed.len() as u32,
                     source,
                     catalog.clone(),
@@ -2156,7 +2159,9 @@ struct Start {
 /// the functions a probe searches for, each once.
 struct Setup {
     command_line: String,
-    searched: Vec<stela_linux::function::Identity>,
+    searched: Vec<before::Searched>,
+    /// The graphics memory the firmware reserved for an integrated GPU.
+    stolen: Option<(u64, u64)>,
 }
 
 impl Setup {
@@ -2166,18 +2171,19 @@ impl Setup {
             .filter_map(|claimed| claimed.parameters.as_deref())
             .collect::<Vec<_>>()
             .join(" ");
-        let mut searched: Vec<stela_linux::function::Identity> = Vec::new();
-        for identity in claimed.iter().flat_map(|claimed| &claimed.searched) {
-            if !searched
-                .iter()
-                .any(|seen| (seen.bus, seen.devfn) == (identity.bus, identity.devfn))
-            {
-                searched.push(*identity);
+        let mut searched: Vec<before::Searched> = Vec::new();
+        for function in claimed.iter().flat_map(|claimed| &claimed.searched) {
+            let at = |searched: &before::Searched| (searched.identity.bus, searched.identity.devfn);
+            match searched.iter_mut().find(|seen| at(seen) == at(function)) {
+                // One driver reads the configuration another only searches.
+                Some(seen) => seen.configuration = seen.configuration.or(function.configuration),
+                None => searched.push(function.clone()),
             }
         }
         Self {
             command_line,
             searched,
+            stolen: claimed.iter().find_map(|claimed| claimed.stolen),
         }
     }
 }
@@ -2232,10 +2238,25 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>, setup: Option<Setup>) -> S
         }
         // What the drivers search for, before any driver's probe: a probe
         // looks for them (`intel_pch.c` for the chipset).
-        for identity in setup.searched {
+        if let Some((base, size)) = setup.stolen {
+            // SAFETY: entered, on the canonical kernel task, before any
+            // driver registers.
+            unsafe { stela_linux::function::set_graphics_stolen(base, size) };
+        }
+        for before::Searched {
+            identity,
+            configuration,
+        } in setup.searched
+        {
             // SAFETY: entered, on the canonical kernel task; the publication
             // is kept for the boot.
-            match unsafe { stela_linux::function::Published::new(identity) } {
+            let published = unsafe {
+                match configuration {
+                    Some(bytes) => stela_linux::function::Published::snapshot(identity, &bytes),
+                    None => stela_linux::function::Published::new(identity),
+                }
+            };
+            match published {
                 Ok(published) => job._searched.push(published),
                 Err(error) => output::arguments(format_args!(
                     "GPU: PCI function {:02x}:{:02x}.{} could not be published for searches: \

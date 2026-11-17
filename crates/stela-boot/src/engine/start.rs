@@ -1471,9 +1471,9 @@ fn open_gpus(
     acpi: Option<&'static aml::HostAcpi>,
     handoff: &Handoff,
     firmware: &Option<alloc::sync::Arc<stela_drivers::firmware::Catalog>>,
-    (adapters, isa_bridges, companions): (
+    (adapters, chipset, companions): (
         Vec<stela_drivers::gpu::Adapter>,
-        Vec<stela_drivers::probe::IsaBridge>,
+        Vec<stela_drivers::probe::ChipsetFunction>,
         Vec<(stela_drivers::bus::pci::Address, String)>,
     ),
 ) -> bool {
@@ -1528,7 +1528,7 @@ fn open_gpus(
             .ok()
             .and_then(|entropy| stela_linux::random::Seeded::from_entropy(&*entropy).ok());
         let (claimed, refused) = random.as_ref().map_or_else(Default::default, |_| {
-            gpu::claim_all(&services, &adapters, &isa_bridges, gop, firmware.as_ref())
+            gpu::claim_all(&services, &adapters, &chipset, gop, firmware.as_ref())
         });
         (claimed, refused, random)
     });
@@ -3127,7 +3127,7 @@ fn start_devices(
                 network_account,
                 gpus,
                 gpu_companions,
-                isa_bridges,
+                chipset,
                 usb,
                 bluetooth: host_controller,
                 usb_disks,
@@ -3185,7 +3185,7 @@ fn start_devices(
                     host_acpi,
                     handoff,
                     host_firmware,
-                    (gpus, isa_bridges, gpu_companions),
+                    (gpus, chipset, gpu_companions),
                 )
             {
                 let firmware = handoff

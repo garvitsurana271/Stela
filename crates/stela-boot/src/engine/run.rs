@@ -3158,22 +3158,29 @@ fn heap_report(heap: &stela_boot_core::heap::Usage) {
     super::large_blocks::report();
 }
 
-/// `HEAP OWNERS linux=40/52M libc=900/1350M rest=600M`: the heap bytes
-/// the Linux environment and the C library (Mesa, NAK, LLVM) hold now and
-/// at most, and the rest of the live heap (engine, devices, tables).
+/// `HEAP OWNERS linux=40/52M libc=900/1350M rest=600M page_runs=1200/1248M
+/// arenas=39 fallbacks=0`: the heap bytes the Linux environment and the C
+/// library (Mesa, NAK, LLVM) hold now and at most, the rest of the live heap
+/// (engine, devices, tables), and Linux's page runs in their arenas' bytes,
+/// with the runs the heap served when no arena could be had.
 fn owner_report(live: usize) {
     let (linux, linux_peak) = stela_linux::heap::usage();
     #[cfg(feature = "nvk")]
     let (libc, libc_peak) = super::gpu::client::LIBC_HEAP.usage();
     #[cfg(not(feature = "nvk"))]
     let (libc, libc_peak) = (0, 0);
+    let runs = crate::native_memory::SOURCE.run_usage();
     output::arguments(format_args!(
-        "HEAP OWNERS linux={}/{}M libc={}/{}M rest={}M\n",
+        "HEAP OWNERS linux={}/{}M libc={}/{}M rest={}M page_runs={}/{}M arenas={} fallbacks={}\n",
         linux >> 20,
         linux_peak >> 20,
         libc >> 20,
         libc_peak >> 20,
         live.saturating_sub(linux + libc) >> 20,
+        runs.used >> 20,
+        runs.arena_bytes >> 20,
+        runs.arenas,
+        runs.fallbacks,
     ));
 }
 

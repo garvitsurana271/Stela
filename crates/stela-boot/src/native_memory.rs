@@ -346,10 +346,12 @@ unsafe impl stela_linux::pages::Provider for LinuxPages {
 
     fn allocate(&self, request: stela_linux::pages::Request) -> Result<PinnedPages, MemoryError> {
         self.validate(request)?;
-        let bytes = request.bytes().ok_or(MemoryError::InvalidSize)?;
+        request.bytes().ok_or(MemoryError::InvalidSize)?;
         // The same pinned WB heap supplies Linux's unmovable fallback for
         // reclaimable-class requests. Cache accounting keeps the original class.
-        SOURCE.allocate(bytes, bytes, CacheAttribute::WriteBack)
+        // Runs come from page arenas, where runs of one size tile: from the
+        // heap each strands almost its size behind its boundary tag.
+        SOURCE.allocate_run(request.order)
     }
 }
 

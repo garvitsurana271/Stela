@@ -19,6 +19,8 @@ const PAGE_SHIFT: u8 = 12;
 pub const PAGE: usize = 1 << PAGE_SHIFT;
 
 pub mod cache;
+#[path = "native_memory/runs.rs"]
+pub mod runs;
 
 /// Checks that `bytes` at CPU address `cpu` map physical `physical` with an
 /// effective write-back type, reading page tables at `table_offset` past
@@ -35,6 +37,16 @@ pub struct NativeMemory {
     table_offset: AtomicU64,
     generation: AtomicU64,
     catalogs: AtomicUsize,
+    runs: runs::Arenas,
+}
+
+/// The Linux page arenas' state, for the heap report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunUsage {
+    pub arenas: usize,
+    pub arena_bytes: usize,
+    pub used: usize,
+    pub fallbacks: usize,
 }
 
 /// The registered heap extent, as `initialize` recorded it.
@@ -59,6 +71,7 @@ impl NativeMemory {
             table_offset: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             catalogs: AtomicUsize::new(0),
+            runs: runs::Arenas::new(),
         }
     }
 
@@ -214,6 +227,158 @@ impl PageSource for NativeMemory {
 }
 
 impl NativeMemory {
+    /// The Linux page arenas' state.
+    pub fn run_usage(&self) -> RunUsage {
+        let arenas = self.runs.count.load(Ordering::Relaxed);
+        RunUsage {
+            arenas,
+            arena_bytes: arenas * runs::ARENA_PAGES * PAGE,
+            used: self.runs.used.load(Ordering::Relaxed),
+            fallbacks: self.runs.fallbacks.load(Ordering::Relaxed),
+        }
+    }
+
+    /// A zeroed write-back run of `1 << order` pages aligned to its size, as
+    /// Linux's page allocator gives one: from an arena ([`runs`]), or from
+    /// the heap itself when no arena can be had.
+    pub fn allocate_run(&'static self, order: u32) -> Result<PinnedPages, MemoryError> {
+        if order > runs::MAX_RUN_ORDER {
+            return Err(MemoryError::InvalidSize);
+        }
+        let bytes = PAGE << order;
+        match self.arena_run(order) {
+            Ok(Some(pages)) => Ok(pages),
+            Ok(None) => {
+                self.runs.fallbacks.fetch_add(1, Ordering::Relaxed);
+                self.allocate(bytes, bytes, CacheAttribute::WriteBack)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A run from an arena, a new one when none has room; `None` when the
+    /// registration's CPU and physical bases differ in their arena residue
+    /// or the heap has no arena to give.
+    fn arena_run(&'static self, order: u32) -> Result<Option<PinnedPages>, MemoryError> {
+        let capacity = self.bytes.load(Ordering::Acquire);
+        if capacity == 0 {
+            return Err(MemoryError::Unavailable);
+        }
+        let cpu = self.cpu.load(Ordering::Relaxed);
+        let physical_base = self.physical.load(Ordering::Relaxed);
+        let arena_align = PAGE << runs::MAX_RUN_ORDER;
+        if ((cpu as u64) ^ physical_base) & (arena_align as u64 - 1) != 0 {
+            return Ok(None);
+        }
+        let arena_bytes = runs::ARENA_PAGES * PAGE;
+        let bytes = PAGE << order;
+        let (base, page) = {
+            let mut locked = self.runs.lock();
+            let arenas = locked.arenas();
+            let mut found = None;
+            for arena in arenas.iter_mut() {
+                if let Some(page) = arena.buddy.allocate(order) {
+                    found = Some((arena.base, page));
+                    break;
+                }
+            }
+            match found {
+                Some(found) => found,
+                None => {
+                    if arenas.try_reserve(1).is_err() {
+                        return Ok(None);
+                    }
+                    let Some(mut buddy) = runs::Buddy::new() else {
+                        return Ok(None);
+                    };
+                    let layout = Layout::from_size_align(arena_bytes, arena_align)
+                        .map_err(|_| MemoryError::InvalidAlignment)?;
+                    // SAFETY: a valid nonzero layout; the arena owns the block
+                    // until it is wholly free and given back with it.
+                    let Some(base) = NonNull::new(unsafe { self.heap.alloc(layout) }) else {
+                        return Ok(None);
+                    };
+                    let in_heap = (base.as_ptr() as usize)
+                        .checked_sub(cpu)
+                        .is_some_and(|offset| offset + arena_bytes <= capacity);
+                    if !in_heap {
+                        // SAFETY: the block just allocated with this layout.
+                        unsafe { self.heap.dealloc(base.as_ptr(), layout) };
+                        return Err(MemoryError::OutsideReservation);
+                    }
+                    let page = buddy.allocate(order).ok_or(MemoryError::OutOfMemory)?;
+                    arenas.push(runs::Arena { base, buddy });
+                    self.runs.count.fetch_add(1, Ordering::Relaxed);
+                    (base, page)
+                }
+            }
+        };
+        let mut run = RunAllocation {
+            source: self,
+            arena: base,
+            page,
+            order,
+            pages: Vec::new(),
+        };
+        self.runs.used.fetch_add(bytes, Ordering::Relaxed);
+        let start = run.cpu_base().as_ptr() as usize;
+        let physical = physical_base + (start - cpu) as u64;
+        (self.cache)(
+            start as u64,
+            physical,
+            bytes,
+            self.table_offset.load(Ordering::Relaxed),
+        )?;
+        run.pages
+            .try_reserve_exact(bytes / PAGE)
+            .map_err(|_| MemoryError::OutOfMemory)?;
+        run.pages
+            .extend((0..bytes / PAGE).map(|index| physical + (index * PAGE) as u64));
+        // SAFETY: the run's pages, exclusively owned until it drops.
+        unsafe { core::ptr::write_bytes(start as *mut u8, 0, bytes) };
+        // SAFETY: a valid nonzero layout for the run's owner.
+        let storage = NonNull::new(unsafe { alloc::alloc::alloc(Layout::new::<RunAllocation>()) })
+            .ok_or(MemoryError::OutOfMemory)?
+            .cast::<RunAllocation>();
+        // SAFETY: fresh aligned storage, initialized once; the Box owns it.
+        let run = unsafe {
+            storage.as_ptr().write(run);
+            Box::from_raw(storage.as_ptr())
+        };
+        PinnedPages::new(run, bytes, bytes).map(Some)
+    }
+
+    /// Give a run back to its arena, and the arena to the heap when it is
+    /// wholly free and another wholly free arena is kept.
+    fn free_run(&self, arena: NonNull<u8>, page: usize, order: u32) {
+        self.runs.used.fetch_sub(PAGE << order, Ordering::Relaxed);
+        let released = {
+            let mut locked = self.runs.lock();
+            let arenas = locked.arenas();
+            let Some(index) = arenas.iter().position(|candidate| candidate.base == arena) else {
+                panic!("a Linux page run outside every arena");
+            };
+            arenas[index].buddy.free(page, order);
+            let spare = arenas
+                .iter()
+                .enumerate()
+                .any(|(other, candidate)| other != index && candidate.buddy.empty());
+            if arenas[index].buddy.empty() && spare {
+                self.runs.count.fetch_sub(1, Ordering::Relaxed);
+                Some(arenas.swap_remove(index))
+            } else {
+                None
+            }
+        };
+        if let Some(arena) = released {
+            let layout =
+                Layout::from_size_align(runs::ARENA_PAGES * PAGE, PAGE << runs::MAX_RUN_ORDER)
+                    .expect("the arena layout");
+            // SAFETY: the arena's own block and layout, with no run left.
+            unsafe { self.heap.dealloc(arena.base.as_ptr(), layout) };
+        }
+    }
+
     fn allocate_native(
         &self,
         bytes: usize,
@@ -359,6 +524,49 @@ unsafe impl PageBacking for HeapAllocation {
 
     fn cache_attribute(&self) -> CacheAttribute {
         CacheAttribute::WriteBack
+    }
+}
+
+/// A run of Linux pages in an arena ([`NativeMemory::allocate_run`]).
+struct RunAllocation {
+    source: &'static NativeMemory,
+    arena: NonNull<u8>,
+    page: usize,
+    order: u32,
+    pages: Vec<u64>,
+}
+
+// SAFETY: as HeapAllocation's: an owned, immovable run; the arenas' lock
+// orders its release.
+unsafe impl Send for RunAllocation {}
+// SAFETY: shared access exposes immutable metadata and raw pointers only.
+unsafe impl Sync for RunAllocation {}
+
+// SAFETY: the arena lies in the registered heap, whose PA relation
+// initialize proved; the run is aligned to its size, zeroed, and every page
+// recorded. Drop returns it only after the last lease.
+unsafe impl PageBacking for RunAllocation {
+    fn cpu_base(&self) -> NonNull<u8> {
+        // SAFETY: the run lies inside its arena's block.
+        unsafe { self.arena.add(self.page * PAGE) }
+    }
+
+    fn physical_pages(&self) -> &[u64] {
+        &self.pages
+    }
+
+    fn page_shift(&self) -> u8 {
+        PAGE_SHIFT
+    }
+
+    fn cache_attribute(&self) -> CacheAttribute {
+        CacheAttribute::WriteBack
+    }
+}
+
+impl Drop for RunAllocation {
+    fn drop(&mut self) {
+        self.source.free_run(self.arena, self.page, self.order);
     }
 }
 

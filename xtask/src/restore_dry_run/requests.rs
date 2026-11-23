@@ -232,6 +232,31 @@ fn refusal(why: &'static str) -> Check {
         _ => Verdict::Failed(format!("answered; expected a refusal: {why}")),
     })
 }
+/// A firmware updater the host cannot answer: refused by its name, with
+/// the report-not-retry advice, since `restored` may ask after the Mac's SSD
+/// was erased (`stela_runtime::restore::answers`).
+fn updater_refusal(updater: &'static str) -> Check {
+    Box::new(move |_, o| match o {
+        Outcome::Refused(r) => named_updater_refusal(updater, r),
+        _ => Verdict::Failed(format!(
+            "answered the {updater} updater; expected a refusal"
+        )),
+    })
+}
+
+fn named_updater_refusal(updater: &str, reason: &str) -> Verdict {
+    let named = format!("restored asked for the {updater} firmware updater");
+    if reason.contains(&named) && reason.contains("report it rather than retrying") {
+        Verdict::Refused(format!(
+            "no part of the machine answers this updater, so it refuses by name ({reason})"
+        ))
+    } else {
+        Verdict::Failed(format!(
+            "refused without naming the {updater} updater or the report advice: {reason}"
+        ))
+    }
+}
+
 /// The route's allow-list: a request outside it refuses by name.
 fn routed(route: Route, kind: &'static str, check: Check) -> Check {
     if route.allows(kind) {
@@ -1073,7 +1098,9 @@ pub fn others(route: Route, tss: bool, ctx: &Ctx) -> Vec<Step> {
             }),
         ),
     ));
-    // The updaters restored names at R 0x2f05c and 0x14dbc0.
+    // The updaters restored names at R 0x2f05c and 0x14dbc0, and `Baobab`,
+    // a MacBook's panel TCON (`Baobab,TCON` in the J413AP and J493AP
+    // identities), which only the persona's install could ask for.
     for updater in [
         "SE",
         "Savage",
@@ -1083,6 +1110,7 @@ pub fn others(route: Route, tss: bool, ctx: &Ctx) -> Vec<Step> {
         "Madea",
         "Canary",
         "Timer",
+        "Baobab",
     ] {
         out.push(step(
             "FirmwareUpdaterData",
@@ -1095,11 +1123,7 @@ pub fn others(route: Route, tss: bool, ctx: &Ctx) -> Vec<Step> {
                 ),
             ])),
             Transfer::Control,
-            routed(
-                route,
-                "FirmwareUpdaterData",
-                refusal("updater tickets need a personalized TSS response"),
-            ),
+            routed(route, "FirmwareUpdaterData", updater_refusal(updater)),
         ));
     }
     for kind in [
@@ -1437,5 +1461,36 @@ pub fn final_status() -> Step {
             Ok(_) => Verdict::Failed("final acknowledgement is not ReceivedFinalStatusMsg".into()),
             Err(v) => v,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A TCON request on a MacBook persona must refuse with the host's
+    /// named, report-not-retry reason, and nothing vaguer.
+    #[test]
+    fn an_updater_refusal_must_name_the_updater_and_ask_for_a_report() {
+        let reason = concat!(
+            "restored asked for the Baobab firmware updater, which Stambha cannot answer: ",
+            "this machine has no Baobab part to personalize. The install stops here, ",
+            "possibly after the Mac's SSD was erased; report it rather than retrying"
+        );
+        assert!(matches!(
+            named_updater_refusal("Baobab", reason),
+            Verdict::Refused(_)
+        ));
+        assert!(matches!(
+            named_updater_refusal("AppleTCON", reason),
+            Verdict::Failed(_)
+        ));
+        assert!(matches!(
+            named_updater_refusal(
+                "Baobab",
+                "restore plan: Invalid(\"unsupported firmware updater/ticket trust boundary\")"
+            ),
+            Verdict::Failed(_)
+        ));
     }
 }

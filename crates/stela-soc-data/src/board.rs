@@ -195,6 +195,16 @@ pub const ANE_CLOCKS_MHZ: [u32; 2] = [300, 600];
 /// the path Apple's virtual machines take. In the 26A434 kernelcache only
 /// the ANE kext reads it, and it binds by `compatible`.
 pub const CAPABILITY_PROPERTIES: &[&str] = &["ane-type"];
+/// Board claims, as `(node, property)`, about hardware a PC never has,
+/// removed from whichever tree makes them (`PATH NAME` in the admission
+/// ledger); a tree without them is left as it was. `/product`
+/// `partially-occluded-display` (u32 1 on the 26B123 J413AP and J415AP
+/// trees, absent on J473AP and J493AP) says a camera housing cuts into the
+/// built-in panel. The 26B123 kernelcache never reads it, so its reader is
+/// user space (the menu bar's notch gap), and the panel the guest is shown
+/// is the PC's, which has no notch. Whether macOS then draws no gap is
+/// unverified until a boot.
+pub const UNMODELED_BOARD_CLAIMS: &[(&str, &str)] = &[("/product", "partially-occluded-display")];
 /// The AIC versions the engine models (`platform::apple::aic1` and `aic`).
 const AICS: [&str; 3] = ["aic,1", "aic,2", "aic,3"];
 /// The modern DART compatible; native legacy families are selected through

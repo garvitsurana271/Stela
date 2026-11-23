@@ -83,6 +83,11 @@
 //! it has none, as Apple's virtual machines do. Its `reg`, gates, clocks and
 //! DART links stay as data, like every hidden node's.
 //!
+//! So does the board, of hardware no PC has (`board::UNMODELED_BOARD_CLAIMS`,
+//! `PATH NAME`): a MacBook Air tree's `/product partially-occluded-display`
+//! claims a notch in a panel the guest never sees. A tree without the claim,
+//! such as J473AP's, is not touched.
+//!
 //! An SPMI controller with no admitted target or external platform-function
 //! or interrupt consumer also loses `compatible`. Board templates may carry
 //! alternative controllers over the same banks (26A434 J623/J624); iBoot
@@ -125,6 +130,11 @@ const IGNORE: &str = "AAPL,ignore";
 /// `IONameMatch` of `AppleThunderboltHALType5` and the
 /// `AppleATCDP*Port` drivers, which match the type alone. Only audited class
 /// identities are retired; unknown `device_type` metadata stays intact.
+/// `tcon` is a built-in panel's timing controller (the J413AP and J493AP
+/// `/arm-io/spi4/dp855`, `parade,DP855`, hidden as an SPI peripheral without
+/// NOR): a restore's TCON updater may look for one by type in the raw tree,
+/// and the machine has none to personalize or flash, so
+/// `stela_runtime::restore::answers` refuses that updater by name.
 const SERVICE_IDENTITIES: &[&[u8]] = &[
     b"display-subsystem\0",
     b"ext-display-subsystem\0",
@@ -132,6 +142,7 @@ const SERVICE_IDENTITIES: &[&[u8]] = &[
     b"AAPL,atc-dpphy\0",
     b"AAPL,atc-dpin\0",
     b"AAPL,atc-dpout\0",
+    b"tcon\0",
 ];
 /// Required functions of name-matched hardware classes, not optional
 /// callbacks inferred from arbitrary `function-*` properties. The original
@@ -419,7 +430,20 @@ pub fn hide_unmodeled(tree: &mut DeviceTree) -> Vec<String> {
     retire_hidden_service_identities(tree, &hidden);
     retire_hidden_acio_parents(tree, &mut hidden);
     retire_hidden_capabilities(tree, &mut hidden);
+    retire_board_claims(tree, &mut hidden);
     hidden
+}
+
+/// Drop each board claim the tree makes (`board::UNMODELED_BOARD_CLAIMS`),
+/// noting `PATH NAME` in the ledger. A tree that makes none is unchanged.
+fn retire_board_claims(tree: &mut DeviceTree, hidden: &mut Vec<String>) {
+    for &(path, name) in board::UNMODELED_BOARD_CLAIMS {
+        if let Some(node) = tree.node_mut(path)
+            && node.remove_property(name).is_some()
+        {
+            hidden.push(format!("{path} {name}"));
+        }
+    }
 }
 
 /// Drop each hidden device's raw capability claims

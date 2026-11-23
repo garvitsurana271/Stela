@@ -529,6 +529,44 @@ fn a_retired_nonce_entanglement_claim_is_a_valid_preparation_note() {
     }
 }
 
+/// A MacBook tree's retired notch claim is a preparation note on its own
+/// node only, and holds only once the property is gone.
+#[test]
+fn a_retired_board_claim_is_a_valid_preparation_note_only_where_it_was_made() {
+    let product = |claimed: bool| {
+        let properties: &[(&str, &[u8])] = if claimed {
+            &[
+                ("name", b"product"),
+                ("partially-occluded-display", b"\x01\0\0\0"),
+            ]
+        } else {
+            &[("name", b"product")]
+        };
+        encode(properties, &[])
+    };
+    let watched = encode(&[("name", b"watchdog"), ("clock-gates", &words(&[1]))], &[]);
+    for (claimed, note, admitted) in [
+        (false, "/product partially-occluded-display", true),
+        (true, "/product partially-occluded-display", false),
+        (false, "/arm-io/watchdog partially-occluded-display", false),
+    ] {
+        let io = tree(&[(1, Some(0), [0, 0])], core::slice::from_ref(&watched));
+        let bytes = encode(&[("name", b"device-tree")], &[product(claimed), io]);
+        let mut states = power_states(
+            &Node::root(&bytes).unwrap(),
+            &flat_fixture_extent(&Some),
+            0x8112,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            states.apply_admission(&bytes, &[note.into()]).is_ok(),
+            admitted,
+            "{note} claimed={claimed}"
+        );
+    }
+}
+
 #[test]
 fn preparation_notes_are_validated_without_retiring_resources() {
     let watched = encode(

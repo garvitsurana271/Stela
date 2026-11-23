@@ -1469,3 +1469,91 @@ fn a_hidden_neural_engine_withdraws_its_capability_and_keeps_its_links() {
     // Once withdrawn, a second preparation has nothing to note.
     assert!(hide_unmodeled(&mut tree).is_empty());
 }
+
+/// A MacBook-shaped `/product` and its panel's timing controller, as the
+/// 26B123 J413AP tree has them, or the Mac mini's, which has neither.
+fn laptop_panel_tree(laptop: bool) -> DeviceTree {
+    let mut product = node("product", None, vec![]);
+    product
+        .set_property("product-name", b"Mac\0".to_vec())
+        .unwrap();
+    let mut spi = vec![];
+    if laptop {
+        product
+            .set_property("partially-occluded-display", 1u32.to_le_bytes().to_vec())
+            .unwrap();
+        spi.push(typed(
+            node("dp855", Some(b"parade,DP855\0"), vec![]),
+            b"tcon\0",
+        ));
+    }
+    DeviceTree {
+        root: node(
+            "",
+            None,
+            vec![
+                product,
+                node(
+                    "arm-io",
+                    None,
+                    vec![node("spi4", Some(board::SPI.as_bytes()), spi)],
+                ),
+            ],
+        ),
+    }
+}
+
+#[test]
+fn a_notch_claim_and_a_hidden_tcons_type_go_only_where_the_board_has_them() {
+    let mut laptop = laptop_panel_tree(true);
+    let hidden = hide_unmodeled(&mut laptop);
+    assert!(
+        laptop
+            .property("/product", "partially-occluded-display")
+            .is_none()
+    );
+    assert_eq!(
+        laptop.property("/product", "product-name").unwrap().value,
+        b"Mac\0"
+    );
+    // The TCON is hidden as an SPI peripheral without NOR, and its service
+    // type goes with its compatible; its name stays as data.
+    let tcon = laptop.node("/arm-io/spi4/dp855").unwrap();
+    assert!(tcon.property(COMPATIBLE).is_none());
+    assert!(tcon.property(DEVICE_TYPE).is_none());
+    assert_eq!(
+        hidden,
+        [
+            "/arm-io/spi4",
+            "/arm-io/spi4/dp855",
+            "/product partially-occluded-display"
+        ]
+    );
+
+    // The Mac mini's tree makes neither claim and keeps every byte of its
+    // `/product`.
+    let mut mini = laptop_panel_tree(false);
+    let original = mini.node("/product").unwrap().clone();
+    let hidden = hide_unmodeled(&mut mini);
+    assert_eq!(mini.node("/product").unwrap(), &original);
+    assert_eq!(hidden, ["/arm-io/spi4"]);
+}
+
+#[test]
+fn a_visible_node_keeps_its_tcon_type_and_a_board_claim_goes_once() {
+    let mut tree = laptop_panel_tree(true);
+    // Only a hidden device's type retires: an admitted one (none is today)
+    // keeps it.
+    let ledger: Vec<String> = vec![];
+    retire_hidden_service_identities(&mut tree, &ledger);
+    assert_eq!(
+        tree.property("/arm-io/spi4/dp855", DEVICE_TYPE)
+            .unwrap()
+            .value,
+        b"tcon\0"
+    );
+    let mut notes = vec![];
+    retire_board_claims(&mut tree, &mut notes);
+    retire_board_claims(&mut tree, &mut notes);
+    assert_eq!(notes, ["/product partially-occluded-display"]);
+}

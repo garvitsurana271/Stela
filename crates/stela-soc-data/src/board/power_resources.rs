@@ -234,6 +234,9 @@ impl PowerStates {
                     (_, note) if super::CAPABILITY_PROPERTIES.contains(&note) => {
                         node.property(note).is_none()
                     }
+                    (path, note) if super::UNMODELED_BOARD_CLAIMS.contains(&(path, note)) => {
+                        node.property(note).is_none()
+                    }
                     _ => false,
                 };
                 if !valid {

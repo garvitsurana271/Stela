@@ -766,10 +766,12 @@ impl State {
         }
         let waits = lent.busy();
         let steps = lent.command(packet, self.now);
-        let answers = steps.iter().any(|step| match step {
-            bridge::Step::Guest(event) => answered_opcode(event) == Some(opcode),
-            bridge::Step::Chip(_) => true,
-        });
+        // In flight now, sent or held for the controller's credit, its
+        // answer comes later; else the shadow's came with it, or none does.
+        let answers = lent.busy()
+            || steps.iter().any(|step| {
+                matches!(step, bridge::Step::Guest(event) if answered_opcode(event) == Some(opcode))
+            });
         self.steps(steps);
         // Host Number Of Completed Packets, answered by no event.
         if traced && !waits && !answers {
@@ -1826,6 +1828,42 @@ mod tests {
         hci.deliver_event(&[&[COMMAND_COMPLETE, 252, 1, 0x14, 0x0c, 0][..], &[0; 248]].concat());
         assert_eq!(hci.ready_at(EVENTS), None, "the stale answer is dropped");
         assert_eq!(hci.fallback(), None);
+    }
+
+    /// A command held for the controller's credit is traced with the answer
+    /// it gets once the credit comes back, not as answered with no event.
+    #[test]
+    fn a_command_held_for_a_credit_is_traced_with_its_later_answer() {
+        let mut hci = bridged();
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        hci.take();
+        // Answered with no credit left.
+        hci.deliver_event(&[COMMAND_COMPLETE, 4, 0, 0x03, 0x0c, 0]);
+        read(&mut hci, EVENTS, EVENT_PACKET);
+        hci.take_trace();
+        // Set Event Mask waits for a credit: nothing is traced yet.
+        let mask = [
+            0x01, 0x0c, 8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ];
+        command(&mut hci, &mask).unwrap();
+        assert_eq!(hci.take(), None, "held for a credit");
+        assert!(hci.take_trace().is_empty(), "not answered yet");
+        // Credits alone send it; its answer is the one traced.
+        hci.deliver_event(&[COMMAND_COMPLETE, 3, 1, 0, 0]);
+        assert_eq!(hci.take(), Some(Outbound::Command(mask.to_vec())));
+        hci.deliver_event(&[COMMAND_COMPLETE, 4, 1, 0x01, 0x0c, 0]);
+        let traced = hci.take_trace();
+        assert_eq!(traced.len(), 1, "{traced:?}");
+        assert_eq!(
+            traced[0].to_string(),
+            "command 0x0c01 parameters=8 [ff ff ff ff] answered complete status=0x00 returns=0"
+        );
+        // A command no event answers is still traced so.
+        command(&mut hci, &[0x35, 0x0c, 5, 1, 0x40, 0, 1, 0]).unwrap();
+        assert_eq!(
+            hci.take_trace()[0].to_string(),
+            "command 0x0c35 parameters=5 [01 40 00 01] answered with no event"
+        );
     }
 
     /// After the fallback nothing goes to the host's controller, not even a

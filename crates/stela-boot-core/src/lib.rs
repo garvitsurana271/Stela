@@ -61,6 +61,7 @@ pub mod guest_session;
 pub mod guest_timeouts;
 pub mod handoff_records;
 pub mod heap;
+pub mod hid_keys;
 #[cfg(target_arch = "x86_64")]
 pub mod host_clock;
 pub mod host_identity;
@@ -147,6 +148,8 @@ pub mod vfct;
 pub mod vtd;
 pub mod wifi_hardware;
 pub mod wifi_page;
+pub mod wifi_pending;
+pub mod wifi_picker;
 pub mod wifi_saved;
 pub mod work_status;
 pub mod worker_bindings;

@@ -19,11 +19,11 @@ use stela_drivers::net::wifi::network::{SSID_BYTES, Secret, SecretError};
 /// The most a typed password holds: a PSK's 64 hex digits.
 pub const SECRET_BYTES: usize = 64;
 /// A row's height, the startup menu's.
-const ROW: usize = 36;
+pub(crate) const ROW: usize = 36;
 /// The widest the page's column grows, the startup menu's.
 const COLUMN: usize = 440;
 /// The dialog's height.
-const CARD: usize = 244;
+pub(crate) const CARD: usize = 244;
 
 /// The startup menu's Wi-Fi line: the network this boot joins first, the
 /// one the page chose (`prefer`) or else stela.cfg's `--wifi` one
@@ -175,7 +175,7 @@ pub struct Form {
 }
 
 impl Form {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             field: Field::Name,
             name: String::new(),
@@ -267,7 +267,7 @@ impl Form {
         })
     }
 
-    fn press(&mut self, key: Key) -> Option<Save> {
+    pub(crate) fn press(&mut self, key: Key) -> Option<Save> {
         match key {
             Key::Enter => return self.enter(),
             Key::Down if self.field == Field::Name => return self.enter(),
@@ -494,7 +494,11 @@ impl Page {
                 );
             }
             Mode::Add(form) => {
-                draw_form(&mut scene, &layout, form, self.joins);
+                let about = match self.joins {
+                    true => "Saved on this USB and joined first this boot.",
+                    false => "Saved on this USB, in wifi.saved.",
+                };
+                draw_form(&mut scene, &layout, form, about);
                 let keys = match form.field {
                     Field::Name => "Enter: next   Esc: cancel",
                     Field::Password => "Enter: save   Tab: show or hide   Up: name   Esc: cancel",
@@ -599,14 +603,10 @@ fn draw_confirm(scene: &mut Scene, layout: &Layout, name: &str) {
 }
 
 /// The dialog: a card with the name and password fields.
-fn draw_form(scene: &mut Scene, layout: &Layout, form: &Form, joins: bool) {
+pub(crate) fn draw_form(scene: &mut Scene, layout: &Layout, form: &Form, about: &str) {
     let (left, y) = (layout.left, layout.caption);
     scene.panel(left, y, layout.column, CARD, 12, Tone::Card);
     scene.text(left + 20, y + 20, "Join other network", Tone::Text);
-    let about = match joins {
-        true => "Saved on this USB and joined first this boot.",
-        false => "Saved on this USB, in wifi.saved.",
-    };
     scene.text(left + 20, y + 44, about, Tone::Dim);
     let field = Rect {
         x: left + 16,
@@ -656,22 +656,22 @@ pub struct Geometry {
 }
 
 /// Where the page's parts go: the startup menu's column and footer.
-struct Layout {
-    geometry: Geometry,
-    left: usize,
-    right: usize,
-    column: usize,
-    middle: usize,
-    top: usize,
-    caption: usize,
-    rows: usize,
-    confirm: usize,
-    notice: usize,
-    keys: usize,
+pub(crate) struct Layout {
+    pub(crate) geometry: Geometry,
+    pub(crate) left: usize,
+    pub(crate) right: usize,
+    pub(crate) column: usize,
+    pub(crate) middle: usize,
+    pub(crate) top: usize,
+    pub(crate) caption: usize,
+    pub(crate) rows: usize,
+    pub(crate) confirm: usize,
+    pub(crate) notice: usize,
+    pub(crate) keys: usize,
 }
 
 impl Layout {
-    fn new(geometry: Geometry) -> Self {
+    pub(crate) fn new(geometry: Geometry) -> Self {
         let Geometry {
             width, height, top, ..
         } = geometry;
@@ -694,7 +694,7 @@ impl Layout {
 
     /// The rows that fit above the footer, as many as the startup menu's;
     /// one fewer with the line an empty list shows.
-    fn fits(&self, empty: bool) -> usize {
+    pub(crate) fn fits(&self, empty: bool) -> usize {
         let fits = self.geometry.height.saturating_sub(self.rows + 120) / ROW;
         fits.saturating_sub(usize::from(empty)).max(1)
     }
@@ -735,15 +735,15 @@ pub enum Draw {
 }
 
 #[derive(Clone, Copy)]
-struct Rect {
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
+pub(crate) struct Rect {
+    pub(crate) x: usize,
+    pub(crate) y: usize,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
 }
 
 /// What a field holds.
-enum Content<'a> {
+pub(crate) enum Content<'a> {
     Plain(&'a str),
     /// This many characters, as dots.
     Masked(usize),
@@ -767,6 +767,14 @@ impl Drop for Scene {
 }
 
 impl Scene {
+    /// An empty scene for glyphs `glyph` units wide.
+    pub(crate) fn new(glyph: usize) -> Self {
+        Self {
+            draws: Vec::new(),
+            glyph: glyph.max(1),
+        }
+    }
+
     /// The text of every [`Draw::Text`], in order.
     pub fn texts(&self) -> impl Iterator<Item = &str> {
         self.draws.iter().filter_map(|draw| match draw {
@@ -775,11 +783,11 @@ impl Scene {
         })
     }
 
-    fn width(&self, text: &str) -> usize {
+    pub(crate) fn width(&self, text: &str) -> usize {
         text.chars().count() * self.glyph
     }
 
-    fn panel(
+    pub(crate) fn panel(
         &mut self,
         x: usize,
         y: usize,
@@ -798,7 +806,7 @@ impl Scene {
         });
     }
 
-    fn text(&mut self, x: usize, y: usize, text: &str, tone: Tone) {
+    pub(crate) fn text(&mut self, x: usize, y: usize, text: &str, tone: Tone) {
         self.draws.push(Draw::Text {
             x,
             y,
@@ -807,19 +815,19 @@ impl Scene {
         });
     }
 
-    fn right(&mut self, right: usize, y: usize, text: &str, tone: Tone) {
+    pub(crate) fn right(&mut self, right: usize, y: usize, text: &str, tone: Tone) {
         let x = right.saturating_sub(self.width(text));
         self.text(x, y, text, tone);
     }
 
-    fn centred(&mut self, middle: usize, y: usize, text: &str, tone: Tone) {
+    pub(crate) fn centred(&mut self, middle: usize, y: usize, text: &str, tone: Tone) {
         let x = middle.saturating_sub(self.width(text) / 2);
         self.text(x, y, text, tone);
     }
 
     /// A padlock 12 units wide in a 16 unit line from (`x`, `y`), its
     /// shackle's hole and keyhole in `behind`.
-    fn lock(&mut self, x: usize, y: usize, tone: Tone, behind: Tone) {
+    pub(crate) fn lock(&mut self, x: usize, y: usize, tone: Tone, behind: Tone) {
         self.panel(x + 2, y + 1, 8, 9, 4, tone);
         self.panel(x + 4, y + 3, 4, 7, 2, behind);
         self.panel(x, y + 6, 12, 9, 2, tone);
@@ -827,14 +835,14 @@ impl Scene {
     }
 
     /// A plus sign 12 units wide in a 16 unit line from (`x`, `y`).
-    fn plus(&mut self, x: usize, y: usize, tone: Tone) {
+    pub(crate) fn plus(&mut self, x: usize, y: usize, tone: Tone) {
         self.panel(x + 5, y + 2, 2, 12, 1, tone);
         self.panel(x, y + 7, 12, 2, 1, tone);
     }
 
     /// A text field: raised, ringed in orange with a caret while typed in,
     /// showing the end of what it holds when that is longer than it.
-    fn field(&mut self, rect: Rect, content: Content<'_>, active: bool) {
+    pub(crate) fn field(&mut self, rect: Rect, content: Content<'_>, active: bool) {
         let Rect {
             x,
             y,

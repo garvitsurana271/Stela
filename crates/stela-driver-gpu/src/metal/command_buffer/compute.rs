@@ -82,7 +82,7 @@ impl CommandBuffer {
 
     pub fn set_compute_pipeline_state(&mut self, state: &ComputePipelineState) -> Result<()> {
         compute(&mut self.encoder)?.pipeline = Some(state.clone());
-        self.bound(BoundPipeline::Compute(state.id));
+        self.bound(BoundPipeline::compute(state));
         Ok(())
     }
 

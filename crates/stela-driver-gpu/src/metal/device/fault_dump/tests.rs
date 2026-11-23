@@ -117,6 +117,35 @@ fn a_driver_without_shader_images_still_names_the_pipelines() {
     );
 }
 
+/// A pipeline released while its command buffer is in flight, whose slot a
+/// new pipeline took, is named released: the new one's shaders are not
+/// printed under the old one's work.
+#[test]
+fn a_released_pipeline_whose_slot_was_reused_is_named_released() {
+    let mut device = device();
+    device.backend().shader_images = vec![kernel_image()];
+    let (id, _) = dispatched(&mut device);
+    device
+        .destroy_compute_pipeline(super::super::ComputePipelineId(id as u32))
+        .unwrap();
+    let (reused, _) = dispatched(&mut device);
+    assert_eq!(reused, id, "the new pipeline took the released one's slot");
+    lose(&mut device);
+    let lines = device.fault_dump(1);
+    let released = format!("fault dump 1 compute {id}: released, its shaders unknown");
+    let stage = format!("fault dump 1 compute {id} variant 0 compute (kernel): code=100");
+    assert_eq!(
+        lines.iter().filter(|line| **line == released).count(),
+        1,
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines.iter().filter(|line| line.starts_with(&stage)).count(),
+        1,
+        "only the new pipeline's work shows its shaders: {lines:?}"
+    );
+}
+
 /// Work the GPU finished is not what it was running when it was lost.
 #[test]
 fn finished_work_is_not_named() {

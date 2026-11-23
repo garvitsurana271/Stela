@@ -321,17 +321,40 @@ pub(super) struct Pipelines {
     functions: Slab<FunctionObject>,
     render: Slab<RenderObject>,
     compute: Slab<ComputeObject>,
+    /// Pipeline states made so far, render and compute: each one's
+    /// generation.
+    made: u64,
 }
 
 impl Pipelines {
+    /// The next pipeline state's generation.
+    fn generation(&mut self) -> u64 {
+        self.made += 1;
+        self.made
+    }
+
+    /// Refuses a bound pipeline whose state was released, its slot perhaps
+    /// another's since.
+    fn current(generation: u64, bound: u64) -> Result<()> {
+        ensure(generation == bound, "the pipeline was released")
+    }
+
     /// The entry points of the functions `pipeline` uses: those its
     /// descriptor names and those it links.
     /// A pipeline's functions by entry point, each with the function
     /// constants it was specialized with as `[index=bytes, ...]`.
     pub(super) fn entries(&self, pipeline: BoundPipeline) -> Result<Vec<String>> {
         let kept = match pipeline {
-            BoundPipeline::Render(id) => &self.render.get(id as u32)?.kept,
-            BoundPipeline::Compute(id) => &self.compute.get(id as u32)?.kept,
+            BoundPipeline::Render { id, generation } => {
+                let render = self.render.get(id as u32)?;
+                Self::current(render.state.generation, generation)?;
+                &render.kept
+            }
+            BoundPipeline::Compute { id, generation } => {
+                let compute = self.compute.get(id as u32)?;
+                Self::current(compute.state.generation, generation)?;
+                &compute.kept
+            }
         };
         kept.functions
             .iter()
@@ -363,8 +386,9 @@ impl Pipelines {
     /// one its indirect commands set.
     pub(super) fn vulkan_pipelines(&self, pipeline: BoundPipeline) -> Result<Vec<Pipeline>> {
         Ok(match pipeline {
-            BoundPipeline::Render(id) => {
+            BoundPipeline::Render { id, generation } => {
                 let render = self.render.get(id as u32)?;
+                Self::current(render.state.generation, generation)?;
                 render
                     .state
                     .pipeline
@@ -373,8 +397,9 @@ impl Pipelines {
                     .chain(render.variants.iter().map(|&(_, _, pipeline)| pipeline))
                     .collect()
             }
-            BoundPipeline::Compute(id) => {
+            BoundPipeline::Compute { id, generation } => {
                 let compute = self.compute.get(id as u32)?;
+                Self::current(compute.state.generation, generation)?;
                 compute
                     .variants
                     .iter()
@@ -1320,10 +1345,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             None
         };
         self.keep(&kept)?;
+        let generation = self.pipelines.generation();
         let index = self.pipelines.render.insert(RenderObject {
             kept,
             state: RenderPipelineState {
                 id: 0,
+                generation,
                 pipeline: Some(vulkan),
                 plan,
                 interfaces,
@@ -1576,10 +1603,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         };
         self.tests_fragments |= plan.tests_fragments;
         self.keep(&kept)?;
+        let generation = self.pipelines.generation();
         let index = self.pipelines.render.insert(RenderObject {
             kept,
             state: RenderPipelineState {
                 id: 0,
+                generation,
                 pipeline: None,
                 plan,
                 interfaces,
@@ -1890,6 +1919,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         };
         let state = ComputePipelineState {
             id: 0,
+            generation: self.pipelines.generation(),
             plan,
             interface,
             indirect,

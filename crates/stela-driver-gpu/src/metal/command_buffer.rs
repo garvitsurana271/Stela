@@ -76,6 +76,10 @@ impl BufferRef {
 pub struct RenderPipelineState {
     /// The device's id for the state, which names its variants.
     pub id: u64,
+    /// The device's count of the pipelines it made, when it made this one:
+    /// a pipeline made after this one is released may take its `id`, never
+    /// its generation ([`BoundPipeline`]).
+    pub generation: u64,
     /// The Vulkan pipeline; `None` for mesh pipelines, which bind a variant
     /// per draw.
     pub pipeline: Option<Pipeline>,
@@ -102,6 +106,8 @@ pub struct RenderPipelineState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComputePipelineState {
     pub id: u64,
+    /// As [`RenderPipelineState::generation`].
+    pub generation: u64,
     pub plan: ComputePipelinePlan,
     pub interface: Interface,
     /// Its variant for GPU-resident indirect commands, when they can
@@ -363,11 +369,28 @@ impl Workload {
 
 /// A pipeline state an encoder set, by its device id, which names the work
 /// in flight when the device is lost. The pipelines an indirect command
-/// buffer sets itself are not among them.
+/// buffer sets itself are not among them. Its generation tells the state
+/// from one made later in the same slot, once it is released.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoundPipeline {
-    Render(u64),
-    Compute(u64),
+    Render { id: u64, generation: u64 },
+    Compute { id: u64, generation: u64 },
+}
+
+impl BoundPipeline {
+    pub fn render(state: &RenderPipelineState) -> Self {
+        Self::Render {
+            id: state.id,
+            generation: state.generation,
+        }
+    }
+
+    pub fn compute(state: &ComputePipelineState) -> Self {
+        Self::Compute {
+            id: state.id,
+            generation: state.generation,
+        }
+    }
 }
 
 /// One stage's argument table and whether the GPU copy is current.

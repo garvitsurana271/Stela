@@ -1573,7 +1573,7 @@ impl CommandBuffer {
             self.recorder
                 .push(Command::SetRasterizerDiscard(!plan.rasterization_enabled));
         }
-        self.bound(BoundPipeline::Render(state.id));
+        self.bound(BoundPipeline::render(state));
         Ok(())
     }
 

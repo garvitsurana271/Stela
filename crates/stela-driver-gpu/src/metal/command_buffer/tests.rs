@@ -328,6 +328,7 @@ pub(crate) fn render_state(amplification: u64) -> RenderPipelineState {
     let plan = render_pipeline(&capabilities(), &descriptor).unwrap();
     RenderPipelineState {
         id: 0,
+        generation: 0,
         pipeline: Some(Pipeline(42)),
         plan,
         interfaces: alloc::vec![vertex.interface, fragment.interface],
@@ -395,6 +396,7 @@ fn patch_state_of(
     };
     RenderPipelineState {
         id: 1,
+        generation: 0,
         pipeline: Some(Pipeline(43)),
         plan: render_pipeline(&capabilities(), &descriptor).unwrap(),
         interfaces: alloc::vec![evaluation.interface],
@@ -668,6 +670,7 @@ fn mesh_thread_draws_cover_the_grid_with_the_first_stage() {
         };
         let state = RenderPipelineState {
             id: 2,
+            generation: 0,
             pipeline: None,
             plan: mesh_render_pipeline(&capabilities(), &descriptor).unwrap(),
             interfaces: object
@@ -1610,6 +1613,7 @@ fn kernel_state(writes: bool) -> ComputePipelineState {
     let plan = compute_pipeline(&capabilities(), &descriptor).unwrap();
     ComputePipelineState {
         id: 1,
+        generation: 0,
         plan,
         interface: kernel.interface,
         indirect: None,
@@ -1650,6 +1654,7 @@ fn stage_in_dispatches_pass_their_region() {
     };
     let state = ComputePipelineState {
         id: 1,
+        generation: 0,
         plan: compute_pipeline(&capabilities(), &descriptor).unwrap(),
         interface: kernel.interface,
         indirect: None,
@@ -1736,6 +1741,7 @@ fn dynamic_stage_in_strides_follow_the_region() {
     };
     let state = ComputePipelineState {
         id: 1,
+        generation: 0,
         plan: compute_pipeline(&capabilities(), &descriptor).unwrap(),
         interface: kernel.interface,
         indirect: None,

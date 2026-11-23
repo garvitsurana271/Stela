@@ -46,7 +46,7 @@ impl CommandBuffer {
         target: TileTarget,
     ) -> Result<()> {
         render(&mut self.encoder)?.tile.pipeline = Some((state.clone(), target));
-        self.bound(super::BoundPipeline::Compute(state.id));
+        self.bound(super::BoundPipeline::compute(state));
         Ok(())
     }
 

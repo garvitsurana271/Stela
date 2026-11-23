@@ -16,8 +16,8 @@ use alloc::{format, string::String, vec, vec::Vec};
 /// How a dump names a pipeline: its kind and device id.
 fn label(pipeline: BoundPipeline) -> String {
     match pipeline {
-        BoundPipeline::Render(id) => format!("render {id}"),
-        BoundPipeline::Compute(id) => format!("compute {id}"),
+        BoundPipeline::Render { id, .. } => format!("render {id}"),
+        BoundPipeline::Compute { id, .. } => format!("compute {id}"),
     }
 }
 
@@ -31,7 +31,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     pub fn fault_dump(&mut self, fault: u32) -> Vec<String> {
         let (serials, mut pipelines) = self.unfinished_pipelines();
         // Stable: each kind keeps the order it was bound in.
-        pipelines.sort_by_key(|pipeline| matches!(pipeline, BoundPipeline::Compute(_)));
+        pipelines.sort_by_key(|pipeline| matches!(pipeline, BoundPipeline::Compute { .. }));
         let labels: Vec<String> = pipelines.iter().copied().map(label).collect();
         let mut lines = vec![fault_dump::opening(fault, &serials, &labels)];
         let mut stages: Vec<(&str, usize, ShaderImage)> = Vec::new();

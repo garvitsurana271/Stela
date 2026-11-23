@@ -399,6 +399,11 @@ pub(crate) struct Create {
     /// supported now.
     #[arg(long, hide = true)]
     model: Option<String>,
+    /// Let `--model` name an experimental MacBook persona, Mac14,2 (MacBook
+    /// Air M2): a new install of its own for testing, never a switch of a
+    /// Mac mini install.
+    #[arg(long, requires = "model", hide = true)]
+    experimental_macbook: bool,
     /// The PC's partition that becomes the Mac's internal SSD, when stambha
     /// runs on the PC itself; on an existing setup it adds another install.
     #[arg(long, value_parser = partition_name, hide = true)]
@@ -454,6 +459,7 @@ impl Create {
             download_dir: self.download_dir,
             efi: self.efi,
             model: self.model,
+            experimental_macbook: self.experimental_macbook,
             target: self.target,
             nor: self.nor,
             disk_serial: self.disk_serial,

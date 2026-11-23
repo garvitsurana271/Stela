@@ -128,9 +128,23 @@ pub(crate) const SUPPORTED_MODELS: &[(&str, &str)] = &[("Mac14,3", "Mac mini M2"
 /// The Mac model Stela presents by default.
 pub(crate) const PINNED_MODEL: &str = SUPPORTED_MODELS[0].0;
 
-/// Refuse a Mac model `models` does not hold, naming the ones it does.
-fn check_model(models: &[(&str, &str)], model: &str) -> Result<()> {
-    if models.iter().any(|(supported, _)| *supported == model) {
+/// Mac models setup makes a stick for only when the hidden
+/// `--experimental-macbook` asks: the MacBook Air M2 persona of release 2,
+/// whose install and USB input have not run on a PC yet. Such a stick is a
+/// new install of its own, never a switch of a Mac mini install. Setup
+/// presents and defaults to [`SUPPORTED_MODELS`] alone.
+pub(crate) const EXPERIMENTAL_MODELS: &[(&str, &str)] = &[("Mac14,2", "MacBook Air M2")];
+
+fn experimental(model: &str) -> bool {
+    EXPERIMENTAL_MODELS.iter().any(|(name, _)| *name == model)
+}
+
+/// Refuse a Mac model `models` does not hold, naming the ones it does; an
+/// [`EXPERIMENTAL_MODELS`] one passes only when `allow_experimental`.
+fn check_model(models: &[(&str, &str)], model: &str, allow_experimental: bool) -> Result<()> {
+    if models.iter().any(|(supported, _)| *supported == model)
+        || allow_experimental && experimental(model)
+    {
         return Ok(());
     }
     let supported: Vec<String> = models
@@ -513,6 +527,9 @@ pub(crate) struct Request {
     download_dir: Option<PathBuf>,
     efi: Option<PathBuf>,
     model: Option<String>,
+    /// `--experimental-macbook`: `model` may name one of
+    /// [`EXPERIMENTAL_MODELS`].
+    experimental_macbook: bool,
     pub(crate) build: String,
     /// `update --macos`: the build the stick moves to after its Stela.
     macos: Option<String>,
@@ -1428,6 +1445,8 @@ impl Request {
         self.usb = esp;
         self.build = record.build.clone();
         self.model = Some(record.model.clone());
+        // A stick begun with `--experimental-macbook` finishes as it began.
+        self.experimental_macbook |= experimental(&record.model);
         // The installer the stopped setup was making: a full one goes on
         // from the pieces already on the stick.
         self.install_image = Some(record.install_kind());
@@ -1464,7 +1483,7 @@ impl Request {
     /// Create a setup, or add an install (`--target`) to an existing one.
     fn create(mut self, environment: &Environment<'_>) -> Result<String> {
         if let Some(model) = &self.model {
-            check_model(environment.models, model)?;
+            check_model(environment.models, model, self.experimental_macbook)?;
         }
         // A first setup that was interrupted is finished by `repair`, not
         // added to.

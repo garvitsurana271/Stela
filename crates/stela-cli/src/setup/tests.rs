@@ -8439,3 +8439,57 @@ fn a_new_stick_s_log_is_as_long_as_its_efi_partition_allows() {
         assert_eq!(stick_log(&f), vec![0; bytes as usize]);
     }
 }
+
+#[test]
+fn the_macbook_air_persona_needs_the_hidden_opt_in_and_the_default_stays_the_mac_mini() {
+    assert_eq!(SUPPORTED_MODELS, [("Mac14,3", "Mac mini M2")]);
+    assert_eq!(PINNED_MODEL, "Mac14,3");
+    assert_eq!(EXPERIMENTAL_MODELS, [("Mac14,2", "MacBook Air M2")]);
+    for allow in [false, true] {
+        check_model(SUPPORTED_MODELS, "Mac14,3", allow).unwrap();
+        // The opt-in admits only the listed persona, with today's refusal
+        // for every other model.
+        for model in ["Mac14,7", "MacBookPro18,3", "Mac14,15"] {
+            assert_eq!(
+                check_model(SUPPORTED_MODELS, model, allow)
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "Mac model {model} is not supported yet; Stambha supports Mac14,3 (Mac mini M2)"
+                )
+            );
+        }
+    }
+    assert_eq!(
+        check_model(SUPPORTED_MODELS, "Mac14,2", false)
+            .unwrap_err()
+            .to_string(),
+        "Mac model Mac14,2 is not supported yet; Stambha supports Mac14,3 (Mac mini M2)"
+    );
+    check_model(SUPPORTED_MODELS, "Mac14,2", true).unwrap();
+
+    let request =
+        crate::tests::parse(&["create", "--model", "Mac14,2", "--experimental-macbook"]).unwrap();
+    assert_eq!(request.model.as_deref(), Some("Mac14,2"));
+    assert!(request.experimental_macbook);
+    let plain = crate::tests::parse(&["create"]).unwrap();
+    assert!(!plain.experimental_macbook && plain.model.is_none());
+    // The opt-in names no model of its own.
+    assert!(crate::tests::parse(&["create", "--experimental-macbook"]).is_err());
+}
+
+#[test]
+fn a_persona_stick_resumes_with_its_opt_in_and_a_mac_mini_stick_without() {
+    let mut f = fixture(64 * GIB, false);
+    add_installed_disk(&mut f, &[], &[]);
+    setup(&environment(&f.host), installed_command(&f)).unwrap();
+    interrupt_setup(&f);
+    let mut found = read_record(&environment(&f.host), &f.esp).unwrap();
+    for (model, opted) in [("Mac14,3", false), ("Mac14,2", true)] {
+        found.model = model.into();
+        let mut command = command(&f, Path::new("disk5"));
+        command.resume_from(f.esp.clone(), &found);
+        assert_eq!(command.model.as_deref(), Some(model));
+        assert_eq!(command.experimental_macbook, opted, "{model}");
+    }
+}

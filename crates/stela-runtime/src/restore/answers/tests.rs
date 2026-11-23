@@ -665,3 +665,43 @@ fn each_answer_from_a_remote_image_ends_in_bounded_turns_with_the_unbounded_byte
         assert!(sent(&plan, &mut plain.store) == expected, "{what}");
     }
 }
+
+/// A firmware updater other than Cryptex1, such as a MacBook panel TCON's
+/// `Baobab`, is refused by its name, with the whole request, and the reason
+/// asks for a report rather than a retry.
+#[test]
+fn an_unanswerable_firmware_updater_is_refused_by_name() {
+    let mut answers = Answers::new(super::super::store::tests::fixture(b"x", false));
+    for updater in ["Baobab", "SomethingElse"] {
+        let request = Value::dict([
+            ("DataType", Value::from("FirmwareUpdaterData")),
+            (
+                "Arguments",
+                Value::dict([
+                    ("MessageArgUpdaterName", Value::from(updater)),
+                    ("Nonce", Value::Data(vec![9])),
+                ]),
+            ),
+        ]);
+        let Err(Error::Refused {
+            reason,
+            request: kept,
+        }) = answers.plan(&request)
+        else {
+            panic!("{updater} must refuse")
+        };
+        let reason = reason.to_string();
+        assert!(
+            reason.starts_with(&format!(
+                "restored asked for the {updater} firmware updater, which Stambha cannot answer"
+            )),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("report it rather than retrying"),
+            "{reason}"
+        );
+        assert!(!reason.contains("restore plan"), "{reason}");
+        assert_eq!(*kept, request);
+    }
+}

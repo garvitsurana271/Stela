@@ -488,13 +488,15 @@ impl<R: ReadAt> Answers<R> {
     }
     /// The plan for `request`. A pending read leaves it to be asked again
     /// with the same request, which goes on from what this call read
-    /// ([`Store::answering`]).
+    /// ([`Store::answering`]). A refusal keeps its own reason, and carries
+    /// the whole request as every other error does.
     pub fn plan(&mut self, request: &Value) -> Result<Plan> {
         self.store.answering(request);
         let plan = self.plan_inner(request);
         self.store.answered(matches!(plan, Err(Error::Pending)));
         plan.map_err(|e| match e {
             Error::Pending => e,
+            Error::Refused { reason, .. } => super::refuse(reason, request),
             e => super::refuse(refuse!("restore plan: {e}", ?e), request),
         })
     }
@@ -846,11 +848,24 @@ impl<R: ReadAt> Answers<R> {
         }
         Ok(Plan::Reply(Value::Dict(response)))
     }
+    /// A firmware updater's ticket: only Cryptex1's, the one updater a real
+    /// 26B123 J473AP install asks for. Any other personalizes a part by its
+    /// own ECID and nonce (a MacBook's panel TCON, `Baobab`, carries
+    /// `Baobab,*` tags), which the machine does not have, so it is refused by
+    /// name. Where in the install it comes is unknown; it may be after the
+    /// Mac's SSD was erased, so the refusal asks for a report, not a retry.
     fn updater(&mut self, identity: &Identity, args: &Value) -> Result<Plan> {
         let updater = args.required("MessageArgUpdaterName")?.string()?;
         if updater != "Cryptex1" {
-            return Err(Error::Invalid(
-                "unsupported firmware updater/ticket trust boundary",
+            return Err(super::refuse(
+                refuse!(
+                    "restored asked for the {updater} firmware updater, which Stambha cannot \
+                     answer: this machine has no {updater} part to personalize. The install \
+                     stops here, possibly after the Mac's SSD was erased; report it rather \
+                     than retrying",
+                    %updater
+                ),
+                args,
             ));
         }
         let request = args.required("DeviceGeneratedRequest")?;

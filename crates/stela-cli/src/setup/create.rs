@@ -6,6 +6,7 @@ use super::{
     ecid::Ecid,
     firmware, format,
     host::{self, Host},
+    identity::{self, Identity},
     image_is_remote, installed, locate_esp, machines, medium,
     prepare::{
         Prepared, PreparedSetup, copy_bundles, download_dir, prepare_kind, prepare_restore_bundles,
@@ -112,6 +113,7 @@ pub(super) fn plan_install(
         additional_bytes: also,
     } = options;
     let host = environment.host;
+    let identities = record.identities();
     let mut restore = Vec::new();
     for kind in bundle::RESTORE_KINDS {
         let ecids: Vec<Option<Ecid>> = bundles
@@ -128,6 +130,7 @@ pub(super) fn plan_install(
                     model: &record.model,
                     build: Some(build),
                     ecids: &ecids,
+                    identities: &identities,
                 },
             )?;
             restore.extend(prepared);
@@ -347,6 +350,8 @@ pub(super) fn remove_replaced(
 struct Resume {
     name: String,
     ecid: Ecid,
+    /// Its generated identity, which the finished setup keeps.
+    identity: Option<Identity>,
     /// Its restore bundles, when every one is intact and of the generation
     /// this stela prepares; else empty, and they are prepared again.
     bundles: Vec<bundle::Bundle>,
@@ -469,9 +474,19 @@ impl Resume {
                 .collect(),
             false => Vec::new(),
         };
+        // A create that stopped finishes with the identity it began with:
+        // its boot files were prepared with it, or without one.
+        if command.generated_identity && install.identity.is_none() {
+            bail!(
+                "this stick holds a create that stopped, begun without --generated-identity,                  which finishes without one: finish it with {}, or {} to begin with one",
+                super::fix(&command.usb, "repair"),
+                super::START_OVER
+            );
+        }
         Ok(Self {
             name: install.name.clone(),
             ecid,
+            identity: install.identity.clone(),
             bundles,
             stale: previous
                 .bundles
@@ -663,6 +678,12 @@ pub(super) fn plan(
         },
         &mut notes,
     )?;
+    // The machine's generated identity: the stopped create's, or the one
+    // drawn before the stick was erased, or a fresh one when asked for.
+    let identity = match resume.as_ref().and_then(|r| r.identity.as_ref()) {
+        Some(recorded) => Some(recorded.clone()),
+        None => identity::machine_identity(command.generated_identity, command.identity.as_ref())?,
+    };
     let efi_path = match &command.efi {
         Some(path) => path.clone(),
         None => assets::resolve()?,
@@ -679,7 +700,9 @@ pub(super) fn plan(
             notes.push("keeps the boot files already on the stick".into());
             (version, build, Vec::new())
         }
-        (None, _) => prepare_restore_bundles(environment, &ipsw, command.model(), ecid)?,
+        (None, _) => {
+            prepare_restore_bundles(environment, &ipsw, command.model(), ecid, identity.as_ref())?
+        }
     };
     let bundles: u64 = prepared.iter().map(|bundle| bundle.bytes).sum();
     let install = machines::Install {
@@ -693,6 +716,7 @@ pub(super) fn plan(
             |resume| resume.name.clone(),
         ),
         ecid: Some(ecid),
+        identity,
         disk: installed.disk.clone(),
     };
     machines::check_name(&install.name)?;
@@ -873,6 +897,9 @@ pub(super) fn describe(plan: &Plan) -> Result<String> {
     if install.name != machines::FIRST_NAME {
         writeln!(text, "  startup choice \"{}\"", install.name)?;
     }
+    if install.identity.is_some() {
+        writeln!(text, "  {}", identity::PLAN_LINE)?;
+    }
     match checked.nor_image {
         Some(_) => writeln!(
             text,
@@ -894,6 +921,9 @@ pub(super) fn state_line(disk: &installed::InstalledDisk) -> String {
 
 pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Result<String> {
     let host = environment.host;
+    if command.generated_identity {
+        eprintln!("{}", identity::WARNING);
+    }
     // Before anything is erased.
     command.read_wifi_passphrase(environment.ui)?;
     if command.fetch {
@@ -1069,8 +1099,17 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
         if command.target.is_none() {
             let ecid = command.ecid.map_or_else(Ecid::generate, Ok)?;
             command.ecid = Some(ecid);
-            let (version, build, prepared) =
-                prepare_restore_bundles(environment, &ipsw, command.model(), ecid)?;
+            // Drawn with the ECID, before the stick is erased: the bundles
+            // prepared now carry it, and `plan` records it.
+            command.identity =
+                identity::machine_identity(command.generated_identity, command.identity.as_ref())?;
+            let (version, build, prepared) = prepare_restore_bundles(
+                environment,
+                &ipsw,
+                command.model(),
+                ecid,
+                command.identity.as_ref(),
+            )?;
             let image_bytes = if remote {
                 0
             } else {

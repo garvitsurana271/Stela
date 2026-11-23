@@ -66,6 +66,7 @@ mod firmware;
 mod format;
 pub(crate) mod home;
 pub(crate) mod host;
+mod identity;
 mod inputs;
 mod installed;
 mod machines;
@@ -149,6 +150,9 @@ pub(super) const MARGIN: u64 = 64 * 1024 * 1024;
 pub(super) const LOADER_PATH: &str = efi::LOADER;
 /// The startup choices beside `stela.cfg`.
 const CHOICES_PATH: &str = "EFI/stela/choices.cfg";
+/// The machines' generated identities beside it
+/// (`stela_boot_core::generated_identity::FILE`), when any has one.
+const IDENTITY_PATH: &str = "EFI/stela/identity.cfg";
 /// The startup choices' timeout with several installs; with one, the list
 /// opens only when a key is held.
 const CHOOSER_SECONDS: u32 = 5;
@@ -534,6 +538,11 @@ pub(crate) struct Request {
     install: Option<String>,
     ecid: Option<Ecid>,
     new_ecid: bool,
+    /// `--generated-identity`: give a new machine a generated identity
+    /// (`setup::identity`).
+    generated_identity: bool,
+    /// The new machine's generated identity, once drawn.
+    identity: Option<identity::Identity>,
     profile: bool,
     no_profile: bool,
     verify_on_read: bool,

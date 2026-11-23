@@ -5,6 +5,7 @@ use super::{
     bundle::{self, Kind},
     ecid::Ecid,
     host::Host,
+    identity::Identity,
     record::Record,
 };
 use crate::{boot, restore};
@@ -40,14 +41,18 @@ pub(super) const BUNDLE_LEAF: &str = "bundle";
 
 /// Prepare `ipsw`'s restore bundles of every kind setup writes
 /// ([`bundle::RESTORE_KINDS`]) for the machine `ecid`, under Apple's
-/// personalized ticket. Returns the image's version and build too.
+/// personalized ticket, with its generated `identity` when it has one.
+/// Returns the image's version and build too.
 pub(super) fn prepare_restore_bundles(
     environment: &Environment<'_>,
     ipsw: &Path,
     model: &str,
     ecid: Ecid,
+    identity: Option<&Identity>,
 ) -> Result<PreparedSetup> {
     let (product_version, build) = restore::payload::identity(ipsw, model)?;
+    let identities: Vec<(Ecid, Identity)> =
+        identity.map(|i| (ecid, i.clone())).into_iter().collect();
     let mut prepared = Vec::new();
     for kind in bundle::RESTORE_KINDS {
         let (_, _, bundles) = prepare_kind(
@@ -58,6 +63,7 @@ pub(super) fn prepare_restore_bundles(
                 model,
                 build: Some(&build),
                 ecids: &[Some(ecid)],
+                identities: &identities,
             },
         )?;
         prepared.extend(bundles);
@@ -86,6 +92,9 @@ pub(super) struct BundleOptions<'a> {
     pub(super) model: &'a str,
     pub(super) build: Option<&'a str>,
     pub(super) ecids: &'a [Option<Ecid>],
+    /// The generated identities of those machines that have one
+    /// (`Record::identities`).
+    pub(super) identities: &'a [(Ecid, Identity)],
 }
 
 /// Prepare the selected bundle kind for each machine; verify the requested
@@ -100,6 +109,7 @@ pub(super) fn prepare_kind(
         model,
         build,
         ecids,
+        identities,
     } = options;
     let (product_version, found) = restore::payload::identity(ipsw, model)?;
     if let Some(build) = build {
@@ -127,10 +137,15 @@ pub(super) fn prepare_kind(
             (Kind::Update, true) => "Preparing and signing the update boot files",
             (Kind::Update, false) => "Preparing the update boot files",
         });
+        let identity = identities
+            .iter()
+            .find(|(machine, _)| Some(*machine) == ecid)
+            .map(|(_, identity)| identity);
         prepare(RamdiskOptions {
             ipsw,
             model,
             ecid,
+            identity,
             output: &output,
         })
         .context("could not prepare the boot files")?;
@@ -389,6 +404,9 @@ pub(super) struct RamdiskOptions<'a> {
     /// The machine; its restore bundle boots under the AP ticket Apple's
     /// signing service (TSS) personalizes for it.
     pub(super) ecid: Option<Ecid>,
+    /// The machine's generated identity, for the DeviceTree's fill-ins;
+    /// without one they keep their zero fallbacks.
+    pub(super) identity: Option<&'a Identity>,
     pub(super) output: &'a Path,
 }
 
@@ -410,10 +428,21 @@ pub(super) fn prepare_update(options: RamdiskOptions<'_>) -> Result<()> {
 /// (`machine::soc::board`), so a model the engine cannot run is refused
 /// before the USB changes rather than when the PC boots it.
 fn prepare_ramdisk(options: RamdiskOptions<'_>, update: bool) -> Result<()> {
-    let RamdiskOptions {
+    boot::prepare(&ramdisk_line(&options, update)?)?;
+    let tree = fs::read(options.output.join("devicetree.adt"))?;
+    stela_soc_data::board::board(&tree)
+        .map_err(|reason| anyhow::anyhow!("Stambha cannot run {} yet: {reason}", options.model))?;
+    Ok(())
+}
+
+/// The `stela-dev boot prepare` line of [`prepare_ramdisk`]. A machine
+/// without a generated identity gets the line it always got.
+fn ramdisk_line(options: &RamdiskOptions<'_>, update: bool) -> Result<Vec<String>> {
+    let &RamdiskOptions {
         ipsw,
         model,
         ecid,
+        identity,
         output,
     } = options;
     let mut line: Vec<String> = [
@@ -434,17 +463,58 @@ fn prepare_ramdisk(options: RamdiskOptions<'_>, update: bool) -> Result<()> {
     if let Some(ecid) = ecid {
         line.extend(["--ecid".into(), ecid.to_string()]);
     }
-    boot::prepare(&line)?;
-    let tree = fs::read(output.join("devicetree.adt"))?;
-    stela_soc_data::board::board(&tree)
-        .map_err(|reason| anyhow::anyhow!("Stambha cannot run {model} yet: {reason}"))?;
-    Ok(())
+    if let Some(identity) = identity {
+        line.extend(identity.prepare_arguments());
+    }
+    Ok(line)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{collections::BTreeMap, ffi::OsString};
+
+    #[test]
+    fn a_generated_identity_only_adds_its_fill_ins_to_the_prepare_line() {
+        let ecid = Ecid(0x700c_de23_bbf1_c97d);
+        let options = |identity| RamdiskOptions {
+            ipsw: Path::new("/images/macOS.ipsw"),
+            model: "Mac14,3",
+            ecid: Some(ecid),
+            identity,
+            output: Path::new("/tmp/bundle"),
+        };
+        // Golden: without an identity, the line setup always passed.
+        let line = ramdisk_line(&options(None), false).unwrap();
+        assert_eq!(
+            line,
+            [
+                "--ipsw",
+                "/images/macOS.ipsw",
+                "--model",
+                "Mac14,3",
+                "--restore",
+                "--output",
+                "/tmp/bundle",
+                "--boot-args=-v serial=3 serial-device-name=uart0",
+                "--ecid",
+                "0x700cde23bbf1c97d",
+            ]
+        );
+        let mut update = line.clone();
+        update.insert(8, "--update".into());
+        assert_eq!(ramdisk_line(&options(None), true).unwrap(), update);
+        assert!(
+            !line
+                .iter()
+                .any(|word| word == "--syscfg" || word == "--macaddr")
+        );
+        // With one: the same line, then its --syscfg and --macaddr values.
+        let identity = Identity::generate().unwrap();
+        let with = ramdisk_line(&options(Some(&identity)), false).unwrap();
+        assert_eq!(with[..line.len()], line[..]);
+        assert_eq!(with[line.len()..], identity.prepare_arguments()[..]);
+    }
 
     fn cache(os: &str, vars: &[(&str, &str)]) -> Option<PathBuf> {
         let vars: BTreeMap<String, OsString> = vars

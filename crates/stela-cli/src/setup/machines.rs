@@ -14,8 +14,8 @@
 //! prepared from the active build's restore image.
 use super::{
     Environment, Request, apply_install, bundle, check_bundle_revision, check_installed_efi,
-    describe_install, ecid::Ecid, installed, plan_install, publish, read_record, sources,
-    write_record,
+    describe_install, ecid::Ecid, identity, identity::Identity, installed, plan_install, publish,
+    read_record, sources, write_record,
 };
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,10 @@ pub(super) struct Install {
     /// None only for an install a schema 3 setup made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) ecid: Option<Ecid>,
+    /// The machine's generated identity (`--generated-identity`), kept for
+    /// its life; none unless asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) identity: Option<Identity>,
     #[serde(flatten)]
     pub(super) disk: installed::InstalledDisk,
 }
@@ -95,6 +99,9 @@ pub(super) fn machine_ecid(options: EcidOptions, notes: &mut Vec<String>) -> Res
 /// `--target` (and an optional `--nor`) on an existing setup: add an
 /// install.
 pub(super) fn add(environment: &Environment<'_>, command: &Request) -> Result<String> {
+    if command.generated_identity {
+        eprintln!("{}", identity::WARNING);
+    }
     let record = read_record(environment, &command.usb)?;
     check_installed_efi(environment, &record)?;
     check_bundle_revision(environment, &record)?;
@@ -198,8 +205,11 @@ pub(super) fn add(environment: &Environment<'_>, command: &Request) -> Result<St
                 "finishes adding install \"{}\", which was interrupted",
                 install.name
             ));
+            let identity =
+                identity::machine_identity(command.generated_identity, install.identity.as_ref())?;
             if let Some(kept) = next.installs.iter_mut().find(|i| i.name == install.name) {
                 kept.ecid = Some(ecid);
+                kept.identity = identity;
                 kept.disk = checked.disk.clone();
             }
             install.name
@@ -234,6 +244,7 @@ pub(super) fn add(environment: &Environment<'_>, command: &Request) -> Result<St
             next.installs.push(Install {
                 name: name.clone(),
                 ecid: Some(ecid),
+                identity: identity::machine_identity(command.generated_identity, None)?,
                 disk: checked.disk.clone(),
             });
             name
@@ -308,6 +319,13 @@ pub(super) fn add(environment: &Environment<'_>, command: &Request) -> Result<St
         text,
         "  choices.cfg    adds \"{name}\" and its Install macOS"
     )?;
+    if next
+        .installs
+        .iter()
+        .any(|install| install.name == name && install.identity.is_some())
+    {
+        writeln!(text, "  {}", identity::PLAN_LINE)?;
+    }
     if checked.nor_image.is_some() {
         writeln!(
             text,

@@ -430,6 +430,12 @@ pub(crate) struct Create {
     /// another one.
     #[arg(long, hide = true)]
     new_ecid: bool,
+    /// Experimental: give the new machine a random serial number, board
+    /// serial, model number, region and MAC addresses, never a real Mac's,
+    /// in place of the blank ones every machine has otherwise. Apple Account
+    /// sign-in will most likely still fail. A machine that has one keeps it.
+    #[arg(long, hide = true)]
+    generated_identity: bool,
     /// Have every startup choice time the engine (its `--profile`).
     #[arg(long, hide = true)]
     profile: bool,
@@ -462,6 +468,7 @@ impl Create {
             install: self.install,
             ecid: self.ecid,
             new_ecid: self.new_ecid,
+            generated_identity: self.generated_identity,
             profile: self.profile,
             verify_on_read: self.verify_on_read,
             translation_store_bytes: self.translation_store_bytes,

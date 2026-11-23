@@ -1,10 +1,12 @@
 //! The setup record, `EFI/stela/setup.json`: what setup wrote, read by every
 //! later command and written before each change.
 use super::{
-    CHOICES_PATH, CHOOSER_SECONDS, Environment, InstallImage, LOADER_PATH, RECORD, addresses,
+    CHOICES_PATH, CHOOSER_SECONDS, Environment, IDENTITY_PATH, InstallImage, LOADER_PATH, RECORD,
+    addresses,
     bundle::{self, Kind},
     ecid::Ecid,
     host::Host,
+    identity::Identity,
     image_is_remote, installed, locate_esp, machines, medium, restore_choice_name, translations,
     wifi,
 };
@@ -15,7 +17,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use stela_boot_core::options::{System, Uuid};
+use stela_boot_core::{
+    generated_identity,
+    options::{System, Uuid},
+};
 use stela_loader::mount_interface::{Choice, Choices};
 
 /// What setup writes, recorded on the ESP so `uninstall` can remove it.
@@ -185,6 +190,7 @@ impl Record {
             self.installs.push(machines::Install {
                 name: machines::FIRST_NAME.into(),
                 ecid: None,
+                identity: None,
                 disk,
             });
         }
@@ -301,6 +307,35 @@ impl Record {
             }
         }
         machines
+    }
+
+    /// The generated identities of the installs' machines, each once, by
+    /// ECID: none unless asked for (`--generated-identity`).
+    pub(super) fn identities(&self) -> Vec<(Ecid, Identity)> {
+        let mut identities: Vec<(Ecid, Identity)> = Vec::new();
+        for install in &self.installs {
+            if let (Some(ecid), Some(identity)) = (install.ecid, &install.identity)
+                && identities.iter().all(|(known, _)| *known != ecid)
+            {
+                identities.push((ecid, identity.clone()));
+            }
+        }
+        identities
+    }
+
+    /// `identity.cfg`'s text: none when no machine has an identity.
+    pub(super) fn identity_text(&self) -> Option<String> {
+        let identities = self.identities();
+        if identities.is_empty() {
+            return None;
+        }
+        let values: Vec<_> = identities
+            .iter()
+            .map(|(ecid, identity)| (ecid.0, identity.values()))
+            .collect();
+        Some(generated_identity::encode(
+            values.iter().map(|(ecid, values)| (*ecid, values)),
+        ))
     }
 
     /// The option line of `install`'s Install macOS choice
@@ -489,6 +524,14 @@ pub(super) fn publish(record: &mut Record) -> Result<()> {
     efi::add_mount(&record.esp, &fs::read(&tool)?, None, Some(&record.options))?;
     let path = record.esp.join(CHOICES_PATH);
     match choices {
+        Some(text) => efi::write_atomic(&path, text.as_bytes(), false)?,
+        None if path.exists() => fs::remove_file(&path)?,
+        None => {}
+    }
+    // The generated identities, which stela.efi gives every bundle it
+    // builds from a machine's disk. A setup without one writes nothing.
+    let path = record.esp.join(IDENTITY_PATH);
+    match record.identity_text() {
         Some(text) => efi::write_atomic(&path, text.as_bytes(), false)?,
         None if path.exists() => fs::remove_file(&path)?,
         None => {}

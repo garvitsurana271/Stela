@@ -8439,3 +8439,167 @@ fn a_new_stick_s_log_is_as_long_as_its_efi_partition_allows() {
         assert_eq!(stick_log(&f), vec![0; bytes as usize]);
     }
 }
+
+/// Who each `boot prepare` was for, and with which generated identity.
+type Seen = std::rc::Rc<std::cell::RefCell<Vec<(Option<Ecid>, Option<identity::Identity>)>>>;
+
+/// [`preparers`] that note each machine and identity they prepare for.
+fn watched_preparers(revision: u32, seen: &Seen) -> [Box<Prepare>; 2] {
+    preparers(revision).map(|inner| -> Box<Prepare> {
+        let seen = seen.clone();
+        Box::new(move |options: prepare::RamdiskOptions<'_>| {
+            seen.borrow_mut()
+                .push((options.ecid, options.identity.cloned()));
+            inner(options)
+        })
+    })
+}
+
+#[test]
+fn the_generated_identity_flag_is_hidden_and_off_by_default() {
+    let plain = crate::tests::parse(&["create", "/dev/sdb"]).unwrap();
+    assert!(!plain.generated_identity);
+    assert!(plain.identity.is_none());
+    let asked = crate::tests::parse(&["create", "/dev/sdb", "--generated-identity"]).unwrap();
+    assert!(asked.generated_identity);
+    // Only create takes it: an update keeps what the record holds.
+    assert!(crate::tests::parse(&["update", "--generated-identity"]).is_err());
+    for said in [
+        "experiment",
+        "Apple Account sign-in will most likely still fail",
+        "Secure Enclave",
+        "Apple may flag or lock an Apple Account",
+        "Never share this identity or reuse it on another machine",
+        "tiny chance that the random serial matches a real Mac's",
+        "never copied from a real Mac",
+    ] {
+        assert!(identity::WARNING.contains(said), "{said}");
+    }
+}
+
+#[test]
+fn without_the_opt_in_nothing_changes() {
+    let mut f = fixture(64 * GIB, false);
+    add_installed_disk(&mut f, &[], &[]);
+    let seen = Seen::default();
+    let preparers = watched_preparers(stela_loader::boot_bundle::REVISION, &seen);
+    let environment = environment_at(&f.host, &preparers, stela_loader::boot_bundle::REVISION);
+    let mut dry = installed_command(&f);
+    dry.dry_run = true;
+    let plan = setup(&environment, dry).unwrap();
+    assert!(!plan.contains("identity"), "{plan}");
+    setup(&environment, installed_command(&f)).unwrap();
+    // Every bundle was prepared as before: no identity, so no --syscfg
+    // (`prepare::ramdisk_line`'s golden line).
+    assert!(!seen.borrow().is_empty());
+    assert!(seen.borrow().iter().all(|(_, identity)| identity.is_none()));
+    // The record and the stick hold no trace of one.
+    let raw = fs::read_to_string(f.esp.join(RECORD)).unwrap();
+    assert!(!raw.contains("identity"), "{raw}");
+    assert!(!f.esp.join(IDENTITY_PATH).exists());
+    let record = record(&f);
+    assert!(record.identities().is_empty());
+    assert_eq!(record.identity_text(), None);
+    // A record written again is the same record.
+    let before = snapshot(&f.esp);
+    rerun(&f, |c| c.action = Action::Repair).unwrap();
+    assert!(!f.esp.join(IDENTITY_PATH).exists());
+    assert_eq!(
+        fs::read_to_string(f.esp.join(RECORD)).unwrap(),
+        String::from_utf8(before[&f.esp.join(RECORD)].clone()).unwrap()
+    );
+}
+
+#[test]
+fn a_generated_identity_reaches_every_bundle_and_stays_across_updates() {
+    let mut f = fixture(64 * GIB, false);
+    add_installed_disk(&mut f, &[], &[]);
+    add_disk(&mut f, true, &[], &[]);
+    let seen = Seen::default();
+    let (older, newer) = (watched_preparers(0, &seen), watched_preparers(1, &seen));
+    let old = environment_at(&f.host, &older, 0);
+    let asked = || {
+        let mut command = installed_command(&f);
+        command.generated_identity = true;
+        command
+    };
+    // A dry run names it and writes nothing.
+    let before = snapshot(&f.esp);
+    let mut dry = asked();
+    dry.dry_run = true;
+    let plan = setup(&old, dry).unwrap();
+    assert!(plan.contains(identity::PLAN_LINE), "{plan}");
+    assert_eq!(snapshot(&f.esp), before);
+    seen.borrow_mut().clear();
+    setup(&old, asked()).unwrap();
+    let first = record(&f);
+    let ecid = first.installs[0].ecid.unwrap();
+    let identity = first.installs[0].identity.clone().unwrap();
+    identity.check().unwrap();
+    // Every bundle of the machine was prepared with it.
+    assert!(!seen.borrow().is_empty());
+    for (machine, given) in seen.borrow().iter() {
+        assert_eq!((*machine, given.as_ref()), (Some(ecid), Some(&identity)));
+    }
+    // stela.efi reads the same values from identity.cfg; the boot options
+    // do not carry them.
+    let file = fs::read(f.esp.join(IDENTITY_PATH)).unwrap();
+    assert_eq!(
+        stela_boot_core::generated_identity::for_machine(&file, ecid.0),
+        Ok(Some(identity.values()))
+    );
+    let options = fs::read_to_string(f.esp.join("EFI/stela/stela.cfg")).unwrap();
+    let choices = fs::read_to_string(f.esp.join(CHOICES_PATH)).unwrap();
+    for text in [&options, &choices] {
+        assert!(!text.contains(&identity.serial), "{text}");
+        assert!(!text.contains("syscfg"), "{text}");
+    }
+    // An update that prepares every bundle again keeps the identity, byte
+    // for byte: it is never drawn again.
+    seen.borrow_mut().clear();
+    let new = environment_at(&f.host, &newer, 1);
+    let run = |configure: &dyn Fn(&mut Request)| {
+        let mut command = command(&f, &f.esp);
+        command.ipsw = None;
+        command.model = None;
+        configure(&mut command);
+        command.dispatch(&new)
+    };
+    run(&|c| c.action = Action::UpdateStela).unwrap();
+    assert_eq!(record(&f).bundle_revision, 1);
+    assert!(!seen.borrow().is_empty());
+    for (machine, given) in seen.borrow().iter() {
+        assert_eq!((*machine, given.as_ref()), (Some(ecid), Some(&identity)));
+    }
+    assert_eq!(record(&f).installs[0].identity.as_ref(), Some(&identity));
+    assert_eq!(fs::read(f.esp.join(IDENTITY_PATH)).unwrap(), file);
+    // A repair keeps it too.
+    run(&|c| c.action = Action::Repair).unwrap();
+    assert_eq!(fs::read(f.esp.join(IDENTITY_PATH)).unwrap(), file);
+    // Another machine of the setup gets its own, and the first keeps its.
+    run(&|c| {
+        c.target = Some(REGION2.into());
+        c.nor = Some(NOR2.into());
+        c.ipsw = Some(f.ipsw.clone());
+        c.generated_identity = true;
+    })
+    .unwrap();
+    let both = record(&f);
+    assert_eq!(both.installs.len(), 2);
+    assert_eq!(both.installs[0].identity.as_ref(), Some(&identity));
+    let second = both.installs[1].identity.clone().unwrap();
+    let second_ecid = both.installs[1].ecid.unwrap();
+    assert_ne!(second.serial, identity.serial);
+    assert_ne!(second.mlb, identity.mlb);
+    assert_ne!(second.wifi_mac, identity.wifi_mac);
+    let file = fs::read(f.esp.join(IDENTITY_PATH)).unwrap();
+    for (machine, values) in [(ecid, identity.values()), (second_ecid, second.values())] {
+        assert_eq!(
+            stela_boot_core::generated_identity::for_machine(&file, machine.0),
+            Ok(Some(values))
+        );
+    }
+    // Uninstall removes the file with the rest.
+    uninstall(&new, &f.esp, false).unwrap();
+    assert!(!f.esp.join(IDENTITY_PATH).exists());
+}

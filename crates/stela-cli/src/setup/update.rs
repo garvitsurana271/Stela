@@ -314,6 +314,7 @@ pub(super) fn update_stela(
                         model: &record.model,
                         build: Some(&record.build),
                         ecids: &ecids,
+                        identities: &record.identities(),
                     },
                 )?;
                 prepared.extend(restore);

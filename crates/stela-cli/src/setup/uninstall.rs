@@ -1,6 +1,6 @@
 //! `stela uninstall`: remove everything the setup record names.
 use super::{
-    CHOICES_PATH, Environment, RECORD, bundle, locate_esp,
+    CHOICES_PATH, Environment, IDENTITY_PATH, RECORD, bundle, locate_esp,
     record::{Record, read_any_record},
     translations, wifi,
 };
@@ -77,7 +77,7 @@ pub(super) fn uninstall(
     }
     for file in efi::INSTALLED
         .iter()
-        .chain([&CHOICES_PATH, &wifi::KEY_PATH])
+        .chain([&CHOICES_PATH, &IDENTITY_PATH, &wifi::KEY_PATH])
     {
         if esp.join(file).is_file() {
             writeln!(text, "  remove   {}", esp.join(file).display())?;
@@ -100,7 +100,7 @@ pub(super) fn uninstall(
         fs::remove_dir_all(directory)
             .with_context(|| format!("cannot remove {}", directory.display()))?;
     }
-    for file in [CHOICES_PATH, wifi::KEY_PATH] {
+    for file in [CHOICES_PATH, IDENTITY_PATH, wifi::KEY_PATH] {
         if esp.join(file).is_file() {
             fs::remove_file(esp.join(file))?;
         }

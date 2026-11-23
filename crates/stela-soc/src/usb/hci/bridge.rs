@@ -78,15 +78,36 @@ pub enum Cause {
     /// (Vol 4 Part E 7.7.16): its firmware has failed, and whatever it was
     /// running is lost.
     HardwareError(u8),
-    /// bluetoothd reset the controller [`RESTARTS`] times after its
-    /// start-up: it restarts so when it rejects the bring-up's answers, and
-    /// Setup's first screen waits for it.
+    /// bluetoothd reset the controller [`RESTARTS`] times in a row, each
+    /// within [`SETTLED`] of the start before it: it restarts so when it
+    /// rejects the bring-up's answers, and Setup's first screen waits for
+    /// it.
     Restarted,
 }
 
-/// HCI Resets after the start-up's first answered one at which the bridge
-/// falls back: one restart passes, the second is the model's.
+/// HCI Resets in a row after an answered one, each within [`SETTLED`] of
+/// the last answered one, at which the bridge falls back: one restart
+/// passes, the second is the model's.
 pub const RESTARTS: u64 = 2;
+
+/// System counts after the controller answered an HCI Reset past which the
+/// guest's next HCI Reset starts the count of [`RESTARTS`] again: one
+/// minute.
+///
+/// A bluetoothd that rejects its bring-up exits, and launchd starts it again
+/// no sooner than its throttle interval (`ThrottleInterval`, 10 s by
+/// default, `launchd.plist(5)`); the bring-up it then runs takes at most a
+/// [`DEADLINE`] a command. So a restart loop resets the controller well
+/// within a minute of the start before. Bluetooth turned off and on in
+/// System Settings, or a sleep and wake, each sends one HCI Reset after a
+/// session that ran longer, and is a start of its own: without this, the
+/// boot's second of them fell back. The bias is toward the loop: a loop
+/// missed leaves Setup waiting on bluetoothd, a session counted as a
+/// restart only gives the guest the model.
+pub const SETTLED: u64 = 60 * FREQUENCY_HZ;
+
+/// [`SETTLED`] in seconds, as the log says it.
+pub const SETTLED_S: u64 = SETTLED / FREQUENCY_HZ;
 
 /// [`DEADLINE`] in milliseconds, as the log says it.
 pub const DEADLINE_MS: u64 = DEADLINE * 1000 / FREQUENCY_HZ;
@@ -103,8 +124,8 @@ impl fmt::Display for Cause {
             }
             Self::Restarted => write!(
                 f,
-                "bluetoothd reset the controller {RESTARTS} times after its start-up, \
-                 as it does when it rejects the bring-up"
+                "bluetoothd reset the controller {RESTARTS} times in a row, each within \
+                 {SETTLED_S} s of its start, as it does when it rejects the bring-up"
             ),
         }
     }
@@ -141,6 +162,9 @@ pub struct Counters {
     pub dropped: u64,
     /// HCI Resets of the guest after the first the controller answered.
     pub restarts: u64,
+    /// Those of them in a row, each within [`SETTLED`] of the controller's
+    /// last answered HCI Reset: at [`RESTARTS`] the bridge falls back.
+    pub streak: u64,
 }
 
 /// The forwarded command in flight.
@@ -176,6 +200,8 @@ pub struct Bridge {
     running: Vec<Running>,
     /// Whether the controller answered an HCI Reset: the start-up ran.
     started: bool,
+    /// The system count at which the controller last answered an HCI Reset.
+    last_start: u64,
     /// The commands the controller takes now, as its last Command Complete
     /// or Command Status said (Num_HCI_Command_Packets, Vol 4 Part E 4.4).
     credits: u8,
@@ -281,6 +307,7 @@ impl Bridge {
             address_differs: false,
             running: Vec::new(),
             started: false,
+            last_start: 0,
             credits: 1,
             counters: Counters::default(),
         }
@@ -389,12 +416,17 @@ impl Bridge {
             deadline: now.saturating_add(DEADLINE),
             unsent: None,
         };
-        // A reset after the start-up is bluetoothd restarting; at the
-        // second, the model takes over, answering this reset. A reset ends
-        // the controller's procedures with no event.
+        // A reset soon after the last start is bluetoothd restarting; at
+        // the second in a row, the model takes over, answering this reset.
+        // One after a session that ran past `SETTLED` starts a new one.
+        // A reset ends the controller's procedures with no event.
         if pending.opcode == RESET && self.started {
             self.counters.restarts += 1;
-            if self.counters.restarts >= RESTARTS {
+            if now.saturating_sub(self.last_start) >= SETTLED {
+                self.counters.streak = 0;
+            }
+            self.counters.streak += 1;
+            if self.counters.streak >= RESTARTS {
                 self.running.clear();
                 self.pending = Some(pending);
                 return self.fall(Cause::Restarted, now);
@@ -561,6 +593,7 @@ impl Bridge {
             (RESET, _) if chip.status == 0 => {
                 self.running.clear();
                 self.started = true;
+                self.last_start = now;
             }
             _ => {}
         }

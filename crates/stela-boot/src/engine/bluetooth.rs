@@ -352,13 +352,13 @@ impl HostBluetooth {
         }
         let (fallback, lend, differs) = self.lend.unwrap_or_default();
         if lend.restarts > self.restarts {
+            use stela_soc::usb::hci::bridge::{RESTARTS, SETTLED_S};
             self.restarts = lend.restarts;
             output::arguments(format_args!(
                 "BLUETOOTH LEND bluetoothd reset the guest's controller after its start-up \
-                 ({} of {}); at {} the model takes over\n",
-                lend.restarts,
-                stela_soc::usb::hci::bridge::RESTARTS,
-                stela_soc::usb::hci::bridge::RESTARTS,
+                 (restart {}, {} of {RESTARTS} in a row); at {RESTARTS} in a row, each within \
+                 {SETTLED_S} s of the start before it, the model takes over\n",
+                lend.restarts, lend.streak,
             ));
         }
         if let Some(fallback) = fallback.filter(|_| !self.fell_back) {

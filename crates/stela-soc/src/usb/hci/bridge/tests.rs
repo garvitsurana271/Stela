@@ -660,11 +660,10 @@ fn the_causes_name_the_deadline_and_restarts_the_bridge_uses() {
         Cause::Timeout.to_string(),
         alloc::format!("no answer in {DEADLINE_MS} ms")
     );
-    assert!(
-        Cause::Restarted
-            .to_string()
-            .contains(&alloc::format!("controller {RESTARTS} times after"))
-    );
+    assert!(Cause::Restarted.to_string().contains(&alloc::format!(
+        "controller {RESTARTS} times in a row, each within {SETTLED_S} s"
+    )));
+    assert_eq!(SETTLED_S * FREQUENCY_HZ, SETTLED);
 }
 
 /// A fallback ends what the controller was running: the guest saw the
@@ -745,10 +744,13 @@ fn bluetoothd_restarting_twice_after_its_start_up_falls_back() {
     );
     assert_eq!(
         fallback.to_string(),
-        "0x0c03 bluetoothd reset the controller 2 times after its start-up, \
-         as it does when it rejects the bring-up"
+        "0x0c03 bluetoothd reset the controller 2 times in a row, each within 60 s \
+         of its start, as it does when it rejects the bring-up"
     );
-    assert_eq!(bridge.counters().restarts, 2);
+    assert_eq!(
+        (bridge.counters().restarts, bridge.counters().streak),
+        (2, 2)
+    );
     events(bridge.command(&packet(0x1009, &[]), 0));
     // Resets before the controller answered one are the start-up's own.
     let mut bridge = Bridge::new(ADDRESS);
@@ -763,6 +765,43 @@ fn bluetoothd_restarting_twice_after_its_start_up_falls_back() {
         );
     }
     assert_eq!((bridge.fallen(), bridge.counters().restarts), (None, 0));
+}
+
+/// Bluetooth turned off and on, or a sleep and wake, resets the controller
+/// once after a session that ran: each starts the count of restarts again,
+/// so any number of them keep the lend, while two quick restarts after one
+/// still fall back.
+#[test]
+fn a_reset_after_a_settled_session_starts_the_count_again() {
+    let mut bridge = Bridge::new(ADDRESS);
+    let reset = packet(0x0c03, &[]);
+    let mut now = 0;
+    // The start-up's reset.
+    chip(bridge.command(&reset, now));
+    events(bridge.chip_event(&complete(0x0c03, 1, 0, &[]), now));
+    // Five off/on cycles, each a minute or more after the last start.
+    for cycle in 1..=5 {
+        now += SETTLED;
+        assert_eq!(chip(bridge.command(&reset, now)), reset, "cycle {cycle}");
+        events(bridge.chip_event(&complete(0x0c03, 1, 0, &[]), now));
+        assert_eq!(bridge.fallen(), None, "cycle {cycle}");
+        assert_eq!(
+            (bridge.counters().restarts, bridge.counters().streak),
+            (cycle, 1)
+        );
+    }
+    // Then bluetoothd rejects the bring-up and restarts within the minute.
+    now += SETTLED - 1;
+    assert_eq!(
+        events(bridge.command(&reset, now)),
+        [complete(0x0c03, 1, 0, &[])]
+    );
+    assert_eq!(
+        bridge.fallen().map(|f| f.cause),
+        Some(Cause::Restarted),
+        "the model answers the second in a row"
+    );
+    assert_eq!(bridge.counters().streak, RESTARTS);
 }
 
 /// The controller's own command credits: a forwarded command waits until

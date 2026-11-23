@@ -719,6 +719,40 @@ fn a_fallback_ends_the_procedures_the_controller_was_running() {
     assert!(events(bridge.advance(u64::MAX)).is_empty());
 }
 
+/// An HCI Reset that falls back, by its deadline or refused, ends the
+/// controller's procedures with no event, as every reset does: the guest
+/// gets the reset's answer and no Inquiry Complete or Page Timeout after it.
+#[test]
+fn a_fallback_at_an_hci_reset_ends_the_procedures_with_no_event() {
+    let mut name = CHIP_ADDRESS.to_vec();
+    name.extend_from_slice(&[1, 0, 0, 0]);
+    let reset = packet(0x0c03, &[]);
+    for refused in [false, true] {
+        let mut bridge = Bridge::new(ADDRESS);
+        chip(bridge.command(&packet(0x0401, &[0x33, 0x8b, 0x9e, 8, 0]), 0));
+        events(bridge.chip_event(&status(0x0401, 1, 0), 0));
+        chip(bridge.command(&packet(0x0419, &name), 0));
+        events(bridge.chip_event(&status(0x0419, 1, 0), 0));
+        assert_eq!(chip(bridge.command(&reset, 10)), reset);
+        let answer = if refused {
+            events(bridge.chip_event(&complete(0x0c03, 1, 0x03, &[]), 20))
+        } else {
+            events(bridge.advance(10 + DEADLINE))
+        };
+        assert_eq!(answer, [complete(0x0c03, 1, 0, &[])], "refused: {refused}");
+        let cause = if refused {
+            Cause::Refused(0x03)
+        } else {
+            Cause::Timeout
+        };
+        assert_eq!(bridge.fallen().map(|f| f.cause), Some(cause));
+        assert!(
+            events(bridge.advance(u64::MAX)).is_empty(),
+            "refused: {refused}"
+        );
+    }
+}
+
 /// bluetoothd restarts, and resets its controller, when it rejects even a
 /// well-formed answer (reason 108), and Setup's first screen waits for it:
 /// a second restart after the start-up falls back, so the model answers it.

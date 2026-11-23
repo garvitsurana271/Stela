@@ -427,7 +427,6 @@ impl Bridge {
             }
             self.counters.streak += 1;
             if self.counters.streak >= RESTARTS {
-                self.running.clear();
                 self.pending = Some(pending);
                 return self.fall(Cause::Restarted, now);
             }
@@ -473,13 +472,18 @@ impl Bridge {
     /// command in flight, then the end of each procedure the controller was
     /// running (an inquiry completes, a name request times out), which the
     /// shadow then no longer runs, and the commands that waited are the
-    /// shadow's.
+    /// shadow's. An HCI Reset in flight, whatever the cause, ends those
+    /// procedures with no event: the shadow ran it, and the guest gets its
+    /// answer.
     fn fall(&mut self, cause: Cause, now: u64) -> Vec<Step> {
         let pending = self.pending.take();
         self.fallen.get_or_insert(Fallback {
             opcode: pending.as_ref().map(|p| p.opcode),
             cause,
         });
+        if pending.as_ref().is_some_and(|p| p.opcode == RESET) {
+            self.running.clear();
+        }
         let mut steps = pending.map(|p| guest(p.shadow)).unwrap_or_default();
         for running in core::mem::take(&mut self.running) {
             let end = match running {

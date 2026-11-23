@@ -682,9 +682,17 @@ fn plain_nodes(text: &str) -> alloc::string::String {
             kept.push(arguments(2));
         } else if node.starts_with("NVMe(") {
             kept.push(arguments(1));
-        } else if ["USB(", "UsbClass(", "Sata(", "Scsi(", "SD(", "eMMC("]
-            .iter()
-            .any(|prefix| node.starts_with(prefix))
+        } else if [
+            "USB(",
+            "UsbClass(",
+            "Unit(",
+            "Sata(",
+            "Scsi(",
+            "SD(",
+            "eMMC(",
+        ]
+        .iter()
+        .any(|prefix| node.starts_with(prefix))
         {
             kept.push(alloc::string::String::from(node));
         }

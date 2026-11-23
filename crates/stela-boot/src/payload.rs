@@ -430,11 +430,36 @@ fn identify_text(bytes: &[u8]) -> Option<String> {
 /// bus reads it after the firmware has exited, which finds the disk by it.
 /// SCSI disks' unit serial numbers (VPD page 0x80) are not read: no driver
 /// of Stela's reads them, so a disk named by one could not be found again.
+/// A USB device's logical unit other than 0 is named apart from unit 0,
+/// as Stela's USB driver names it (`chosen_disk::usb_unit_serial`): every
+/// unit of one device reads that device's serial number string.
 pub(crate) fn disk_serial(handle: Handle, path: &str) -> Option<String> {
-    nvme_identify(path)
+    let serial = nvme_identify(path)
         .and_then(|data| identify_text(data.get(NVME_SERIAL)?))
         .or_else(|| ata_text(handle, ATA_SERIAL))
-        .or_else(|| usb_string(path, |device| device.str_serial_number))
+        .or_else(|| usb_string(path, |device| device.str_serial_number))?;
+    Some(stela_boot_core::chosen_disk::usb_unit_serial(
+        &serial,
+        usb_unit(handle),
+    ))
+}
+
+/// The logical unit of the USB device a disk is, as its device path names
+/// it (`chosen_disk::usb_unit`); `None` for a disk on another bus.
+pub(crate) fn usb_unit(handle: Handle) -> Option<u64> {
+    // SAFETY: the path is only read, while no driver changes this handle.
+    let path = unsafe {
+        boot::open_protocol::<DevicePath>(
+            OpenProtocolParams {
+                handle,
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+    }
+    .ok()?;
+    stela_boot_core::chosen_disk::usb_unit(path.as_bytes())
 }
 
 /// A whole disk's model name, from the same sources as [`disk_serial`]

@@ -30,7 +30,9 @@ use crate::{
     choice::{self, Press, Wait},
     console::{Framebuffer, font},
     output,
-    payload::{Aligned, device_path, disk_model, disk_rotation, disk_serial, serial_sources},
+    payload::{
+        Aligned, device_path, disk_model, disk_rotation, disk_serial, serial_sources, usb_unit,
+    },
     ui::{self, Canvas},
 };
 use alloc::string::ToString;
@@ -74,6 +76,11 @@ struct Disk {
     table: Option<Table>,
     /// Data without a GPT, which only erasing the disk replaces.
     foreign: bool,
+    /// The logical unit of the USB device it is (`chosen_disk::usb_unit`).
+    unit: Option<u64>,
+    /// Where the firmware found it, without identifiers
+    /// (`pci_io::disk_location`), for the log.
+    location: String,
     /// Why it cannot take macOS, when it cannot.
     refusal: Option<&'static str>,
     /// Its nominal rotation rate, as it reports it.
@@ -275,12 +282,14 @@ pub fn choose() -> Option<Plan> {
     };
     for disk in &picker.disks {
         output::arguments(format_args!(
-            "INSTALLER disk {} {} serial={} bytes={} rotation={} random_us={} \
-             sequential_kib_s={} table={} refusal={:?}\n",
+            "INSTALLER disk {} {} serial={} bytes={} block_bytes={} path={:?} rotation={} \
+             random_us={} sequential_kib_s={} table={} refusal={:?}\n",
             disk.bus,
             disk.model,
             stela_contracts::masked::Tail(disk.serial.as_deref().unwrap_or_default()),
             disk.bytes(),
+            disk.geometry.block_bytes,
+            disk.location,
             disk.rotation,
             disk.speed.map_or(0, |speed| speed.random_us),
             disk.speed.map_or(0, |speed| speed.sequential_kib_s),
@@ -649,6 +658,8 @@ fn disks() -> Vec<Disk> {
             serial,
             table: None,
             foreign: false,
+            unit: usb_unit(handle),
+            location: crate::pci_io::disk_location(handle).unwrap_or_else(|| "unknown".into()),
             refusal: None,
             rotation,
             speed: None,
@@ -676,6 +687,7 @@ fn disks() -> Vec<Disk> {
             serial: disk.serial.as_deref(),
             bytes: disk.bytes(),
             controller: disk.refusal,
+            unit: disk.unit,
         })
         .collect();
     let refusals: Vec<_> = (0..disks.len())

@@ -147,6 +147,10 @@ pub struct Candidate<'a> {
     pub bytes: u64,
     /// Why Stela's own drivers cannot reach its controller.
     pub controller: Option<&'static str>,
+    /// The logical unit of the USB device it is, from its device path
+    /// ([`usb_unit`]); `None` for a disk on another bus, or a USB device
+    /// whose path names no unit.
+    pub unit: Option<u64>,
 }
 
 /// The picker's refusal of a disk whose serial another listed disk also
@@ -155,9 +159,75 @@ pub struct Candidate<'a> {
 /// ([`Search::SeveralDisks`]), so the install would stop.
 pub const SAME_SERIAL: &str = "Same serial as another disk";
 
+/// The picker's refusal of a USB device's logical unit other than 0: a
+/// bridge's phantom unit, which may read and write unit 0's medium, or a
+/// card reader's further slot. Stela's own USB driver names such a unit
+/// differently from the firmware once it has exited (UAS by its 8-byte
+/// address), so it could not be found again either.
+pub const EXTRA_UNIT: &str = "Extra unit of a USB device";
+
+/// The serial a USB disk at logical unit `unit` is named by, as Stela's
+/// own USB mass-storage driver names it (`stela_drivers::usb::storage`):
+/// unit 0, or a path naming no unit, keeps the device's serial; any other
+/// unit `n` is `{serial}:lun{n}`, in decimal as the driver's BOT units are.
+pub fn usb_unit_serial(serial: &str, unit: Option<u64>) -> alloc::string::String {
+    match unit {
+        Some(unit) if unit != 0 => alloc::format!("{serial}:lun{unit}"),
+        _ => serial.into(),
+    }
+}
+
+/// UEFI device path node types and sub-types (UEFI 2.10 section 10.3).
+const MESSAGING: u8 = 0x03;
+const MESSAGING_SCSI: u8 = 0x02;
+const MESSAGING_USB: u8 = 0x05;
+const MESSAGING_USB_CLASS: u8 = 0x0f;
+const MESSAGING_USB_WWID: u8 = 0x10;
+const MESSAGING_LOGICAL_UNIT: u8 = 0x11;
+const END: u8 = 0x7f;
+
+/// The logical unit a USB disk's binary device path names after its last
+/// USB node: the last Logical Unit node's LUN (edk2's mass-storage driver
+/// adds one per unit of a device with several), or a SCSI node's LUN (a
+/// vendor UAS stack under SCSI pass-through). `None` when the path has no
+/// USB node, no unit node after it, or a malformed node, so the disk keeps
+/// the device's serial and two such disks still refuse each other
+/// ([`SAME_SERIAL`]).
+pub fn usb_unit(path: &[u8]) -> Option<u64> {
+    let mut rest = path;
+    let mut usb = false;
+    let mut unit = None;
+    loop {
+        let [kind, sub, low, high, ..] = *rest else {
+            return None;
+        };
+        let length = usize::from(u16::from_le_bytes([low, high]));
+        if length < 4 || length > rest.len() {
+            return None;
+        }
+        let data = &rest[4..length];
+        match (kind, sub) {
+            (END, _) => break,
+            (MESSAGING, MESSAGING_USB | MESSAGING_USB_CLASS | MESSAGING_USB_WWID) => {
+                usb = true;
+                unit = None;
+            }
+            (MESSAGING, MESSAGING_LOGICAL_UNIT) if usb => unit = Some(u64::from(*data.first()?)),
+            (MESSAGING, MESSAGING_SCSI) if usb => {
+                let lun = data.get(2..4)?;
+                unit = Some(u64::from(u16::from_le_bytes([lun[0], lun[1]])));
+            }
+            _ => {}
+        }
+        rest = &rest[length..];
+    }
+    unit
+}
+
 /// Why the picker refuses disk `index` of `disks`, which it shows by the
-/// disk; `None` when it can be chosen. A disk Stela's drivers cannot reach
-/// or cannot find again by its serial is refused before its size is.
+/// disk; `None` when it can be chosen. A disk Stela's drivers cannot reach,
+/// a USB device's extra unit, or a disk Stela cannot find again by its
+/// serial is refused before its size is.
 pub fn picker_refusal(
     disks: &[Candidate<'_>],
     index: usize,
@@ -166,6 +236,9 @@ pub fn picker_refusal(
     let disk = disks.get(index)?;
     if disk.controller.is_some() {
         return disk.controller;
+    }
+    if disk.unit.is_some_and(|unit| unit != 0) {
+        return Some(EXTRA_UNIT);
     }
     let shared = |serial: &str| {
         disks
@@ -234,6 +307,7 @@ mod tests {
             serial: Some("WD-1"),
             bytes: 1_000_000_000_000,
             controller: None,
+            unit: None,
         }];
         assert_eq!(picker_refusal(&disks, 0, 60_000_000_000), None);
     }
@@ -295,6 +369,7 @@ mod tests {
             serial,
             bytes,
             controller: None,
+            unit: None,
         };
         // Two disks behind one USB-SATA bridge, or a cloned NVMe disk,
         // report one serial: neither can be chosen; the third can.
@@ -335,6 +410,148 @@ mod tests {
         // No serial is shared by two disks that report none.
         let unknown = [disk(None, 1), disk(None, 1)];
         assert_eq!(picker_refusal(&unknown, 0, MIN), Some("No serial number"));
+    }
+
+    #[test]
+    fn a_usb_unit_other_than_zero_is_named_as_stelas_driver_names_it() {
+        // `stela_drivers::usb::storage` names BOT unit n `{serial}:lun{n}`.
+        assert_eq!(usb_unit_serial("ABC", None), "ABC");
+        assert_eq!(usb_unit_serial("ABC", Some(0)), "ABC");
+        assert_eq!(usb_unit_serial("ABC", Some(1)), "ABC:lun1");
+        assert_eq!(usb_unit_serial("ABC", Some(15)), "ABC:lun15");
+    }
+
+    #[test]
+    fn a_usb_bridges_phantom_unit_is_refused_and_its_real_disk_can_be_chosen() {
+        const MIN: u64 = 60_000_000_000;
+        let usb = |serial: Option<&'static str>, bytes: u64, unit: Option<u64>| Candidate {
+            serial,
+            bytes,
+            controller: None,
+            unit,
+        };
+        // A bridge whose firmware driver publishes LUN 1 beside the real
+        // disk: the same USB serial, named apart by its unit, with the junk
+        // capacity of a unit that is not there (64 TiB).
+        let phantom = [
+            usb(Some("ABC"), 1_000_000_000_000, Some(0)),
+            usb(Some("ABC:lun1"), 1 << 46, Some(1)),
+        ];
+        let refusals: Vec<_> = (0..phantom.len())
+            .map(|index| picker_refusal(&phantom, index, MIN))
+            .collect();
+        assert_eq!(refusals, [None, Some(EXTRA_UNIT)]);
+        // An extra unit is refused as one even when it is named alike, has
+        // no serial or is too small: no other reason makes it choosable,
+        // and the reasons keep their order.
+        for extra in [
+            usb(Some("ABC"), 1 << 46, Some(1)),
+            usb(None, 1 << 46, Some(1)),
+            usb(Some("A B"), 1 << 46, Some(2)),
+            usb(Some("ABC:lun1"), 1, Some(1)),
+        ] {
+            let disks = [usb(Some("XYZ"), 1_000_000_000_000, Some(0)), extra];
+            assert_eq!(picker_refusal(&disks, 1, MIN), Some(EXTRA_UNIT));
+        }
+        // The controller's refusal still comes first.
+        let unreachable = [Candidate {
+            controller: Some("Controller not supported"),
+            ..usb(Some("ABC:lun1"), 1 << 46, Some(1))
+        }];
+        assert_eq!(
+            picker_refusal(&unreachable, 0, MIN),
+            Some("Controller not supported")
+        );
+        // Two different devices that report one serial and name no unit,
+        // or two handles with one path, still refuse each other.
+        for unit in [None, Some(0)] {
+            let twins = [
+                usb(Some("ABC"), 1_000_000_000_000, unit),
+                usb(Some("ABC"), 500_000_000_000, unit),
+            ];
+            let refusals: Vec<_> = (0..twins.len())
+                .map(|index| picker_refusal(&twins, index, MIN))
+                .collect();
+            assert_eq!(refusals, [Some(SAME_SERIAL), Some(SAME_SERIAL)]);
+        }
+    }
+
+    /// A device path node of `kind`/`sub` with `data`.
+    fn node(kind: u8, sub: u8, data: &[u8]) -> Vec<u8> {
+        let mut node = vec![kind, sub];
+        node.extend_from_slice(&(4 + data.len() as u16).to_le_bytes());
+        node.extend_from_slice(data);
+        node
+    }
+
+    /// `PciRoot(0x0)/Pci(0x14,0x0)/USB(0x3,0x0)` followed by `tail` and
+    /// the end node.
+    fn usb_path(tail: &[Vec<u8>]) -> Vec<u8> {
+        let mut path = node(0x02, 0x01, &[0xd0, 0x41, 0x03, 0x0a, 0, 0, 0, 0]);
+        path.extend(node(0x01, 0x01, &[0x00, 0x14]));
+        path.extend(node(MESSAGING, MESSAGING_USB, &[3, 0]));
+        for tail in tail {
+            path.extend_from_slice(tail);
+        }
+        path.extend(node(END, 0xff, &[]));
+        path
+    }
+
+    #[test]
+    fn a_usb_disks_unit_is_read_from_its_device_path() {
+        let unit = |lun: u8| node(MESSAGING, MESSAGING_LOGICAL_UNIT, &[lun]);
+        let scsi = |pun: u16, lun: u16| {
+            let mut data = pun.to_le_bytes().to_vec();
+            data.extend_from_slice(&lun.to_le_bytes());
+            node(MESSAGING, MESSAGING_SCSI, &data)
+        };
+        assert_eq!(usb_unit(&usb_path(&[unit(1)])), Some(1));
+        assert_eq!(usb_unit(&usb_path(&[unit(0)])), Some(0));
+        assert_eq!(usb_unit(&usb_path(&[])), None);
+        assert_eq!(usb_unit(&usb_path(&[scsi(0, 1)])), Some(1));
+        assert_eq!(usb_unit(&usb_path(&[scsi(0, 0)])), Some(0));
+        // The last unit node counts.
+        assert_eq!(usb_unit(&usb_path(&[unit(0), unit(2)])), Some(2));
+        // A unit before the USB node is not the USB device's: a USB
+        // controller behind a SCSI one names no unit of its own.
+        let mut before = node(MESSAGING, MESSAGING_LOGICAL_UNIT, &[1]);
+        before.extend(node(MESSAGING, MESSAGING_USB, &[3, 0]));
+        before.extend(node(END, 0xff, &[]));
+        assert_eq!(usb_unit(&before), None);
+        // A hub's port: the unit belongs to the device after the last USB
+        // node, and one before it is forgotten.
+        let hub = usb_path(&[unit(1), node(MESSAGING, MESSAGING_USB, &[2, 0])]);
+        assert_eq!(usb_unit(&hub), None);
+        let hub = usb_path(&[node(MESSAGING, MESSAGING_USB, &[2, 0]), unit(1)]);
+        assert_eq!(usb_unit(&hub), Some(1));
+        // USB WWID and class nodes are USB devices too.
+        let mut wwid = node(MESSAGING, MESSAGING_USB_WWID, &[0; 6]);
+        wwid.extend(unit(1));
+        wwid.extend(node(END, 0xff, &[]));
+        assert_eq!(usb_unit(&wwid), Some(1));
+        // No USB node: a SATA or SCSI disk's unit is not read.
+        let mut sata = node(0x02, 0x01, &[0xd0, 0x41, 0x03, 0x0a, 0, 0, 0, 0]);
+        sata.extend(scsi(0, 1));
+        sata.extend(node(END, 0xff, &[]));
+        assert_eq!(usb_unit(&sata), None);
+        // A malformed path names no unit: a node shorter than its header,
+        // one longer than the path, a unit node without its LUN, or no end.
+        let mut short = usb_path(&[unit(1)]);
+        let at = short.len() - 9;
+        short[at + 2] = 3;
+        assert_eq!(usb_unit(&short), None);
+        let mut long = usb_path(&[unit(1)]);
+        let at = long.len() - 9;
+        long[at + 2] = 200;
+        assert_eq!(usb_unit(&long), None);
+        assert_eq!(
+            usb_unit(&usb_path(&[node(MESSAGING, MESSAGING_LOGICAL_UNIT, &[])])),
+            None
+        );
+        let mut endless = usb_path(&[unit(1)]);
+        endless.truncate(endless.len() - 4);
+        assert_eq!(usb_unit(&endless), None);
+        assert_eq!(usb_unit(&[]), None);
     }
 
     #[test]

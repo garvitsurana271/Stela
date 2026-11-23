@@ -521,9 +521,43 @@ impl RetainedResources for BspSource<'_> {
     }
 }
 
+/// The properties of the node at `path` the loader may have retired as board
+/// claims of hardware no PC has (`board::UNMODELED_BOARD_CLAIMS`): a source
+/// check lets them go, and holds the rest of the node.
+fn retired_claims(path: &str) -> Vec<&'static str> {
+    board::UNMODELED_BOARD_CLAIMS
+        .iter()
+        .filter(|(node, _)| *node == path)
+        .map(|(_, name)| *name)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retired_notch_claim_is_the_only_product_property_that_may_go() {
+        use stela_contracts::adt::encode;
+        let name: &[u8] = b"MacBook Air\0";
+        let claimed = encode(
+            &[
+                ("product-name", name),
+                ("partially-occluded-display", &1u32.to_le_bytes()),
+            ],
+            &[],
+        );
+        let retired = encode(&[("product-name", name)], &[]);
+        let renamed = encode(&[("partially-occluded-display", &1u32.to_le_bytes())], &[]);
+        let source = Node::root(&claimed).unwrap();
+        let claims = retired_claims("/product");
+        assert_eq!(claims, ["partially-occluded-display"]);
+        assert!(retained(&source, &Node::root(&retired).unwrap(), &claims).is_ok());
+        assert!(retained(&source, &Node::root(&retired).unwrap(), &[]).is_err());
+        assert!(retained(&source, &Node::root(&renamed).unwrap(), &claims).is_err());
+        assert!(retired_claims("/arm-io").is_empty());
+    }
+
     #[test]
     fn source_retention_distinguishes_fill_in_recipes_from_structural_values() {
         use stela_contracts::adt::encode;

@@ -78,7 +78,9 @@ impl<'a> BspSource<'a> {
         let prepared_product = adapted
             .child("product")
             .ok_or(refuse!("assigned prepared source lacks product"))?;
-        retained(&product, &prepared_product, &[])?;
+        // A MacBook Air tree's notch claim is retired by the loader; the
+        // rest of `/product` is held to the original.
+        retained(&product, &prepared_product, &retired_claims("/product"))?;
         let io = root
             .child("arm-io")
             .ok_or(refuse!("assigned source lacks arm-io"))?;

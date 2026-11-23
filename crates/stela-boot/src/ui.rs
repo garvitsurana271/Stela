@@ -8,6 +8,8 @@
 //! shown at once.
 use crate::console::{Framebuffer, font::Font};
 use alloc::{vec, vec::Vec};
+use core::cell::RefCell;
+use stela_boot_core::screen::{self, LogoCache};
 
 pub const BACKGROUND: u32 = 0x18191c;
 pub const CARD: u32 = 0x222428;
@@ -24,6 +26,14 @@ pub const HEADER: usize = 88;
 const LOGO: usize = 32;
 const NAME: &str = "Stambha";
 pub use stela_boot_core::screen::scale;
+
+/// The logo as the header last drew it, kept from page to page: one
+/// processor draws the pages, and a page that finds it in use draws its own.
+struct Cached(RefCell<LogoCache>);
+// SAFETY: see `Cached`.
+unsafe impl Sync for Cached {}
+
+static LOGO_IMAGE: Cached = Cached(RefCell::new(LogoCache::new()));
 
 /// A page drawn in memory and shown at once.
 pub struct Canvas {
@@ -147,33 +157,27 @@ impl Canvas {
     }
 
     /// The logo, `size` units square from (`x`, `y`), smoothed by sampling
-    /// each pixel four by four.
+    /// each pixel four by four; made once for its size ([`LOGO_IMAGE`]).
     fn logo(&mut self, x: usize, y: usize, size: usize) {
-        const SAMPLES: usize = 4;
         let side = size * self.scale;
         let (x, y) = (x * self.scale, y * self.scale);
-        for py in 0..side {
-            for px in 0..side {
-                let mut sum = [0u32; 3];
-                for sy in 0..SAMPLES {
-                    for sx in 0..SAMPLES {
-                        let colour = stela_boot_core::screen::logo_pixel(
-                            (px * SAMPLES + sx) as u32,
-                            (py * SAMPLES + sy) as u32,
-                            (side * SAMPLES) as u32,
-                        )
-                        .unwrap_or(BACKGROUND);
-                        for (channel, total) in sum.iter_mut().enumerate() {
-                            *total += (colour >> (16 - 8 * channel)) & 0xff;
-                        }
-                    }
-                }
-                let n = (SAMPLES * SAMPLES) as u32;
-                let colour = sum
-                    .iter()
-                    .fold(0, |pixel, total| (pixel << 8) | ((total + n / 2) / n));
-                self.device_fill(x + px, y + py, 1, 1, colour);
+        let made;
+        let mut cache = LOGO_IMAGE.0.try_borrow_mut();
+        let image: &[u32] = match cache.as_mut() {
+            Ok(cache) => cache.get(side, BACKGROUND),
+            // In use, which one processor drawing one page never finds.
+            Err(_) => {
+                made = screen::logo_image(side, BACKGROUND);
+                &made
             }
+        };
+        let right = (x + side).min(self.width);
+        for (row, pixels) in image.chunks(side.max(1)).enumerate() {
+            if y + row >= self.height || x >= right {
+                break;
+            }
+            let start = (y + row) * self.width + x;
+            self.pixels[start..start + right - x].copy_from_slice(&pixels[..right - x]);
         }
     }
 

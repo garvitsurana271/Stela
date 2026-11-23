@@ -1,5 +1,5 @@
 //! Geometry, colours and text the mount's screens compute before drawing.
-use alloc::{format, string::String};
+use alloc::{format, string::String, vec::Vec};
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, AtomicU8, Ordering},
@@ -226,6 +226,75 @@ pub fn logo_pixel(x: u32, y: u32, side: u32) -> Option<u32> {
         true => mix(colour, 0xfff1c9, 45, 100),
         false => colour,
     })
+}
+
+/// Samples a side of each pixel of [`logo_image`]: four by four.
+const LOGO_SAMPLES: usize = 4;
+
+/// The logo `side` pixels square, row by row, as the boot screen shows it:
+/// each pixel the mean of [`LOGO_SAMPLES`] by [`LOGO_SAMPLES`] samples of
+/// [`logo_pixel`], `background` outside the tile's rounded corners.
+pub fn logo_image(side: usize, background: u32) -> Vec<u32> {
+    let mut pixels = Vec::with_capacity(side * side);
+    let samples = (side * LOGO_SAMPLES) as u32;
+    let n = (LOGO_SAMPLES * LOGO_SAMPLES) as u32;
+    for py in 0..side {
+        for px in 0..side {
+            let mut sum = [0u32; 3];
+            for sy in 0..LOGO_SAMPLES {
+                for sx in 0..LOGO_SAMPLES {
+                    let colour = logo_pixel(
+                        (px * LOGO_SAMPLES + sx) as u32,
+                        (py * LOGO_SAMPLES + sy) as u32,
+                        samples,
+                    )
+                    .unwrap_or(background);
+                    for (channel, total) in sum.iter_mut().enumerate() {
+                        *total += (colour >> (16 - 8 * channel)) & 0xff;
+                    }
+                }
+            }
+            pixels.push(
+                sum.iter()
+                    .fold(0, |pixel, total| (pixel << 8) | ((total + n / 2) / n)),
+            );
+        }
+    }
+    pixels
+}
+
+/// [`logo_image`] made once for the size and background it is shown at.
+/// Each sample walks the pillar's outlines, 16 a pixel, which took 14 to
+/// 24 ms a logo at 4K; the header is drawn at one size a screen, again on
+/// every key press of the menu, the Wi-Fi page and the disk picker.
+#[derive(Debug, Default)]
+pub struct LogoCache {
+    image: Option<(usize, u32, Vec<u32>)>,
+    /// Images made, for the tests.
+    made: u32,
+}
+
+impl LogoCache {
+    pub const fn new() -> Self {
+        Self {
+            image: None,
+            made: 0,
+        }
+    }
+
+    /// The logo `side` pixels square over `background`, made only when the
+    /// last one asked for was of another size or background.
+    pub fn get(&mut self, side: usize, background: u32) -> &[u32] {
+        let made = &mut self.made;
+        let image = self
+            .image
+            .take_if(|(s, b, _)| (*s, *b) == (side, background))
+            .unwrap_or_else(|| {
+                *made += 1;
+                (side, background, logo_image(side, background))
+            });
+        &self.image.insert(image).2
+    }
 }
 
 /// The icon's square in tenths of its 1024 units.
@@ -547,8 +616,9 @@ mod tests {
         assert!(!tile(at(350, 800)));
     }
 
-    /// The logo `side` pixels square, as `stela-boot`'s `ui::Canvas` draws
-    /// it: four by four samples a pixel, `ui::BACKGROUND` outside the tile.
+    /// The logo `side` pixels square, as `stela-boot`'s `ui::Canvas` drew
+    /// it before [`LogoCache`]: four by four samples a pixel,
+    /// `ui::BACKGROUND` outside the tile.
     fn drawn(side: usize) -> Vec<u32> {
         const SAMPLES: usize = 4;
         let mut pixels = Vec::new();
@@ -576,6 +646,21 @@ mod tests {
             }
         }
         pixels
+    }
+
+    /// The cache makes the logo once for each size and background in turn,
+    /// the same pixels the header drew each time before it.
+    #[test]
+    fn the_logo_is_made_once_for_its_size() {
+        let mut cache = LogoCache::new();
+        for _ in 0..3 {
+            assert_eq!(cache.get(96, BACKGROUND), &drawn(96)[..]);
+        }
+        assert_eq!(cache.made, 1);
+        assert_eq!(cache.get(32, BACKGROUND), &drawn(32)[..]);
+        assert_eq!(cache.get(32, TEXT), &logo_image(32, TEXT)[..]);
+        assert_eq!(cache.get(32, TEXT).len(), 32 * 32);
+        assert_eq!(cache.made, 3);
     }
 
     /// `ui::BACKGROUND` and `ui::TEXT`.

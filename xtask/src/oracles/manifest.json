@@ -3369,6 +3369,36 @@
   },
   {
     "package": "stela-loader",
+    "test": "the_engine_builds_a_board_from_the_prepared_j413_tree",
+    "source": "crates/stela-loader/src/boot_bundle/tests/j413.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_TEST_PERSONA_ADT_DIR"
+    ],
+    "reason": "requires the decoded 26B123 J473AP and J413AP DeviceTrees (j473.adt, j413.adt, digest-pinned) through STELA_TEST_PERSONA_ADT_DIR"
+  },
+  {
+    "package": "stela-loader",
+    "test": "the_mac_mini_tree_prepares_as_it_did_before_the_persona",
+    "source": "crates/stela-loader/src/boot_bundle/tests/j413.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_TEST_PERSONA_ADT_DIR"
+    ],
+    "reason": "requires the decoded 26B123 J473AP DeviceTree (j473.adt, digest-pinned) through STELA_TEST_PERSONA_ADT_DIR"
+  },
+  {
+    "package": "stela-loader",
+    "test": "j413_admits_what_j473_admits",
+    "source": "crates/stela-loader/src/boot_bundle/tests/j413.rs",
+    "kind": "oracle",
+    "inputs": [
+      "STELA_TEST_PERSONA_ADT_DIR"
+    ],
+    "reason": "requires the decoded 26B123 J473AP and J413AP DeviceTrees (j473.adt, j413.adt, digest-pinned) through STELA_TEST_PERSONA_ADT_DIR"
+  },
+  {
+    "package": "stela-loader",
     "test": "original_direct_memory_preserves_source_while_pmp_dma_stays_hidden",
     "source": "crates/stela-loader/src/devices/tests.rs",
     "kind": "oracle",

@@ -38,6 +38,10 @@ struct Unit {
     descriptor_sense: bool,
     /// Spun down until START STOP UNIT starts it.
     stopped: bool,
+    /// INQUIRY byte 0: the peripheral qualifier and device type.
+    peripheral: u8,
+    /// A READ CAPACITY(10) reply in place of the medium's own.
+    capacity10: Option<[u8; 8]>,
 }
 struct Command {
     lun: u8,
@@ -280,6 +284,7 @@ impl Io for Model {
                 match cdb[0] {
                     0x12 => {
                         payload = vec![0; 36];
+                        payload[0] = u.peripheral;
                         payload[1] = 0x80;
                         payload[4] = 31;
                         payload[8..16].copy_from_slice(b"STELA   ");
@@ -321,6 +326,9 @@ impl Io for Model {
                         };
                         payload[..4].copy_from_slice(&last.to_be_bytes());
                         payload[4..8].copy_from_slice(&512u32.to_be_bytes());
+                        if let Some(reply) = u.capacity10 {
+                            payload = reply.to_vec();
+                        }
                     }
                     0x9e => {
                         payload = vec![0; 32];
@@ -517,6 +525,8 @@ fn unit(byte: u8) -> Option<Unit> {
         huge: false,
         descriptor_sense: false,
         stopped: false,
+        peripheral: 0,
+        capacity10: None,
     })
 }
 fn model(start: u64, end: u64, units: Vec<Option<Unit>>) -> Model {
@@ -1533,6 +1543,58 @@ fn discovery_reports_empty_slots_and_publishes_only_ready_units() {
             )
         ]
     );
+}
+/// A bridge's phantom LUN 1 beside its real disk (a firmware driver that
+/// checks only INQUIRY's device type publishes it, with junk capacity).
+/// Stela's driver checks the qualifier too, and names every unit but 0
+/// apart, so it never lists two disks with one serial (the installer's
+/// firmware-side picker names them as it does: `chosen_disk::usb_unit_serial`).
+#[test]
+fn a_phantom_second_lun_is_never_a_second_disk_with_the_same_serial() {
+    // FF FF FF FE blocks of 16 KiB: the ~64 TiB the firmware reported.
+    const JUNK: [u8; 8] = [0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x40, 0x00];
+    for aliased in [false, true] {
+        let mut memory = vec![0u64; 32 * 1024];
+        let start = memory.as_mut_ptr() as u64;
+        let mut dma = dma(&mut memory);
+        let mut phantom = unit(1).unwrap();
+        if !aliased {
+            // Qualifier 001b ("not connected"), type 0 (direct access).
+            phantom.peripheral = 0x20;
+            phantom.capacity10 = Some(JUNK);
+        }
+        let io = model(
+            start,
+            start + memory.len() as u64 * 8,
+            vec![unit(0), Some(phantom)],
+        );
+        let bot = Rc::new(RefCell::new(
+            Bot::new(io, 3, endpoints(), &mut dma).unwrap(),
+        ));
+        assert_eq!(bot.borrow().max_lun(), 1);
+        let mut failures = Vec::new();
+        let disks =
+            super::super::discover_units(bot, "ssd interface 0", "serial", &mut failures).unwrap();
+        let serials: Vec<_> = disks.iter().map(|d| d.identity.serial.as_str()).collect();
+        if aliased {
+            // A bridge that ignores the LUN field answers LUN 1 as LUN 0:
+            // two disks, named apart.
+            assert_eq!(serials, ["serial", "serial:lun1"]);
+            assert!(failures.is_empty());
+        } else {
+            assert_eq!(serials, ["serial"]);
+            assert_eq!(disks[0].lun, 0);
+            assert_eq!(
+                failures,
+                vec![(
+                    "ssd interface 0 LUN 1".into(),
+                    BlockError::Unsupported(
+                        "USB LUN is not an attached direct-access block device"
+                    )
+                )]
+            );
+        }
+    }
 }
 #[test]
 fn invalid_identification_capacity_and_mode_never_publish_a_block_device() {

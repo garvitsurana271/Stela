@@ -235,3 +235,33 @@ fn illegal_report_falls_back_and_always_sync_uses_only_safe_mode_page() {
     assert_eq!(state.target.as_ref().unwrap().flushes, vec![Lun::default()]);
     assert!(state.active.is_empty());
 }
+
+/// A UAS bridge whose REPORT LUNS lists LUN 0 alone publishes one disk,
+/// under the device's serial, even when LUN 1 would answer if asked: the
+/// phantom unit a firmware driver may publish is never probed.
+#[test]
+fn a_report_listing_only_lun_zero_publishes_one_disk() {
+    let zero = Lun::default();
+    let mut target = Target::new(vec![
+        Media::disk(zero, 0x10),
+        Media::disk(Lun::sequential(1), 0x11),
+    ]);
+    target.reported = vec![zero];
+    let mut memory = vec![0u64; 32 * 1024];
+    let (owner, state) = target_owner(&mut memory, target, quirks::Flags::default());
+    let mut failures = Vec::new();
+    let disks =
+        crate::usb::storage::discover_uas_units(owner, "ssd", "serial", &mut failures).unwrap();
+    assert!(failures.is_empty());
+    assert_eq!(disks.len(), 1);
+    assert_eq!(disks[0].lun, zero);
+    assert_eq!(disks[0].identity.serial, "serial");
+    let state = state.borrow();
+    assert!(state.history.iter().any(|iu| iu[16] == 0xa0));
+    assert!(
+        state
+            .history
+            .iter()
+            .all(|iu| iu[8..16] != Lun::sequential(1).bytes())
+    );
+}

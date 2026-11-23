@@ -769,6 +769,43 @@ fn storage_selector_uses_stream_policy_before_configuration_and_bot_fallback() {
     assert!(model.borrow().active.iter().skip(2).all(Option::is_none));
 }
 
+/// An interface with BOT at alternate 0 and UAS at alternate 1 is bound
+/// once, by one transport: UAS on a host with stream capacity, else BOT.
+/// The UAS alternate starts no binding of its own, so one device's disks
+/// are never found twice (and named alike) over both transports.
+#[test]
+fn a_storage_interface_with_bot_and_uas_alternates_binds_one_transport() {
+    let mut dma = TestRegion::new(128 * 1024 * 8);
+    let (mut controller, _) = unconfigured_cancellation_controller(&mut dma);
+    controller.slots[1].as_mut().unwrap().speed = SUPER_SPEED;
+    controller.stream_policy = streams::Policy::Standard;
+    let mut dev = configuration::tests::addressed_device(
+        &controller,
+        vec![storage_modes(7, true, true, true)],
+    );
+    dev.speed = SUPER_SPEED;
+    for (streams, uas) in [(16, true), (0, false)] {
+        controller.max_primary_streams = streams;
+        configuration::select_with_controller(&mut dev, Some(&controller)).unwrap();
+        let all = interfaces(&dev.configuration);
+        assert_eq!(all.len(), 2);
+        let bindings: Vec<_> = all
+            .iter()
+            .filter(|interface| primary(interface))
+            .map(|interface| {
+                configuration::plan_with_controller(&dev, interface, &all, Some(&controller))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(bindings.len(), 1);
+        let Plan::Storage(binding) = &bindings[0] else {
+            panic!()
+        };
+        assert_eq!(binding.uas(), uas);
+        assert_eq!(binding.setting(), (0, u8::from(uas)));
+    }
+}
+
 #[test]
 fn storage_configuration_prefers_usable_uas_and_preserves_quirk_bot_fallback() {
     for superspeed in [false, true] {

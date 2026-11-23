@@ -567,6 +567,49 @@ fn a_retired_board_claim_is_a_valid_preparation_note_only_where_it_was_made() {
     }
 }
 
+/// A removed MagSafe HPM die is noted on its bus manager, and holds only on
+/// a manager that no longer has that child.
+#[test]
+fn a_removed_hpm_die_is_a_valid_preparation_note_only_on_its_bus_manager() {
+    let manager = |name: &[u8], compatible: &[u8], with_die: bool| {
+        let die = encode(&[("name", b"hpm5")], &[]);
+        let children = if with_die { vec![die] } else { vec![] };
+        encode(&[("name", name), ("compatible", compatible)], &children)
+    };
+    let watched = encode(&[("name", b"watchdog"), ("clock-gates", &words(&[1]))], &[]);
+    for (bus, note, admitted) in [
+        (
+            manager(b"hpmBusManager", b"usbc,manager\0", false),
+            "/arm-io/hpmBusManager -hpm5",
+            true,
+        ),
+        (
+            manager(b"hpmBusManager", b"usbc,manager\0", true),
+            "/arm-io/hpmBusManager -hpm5",
+            false,
+        ),
+        (
+            manager(b"other", b"other,bus\0", false),
+            "/arm-io/other -hpm5",
+            false,
+        ),
+    ] {
+        let bytes = tree(&[(1, Some(0), [0, 0])], &[watched.clone(), bus]);
+        let mut states = power_states(
+            &Node::root(&bytes).unwrap(),
+            &flat_fixture_extent(&Some),
+            0x8112,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            states.apply_admission(&bytes, &[note.into()]).is_ok(),
+            admitted,
+            "{note}"
+        );
+    }
+}
+
 #[test]
 fn preparation_notes_are_validated_without_retiring_resources() {
     let watched = encode(

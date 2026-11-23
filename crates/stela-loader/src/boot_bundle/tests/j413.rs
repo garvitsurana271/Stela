@@ -124,11 +124,11 @@ fn admitted(tree: &[u8]) -> Vec<String> {
 #[test]
 #[ignore = "oracle: STELA_TEST_PERSONA_ADT_DIR"]
 fn the_engine_builds_a_board_from_the_prepared_j413_tree() {
-    for (tree, model, class, board_id) in [
+    for (original, model, class, board_id) in [
         (j473(), "Mac14,3", "j473ap", 0x24),
         (j413(), "Mac14,2", "j413ap", 0x28),
     ] {
-        let (tree, ledger) = prepared_with_ledger(tree, model, class, board_id);
+        let (tree, ledger) = prepared_with_ledger(original, model, class, board_id);
         let mut found = board::board(&tree).unwrap();
         found
             .power_states
@@ -136,6 +136,25 @@ fn the_engine_builds_a_board_from_the_prepared_j413_tree() {
             .unwrap()
             .apply_admission(&tree, &ledger)
             .unwrap_or_else(|error| panic!("{model}: {error}"));
+        // The assigned source every boot of a loaded bundle builds
+        // (`stela-boot` `source_topology`) holds the prepared tree to the
+        // original's root, `/product`, `/arm-io`, PMGR, AIC and `/cpus`.
+        use board::assigned::{BspSource, ResourceProfile, SourceIdentity};
+        let identity = SourceIdentity {
+            profile: ResourceProfile {
+                chip: stela_contracts::Chip::AppleM2,
+                soc: 0x8112,
+                board: board_id,
+                input_set_sha256: [3; 32],
+                adapted_set_sha256: None,
+            },
+            original_tree_sha256: <sha2::Sha256 as sha2::Digest>::digest(original).into(),
+        };
+        let boot = found.boot_processor.as_ref().unwrap().affinity;
+        BspSource::t8112(original, &tree, identity, boot, 0)
+            .unwrap_or_else(|error| panic!("{model} assigned source: {error}"));
+        BspSource::t8112_assigned(original, &tree, identity, boot, 0, 8)
+            .unwrap_or_else(|error| panic!("{model} 8-worker assigned source: {error}"));
     }
     let tree = prepared(j413(), "Mac14,2", "j413ap", 0x28);
     let found = board::board(&tree).unwrap();
@@ -183,8 +202,8 @@ fn the_mac_mini_tree_prepares_as_it_did_before_the_persona() {
 /// Every device J473AP admits, J413AP admits too, plus the camera's I2C
 /// controller (its targets stay hidden, as J473AP's audio buses' do). What
 /// J413AP hides beyond J473AP is listed: the review artefact of the
-/// persona's admission. The MagSafe `hpm5` is still in the tree (removing
-/// it is the next change).
+/// persona's admission. The MagSafe `hpm5` is removed from the prepared
+/// tree.
 #[test]
 #[ignore = "oracle: STELA_TEST_PERSONA_ADT_DIR"]
 fn j413_admits_what_j473_admits() {
@@ -244,6 +263,7 @@ fn j413_admits_what_j473_admits() {
             "/arm-io/dart-isp",
             "/arm-io/dart-isp/mapper-isp",
             "/product partially-occluded-display",
+            "/arm-io/i2c0/hpmBusManager -hpm5",
         ]
     );
 
@@ -254,9 +274,18 @@ fn j413_admits_what_j473_admits() {
     );
     let tcon = air.node("/arm-io/spi4/dp855").unwrap();
     assert!(tcon.property("compatible").is_none() && tcon.property("device_type").is_none());
-    let magsafe = air.node("/arm-io/i2c0/hpmBusManager/hpm5").unwrap();
+    // The MagSafe die leaves the bus, its two USB-C dies stay, and the port
+    // it named stays as data. Apple's original tree still has it.
+    let bus = air.node("/arm-io/i2c0/hpmBusManager").unwrap();
+    let dies: Vec<_> = bus.children.iter().filter_map(|die| die.name()).collect();
+    assert_eq!(dies, ["hpm0", "hpm1"]);
+    assert!(air.node("/port-magsafe3-1").is_some());
+    let original = DeviceTree::parse(j413()).unwrap();
     assert_eq!(
-        magsafe.property("hpm-class-type").unwrap().value,
+        original
+            .property("/arm-io/i2c0/hpmBusManager/hpm5", "hpm-class-type")
+            .unwrap()
+            .value,
         0xbu32.to_le_bytes()
     );
 }

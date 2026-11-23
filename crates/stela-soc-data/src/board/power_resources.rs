@@ -237,6 +237,11 @@ impl PowerStates {
                     (path, note) if super::UNMODELED_BOARD_CLAIMS.contains(&(path, note)) => {
                         node.property(note).is_none()
                     }
+                    // A removed HPM die is noted on its bus manager, which
+                    // stays; the die itself is no longer in the tree.
+                    (_, note) if note.starts_with('-') => {
+                        node.compatible(super::HPM_MANAGER) && node.child(&note[1..]).is_none()
+                    }
                     _ => false,
                 };
                 if !valid {

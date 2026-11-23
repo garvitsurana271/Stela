@@ -88,6 +88,11 @@
 //! claims a notch in a panel the guest never sees. A tree without the claim,
 //! such as J473AP's, is not touched.
 //!
+//! The one node this module removes is a MacBook's MagSafe HPM die: an HPM
+//! bus manager's child without `compatible` whose class has no model
+//! (`MANAGER -NAME`). The bus enables its interrupt only once every child
+//! checks in, and nothing answers for that one.
+//!
 //! An SPMI controller with no admitted target or external platform-function
 //! or interrupt consumer also loses `compatible`. Board templates may carry
 //! alternative controllers over the same banks (26A434 J623/J624); iBoot
@@ -431,7 +436,94 @@ pub fn hide_unmodeled(tree: &mut DeviceTree) -> Vec<String> {
     retire_hidden_acio_parents(tree, &mut hidden);
     retire_hidden_capabilities(tree, &mut hidden);
     retire_board_claims(tree, &mut hidden);
+    remove_unmodeled_hpm_dies(tree, &mut hidden);
     hidden
+}
+
+/// The HPM class of a MacBook's MagSafe port controller (`hpm-class-type`;
+/// `AppleHPMInterfaceType11`): the 26B123 J413AP `hpmBusManager/hpm5` at I2C
+/// 0x3a, with no `compatible` and no die model.
+const MAGSAFE_HPM_CLASS: u32 = 0xb;
+const HPM_CLASS_TYPE: &str = "hpm-class-type";
+/// Properties whose cells name a provider or peer node by phandle. A die any
+/// of them still names is kept (`function-*` names its provider first).
+const PHANDLE_LINKS: &[&str] = &[
+    "interrupt-parent",
+    IOMMU_PARENT,
+    ACIO_PARENT,
+    "dma-parent",
+    "iicProvider",
+    "dock",
+];
+
+/// Whether a property outside `skip` names `phandle` as a provider or peer.
+fn names_phandle(node: &Node, path: &str, skip: &str, phandle: u32) -> bool {
+    if path == skip {
+        return false;
+    }
+    let cell = phandle.to_le_bytes();
+    node.properties.iter().any(|property| {
+        let name = property.name();
+        if name.starts_with("function-") {
+            property.value.first_chunk::<4>() == Some(&cell)
+        } else if PHANDLE_LINKS.contains(&name) {
+            property.value.as_chunks::<4>().0.contains(&cell)
+        } else {
+            false
+        }
+    }) || node.children.iter().any(|child| {
+        let path = format!("{path}/{}", child.name().unwrap_or("?"));
+        names_phandle(child, &path, skip, phandle)
+    })
+}
+
+/// Remove each MagSafe HPM die from a visible HPM bus manager, noting
+/// `MANAGER -NAME` in the ledger. `AppleHPMBusController::publishBelow`
+/// (26B123 KC 0x279300c) publishes every child of the manager, and
+/// `hpmCheckIn` (0x2793434) enables the bus's shared interrupt only once all
+/// of them have checked in: a die nothing answers for keeps hpm0's and
+/// hpm1's interrupt off, and with it the Type-C events the guest's USB
+/// rides on. Removal also hides its `usbc-flash-update` from `restored`'s
+/// USB-C flasher. Only a die without `compatible` of exactly
+/// [`MAGSAFE_HPM_CLASS`] goes, and only while no other node names its
+/// phandle; a tree without one, such as J473AP's, is not touched. The
+/// original tree keeps it.
+fn remove_unmodeled_hpm_dies(tree: &mut DeviceTree, hidden: &mut Vec<String>) {
+    let mut managers = Vec::new();
+    visible_paths(
+        &tree.root,
+        "",
+        &|node| named(node, board::HPM_MANAGER),
+        &mut managers,
+    );
+    for manager in managers {
+        let dies: Vec<(String, Option<u32>)> = tree
+            .node(&manager)
+            .expect("visited path")
+            .children
+            .iter()
+            .filter(|die| {
+                die.property(COMPATIBLE).is_none()
+                    && die.property(HPM_CLASS_TYPE).and_then(|p| p.as_u32())
+                        == Some(MAGSAFE_HPM_CLASS)
+            })
+            .filter_map(|die| {
+                let name = String::from(die.name()?);
+                Some((name, die.property(PHANDLE).and_then(|p| p.as_u32())))
+            })
+            .collect();
+        for (name, phandle) in dies {
+            let path = format!("{manager}/{name}");
+            if phandle.is_some_and(|phandle| names_phandle(&tree.root, "", &path, phandle)) {
+                continue;
+            }
+            tree.node_mut(&manager)
+                .expect("visited path")
+                .remove_child(&name)
+                .expect("listed child");
+            hidden.push(format!("{manager} -{name}"));
+        }
+    }
 }
 
 /// Drop each board claim the tree makes (`board::UNMODELED_BOARD_CLAIMS`),

@@ -151,6 +151,12 @@ impl Node {
         Some(self.properties.remove(index))
     }
 
+    /// Remove the first child named `name`, with everything under it.
+    pub fn remove_child(&mut self, name: &str) -> Option<Node> {
+        let index = self.children.iter().position(|c| c.name() == Some(name))?;
+        Some(self.children.remove(index))
+    }
+
     pub fn child(&self, name: &str) -> Option<&Node> {
         self.children.iter().find(|c| c.name() == Some(name))
     }

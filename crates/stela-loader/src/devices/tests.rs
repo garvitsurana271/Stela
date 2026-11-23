@@ -1557,3 +1557,124 @@ fn a_visible_node_keeps_its_tcon_type_and_a_board_claim_goes_once() {
     retire_board_claims(&mut tree, &mut notes);
     assert_eq!(notes, ["/product partially-occluded-display"]);
 }
+
+/// An HPM bus as the 26B123 trees have it: J413AP's with its MagSafe die
+/// `hpm5` (no `compatible`, class 0xb, `dock` naming `/port-magsafe3-1`), or
+/// J473AP's two USB-C dies alone.
+fn hpm_tree(magsafe: Option<Node>) -> DeviceTree {
+    let die = |name: &str| {
+        let mut die = node(name, Some(board::HPM.as_bytes()), vec![]);
+        die.set_property("iicProvider", 0xb8u32.to_le_bytes().to_vec())
+            .unwrap();
+        die
+    };
+    let mut dies = vec![die("hpm0"), die("hpm1")];
+    dies.extend(magsafe);
+    let manager = phandle(
+        node("hpmBusManager", Some(board::HPM_MANAGER.as_bytes()), dies),
+        0xb8,
+    );
+    DeviceTree {
+        root: node(
+            "",
+            None,
+            vec![
+                node(
+                    "arm-io",
+                    None,
+                    vec![node("i2c0", Some(board::I2C.as_bytes()), vec![manager])],
+                ),
+                phandle(node("port-magsafe3-1", None, vec![]), 0x121),
+            ],
+        ),
+    }
+}
+
+fn magsafe_die(class: u32, compatible: Option<&[u8]>) -> Node {
+    let mut die = phandle(node("hpm5", compatible, vec![]), 0xbb);
+    for (key, value) in [
+        (HPM_CLASS_TYPE, class),
+        ("iicProvider", 0xb8),
+        ("dock", 0x121),
+        ("usbc-flash-update", 1),
+    ] {
+        die.set_property(key, value.to_le_bytes().to_vec()).unwrap();
+    }
+    die
+}
+
+const MANAGER: &str = "/arm-io/i2c0/hpmBusManager";
+
+#[test]
+fn a_magsafe_hpm_die_without_a_model_leaves_its_bus() {
+    let mut tree = hpm_tree(Some(magsafe_die(MAGSAFE_HPM_CLASS, None)));
+    let mut ledger = vec![];
+    remove_unmodeled_hpm_dies(&mut tree, &mut ledger);
+    assert_eq!(ledger, [format!("{MANAGER} -hpm5")]);
+    let manager = tree.node(MANAGER).unwrap();
+    let names: Vec<_> = manager.children.iter().filter_map(Node::name).collect();
+    assert_eq!(names, ["hpm0", "hpm1"]);
+    // The port it named stays as data; nothing binds it.
+    assert!(tree.node("/port-magsafe3-1").is_some());
+    // A second pass finds nothing more.
+    let mut again = vec![];
+    remove_unmodeled_hpm_dies(&mut tree, &mut again);
+    assert!(again.is_empty());
+}
+
+#[test]
+fn only_an_unmodeled_unreferenced_magsafe_class_die_on_a_visible_bus_goes() {
+    let kept = |mut tree: DeviceTree| {
+        let original = tree.serialize();
+        let mut ledger = vec![];
+        remove_unmodeled_hpm_dies(&mut tree, &mut ledger);
+        assert!(ledger.is_empty(), "{ledger:?}");
+        assert_eq!(tree.serialize(), original);
+    };
+    // J473AP's bus has no MagSafe die and comes out byte for byte.
+    kept(hpm_tree(None));
+    // A die with a compatible, or of another class, is not this one.
+    kept(hpm_tree(Some(magsafe_die(
+        MAGSAFE_HPM_CLASS,
+        Some(board::HPM.as_bytes()),
+    ))));
+    kept(hpm_tree(Some(magsafe_die(0xa, None))));
+    // A die another node still names as a provider stays.
+    let mut referenced = hpm_tree(Some(magsafe_die(MAGSAFE_HPM_CLASS, None)));
+    let mut client = node("client", None, vec![]);
+    client
+        .set_property(
+            "function-hpm_power",
+            [0xbbu32, four_char_code(b"Powr")]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+        )
+        .unwrap();
+    referenced.root.children.push(client);
+    kept(referenced);
+    // A hidden bus manager is left alone.
+    let mut hidden = hpm_tree(Some(magsafe_die(MAGSAFE_HPM_CLASS, None)));
+    hidden
+        .node_mut(MANAGER)
+        .unwrap()
+        .remove_property(COMPATIBLE);
+    kept(hidden);
+}
+
+#[test]
+fn a_child_is_removed_by_name_with_its_subtree() {
+    let mut parent = node(
+        "parent",
+        None,
+        vec![
+            node("a", None, vec![node("deep", None, vec![])]),
+            node("b", None, vec![]),
+        ],
+    );
+    let removed = parent.remove_child("a").unwrap();
+    assert_eq!(removed.children.len(), 1);
+    assert_eq!(parent.children.len(), 1);
+    assert_eq!(parent.children[0].name(), Some("b"));
+    assert!(parent.remove_child("a").is_none());
+}

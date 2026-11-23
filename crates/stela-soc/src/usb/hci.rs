@@ -634,12 +634,17 @@ impl Hci {
 
     /// An event from the host's controller for the guest. Dropped (and
     /// counted) while the function is unconfigured or the queue is full.
-    /// The bridge, when there is one, decides what the guest gets of it.
+    /// The bridge, when there is one, decides what the guest gets of it,
+    /// and still hears a Hardware Error while the function is unconfigured.
     pub fn deliver_event(&mut self, packet: &[u8]) {
-        if !self.up() {
+        let state = &mut self.state;
+        if self.control.configuration() == 0 {
+            let now = state.now;
+            if let Some(bridge) = state.bridge.as_mut() {
+                bridge.chip_event_unconfigured(packet, now);
+            }
             return;
         }
-        let state = &mut self.state;
         if state.bridge.is_some() {
             state.captured(capture::Direction::FromChip, capture::Kind::Event, packet);
         }
@@ -1828,6 +1833,31 @@ mod tests {
         hci.deliver_event(&[&[COMMAND_COMPLETE, 252, 1, 0x14, 0x0c, 0][..], &[0; 248]].concat());
         assert_eq!(hci.ready_at(EVENTS), None, "the stale answer is dropped");
         assert_eq!(hci.fallback(), None);
+    }
+
+    /// A Hardware Error while the guest re-enumerates the function falls
+    /// back at once, so the next command is the model's and waits for no
+    /// deadline; the controller's other events then are dropped.
+    #[test]
+    fn a_hardware_error_while_unconfigured_falls_back() {
+        let mut hci = bridged();
+        hci.reset().unwrap();
+        hci.deliver_event(&[0x13, 5, 1, 1, 0, 1, 0]);
+        assert_eq!(hci.fallback(), None);
+        assert_eq!(hci.bridge_counters().unwrap().dropped, 1);
+        hci.deliver_event(&[0x10, 1, 0x2a]);
+        assert_eq!(
+            hci.fallback().map(|f| (f.opcode, f.cause)),
+            Some((None, bridge::Cause::HardwareError(0x2a)))
+        );
+        let mut hci = configured(hci);
+        assert_eq!(hci.ready_at(EVENTS), None, "the queues start empty");
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        assert_eq!(hci.take(), None, "nothing goes to the controller");
+        assert_eq!(
+            read(&mut hci, EVENTS, EVENT_PACKET),
+            [vec![COMMAND_COMPLETE, 4, 1, 0x03, 0x0c, 0]]
+        );
     }
 
     /// A command held for the controller's credit is traced with the answer

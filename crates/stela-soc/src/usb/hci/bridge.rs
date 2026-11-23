@@ -552,6 +552,21 @@ impl Bridge {
         vec![Step::Guest(event.to_vec())]
     }
 
+    /// One event from the host's controller while the guest has the
+    /// function unconfigured, so no guest takes it: dropped, but for a
+    /// Hardware Error, which falls back as it does configured, so the
+    /// fallback does not wait for the next forwarded command's deadline.
+    /// What the fallback gives the guest is dropped too: no guest can read
+    /// it, and the function's queues start empty at its next
+    /// configuration.
+    pub fn chip_event_unconfigured(&mut self, event: &[u8], now: u64) {
+        if event.first() == Some(&HARDWARE_ERROR) && self.fallen.is_none() {
+            drop(self.chip_event(event, now));
+        } else {
+            self.counters.dropped += 1;
+        }
+    }
+
     /// The shadow ends what the controller's event ends, so that after a
     /// fallback it gives the guest no second end of it.
     fn follow(&mut self, event: &[u8], now: u64) {

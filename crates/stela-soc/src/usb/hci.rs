@@ -95,7 +95,8 @@ const SCO_IN: u8 = 0x83;
 const SCO_OUT: u8 = 0x03;
 /// wMaxPacketSize of each alternate setting (Vol 4 Part B 2.1.1).
 const SCO_PACKETS: [u8; 6] = [0, 9, 17, 25, 33, 49];
-/// Packets each direction holds.
+/// Packets each direction holds; the events a lent controller's guest
+/// waits on go past it, to [`AWAITED_PACKETS`].
 pub const QUEUE_PACKETS: usize = 64;
 /// bRequest of an HCI command (Vol 4 Part B 2.2).
 const HCI_COMMAND: u8 = 0;
@@ -177,6 +178,30 @@ fn answered(event: &[u8]) -> Option<Answered> {
         }),
         _ => None,
     }
+}
+
+/// Inquiry Complete and Remote Name Request Complete (Vol 4 Part E 7.7.1,
+/// 7.7.7).
+const INQUIRY_COMPLETE: u8 = 0x01;
+const REMOTE_NAME_REQUEST_COMPLETE: u8 = 0x07;
+
+/// Events the bridge queues for the guest past [`QUEUE_PACKETS`]: a full
+/// queue of the controller's packets (`Hci::room_left` holds them to it),
+/// then the answers of the command in flight and of a full backlog
+/// (`bridge::BACKLOG`), and as many ends of the procedures they started. A
+/// guest that commands on and never reads its events is still bounded.
+const AWAITED_PACKETS: usize = QUEUE_PACKETS + 2 * (bridge::BACKLOG + 1);
+
+/// Whether the guest waits on `event`, so that a full queue must not drop
+/// it: a command's answer, or the end of a procedure it started (a
+/// fallback's replacement events among them).
+fn awaited(event: &[u8]) -> bool {
+    matches!(
+        event.first(),
+        Some(
+            &(COMMAND_COMPLETE | COMMAND_STATUS | INQUIRY_COMPLETE | REMOTE_NAME_REQUEST_COMPLETE)
+        )
+    )
 }
 
 /// The opcode a Command Complete or Command Status answers.
@@ -697,7 +722,12 @@ impl State {
     }
 
     fn event(&mut self, packet: Vec<u8>) {
-        if self.events.queue.len() >= QUEUE_PACKETS {
+        self.queue_event(packet, QUEUE_PACKETS);
+    }
+
+    /// Queues `packet` while the queue holds fewer than `bound`.
+    fn queue_event(&mut self, packet: Vec<u8>, bound: usize) {
+        if self.events.queue.len() >= bound {
             self.counters.overflowed += 1;
             return;
         }
@@ -798,7 +828,14 @@ impl State {
             match step {
                 bridge::Step::Guest(event) => {
                     self.trace_answer(&event);
-                    self.event(event);
+                    // The controller's packets are held to `room_left`, so
+                    // a queue it filled still takes what the guest waits on.
+                    let bound = if awaited(&event) {
+                        AWAITED_PACKETS
+                    } else {
+                        QUEUE_PACKETS
+                    };
+                    self.queue_event(event, bound);
                 }
                 bridge::Step::Chip(command) => {
                     let command = command.into_bytes();
@@ -1833,6 +1870,43 @@ mod tests {
         hci.deliver_event(&[&[COMMAND_COMPLETE, 252, 1, 0x14, 0x0c, 0][..], &[0; 248]].concat());
         assert_eq!(hci.ready_at(EVENTS), None, "the stale answer is dropped");
         assert_eq!(hci.fallback(), None);
+    }
+
+    /// A guest that stalls with its event queue full of the controller's
+    /// inquiry results still gets the fallback's answer to the command in
+    /// flight, after them; what the controller sends then is dropped.
+    #[test]
+    fn a_full_event_queue_still_takes_the_fallbacks_answer() {
+        let mut hci = bridged();
+        hci.set_time(0);
+        command(&mut hci, &[0x03, 0x0c, 0]).unwrap();
+        hci.take();
+        hci.deliver_event(&[COMMAND_COMPLETE, 4, 1, 0x03, 0x0c, 0]);
+        read(&mut hci, EVENTS, EVENT_PACKET);
+        let result = [0x02, 15, 1, 1, 2, 3, 4, 5, 6, 1, 0, 0, 0, 0, 0, 0, 0];
+        for _ in 0..QUEUE_PACKETS {
+            hci.deliver_event(&result);
+        }
+        assert_eq!(hci.room_left(), 0);
+        command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        assert!(hci.take().is_some());
+        hci.set_time(bridge::DEADLINE);
+        assert!(hci.fallback().is_some());
+        hci.deliver_event(&result);
+        assert_eq!(hci.counters().overflowed, 0, "dropped by the fallback");
+        for _ in 0..QUEUE_PACKETS {
+            assert_eq!(read(&mut hci, EVENTS, EVENT_PACKET).concat(), result);
+        }
+        assert_eq!(
+            read(&mut hci, EVENTS, EVENT_PACKET).concat(),
+            [COMMAND_COMPLETE, 10, 1, 0x09, 0x10, 0, 1, 2, 3, 4, 5, 0x02]
+        );
+        assert_eq!(hci.ready_at(EVENTS), None);
+        // Bounded all the same: a guest that commands on and never reads.
+        for _ in 0..2 * AWAITED_PACKETS {
+            command(&mut hci, &[0x09, 0x10, 0]).unwrap();
+        }
+        assert_eq!(hci.state.events.queue.len(), AWAITED_PACKETS);
     }
 
     /// A Hardware Error while the guest re-enumerates the function falls

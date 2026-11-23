@@ -35,6 +35,7 @@ fn from_disk(
     adopt_ecid: bool,
     bluetooth: bool,
     tsc_hz: u64,
+    identity: Option<stela_boot_core::generated_identity::Values>,
 ) -> Vec<(String, Vec<u8>)> {
     crate::status::begin("Reading macOS's boot files from its disk");
     // The kernel's text on the screen and on the debug UART, which the
@@ -77,6 +78,13 @@ fn from_disk(
             });
     }
     defaults.boot_args.push_str(&lock_timeout_arguments(tsc_hz));
+    // The machine's generated identity fills the tree's serial, MLB, model,
+    // region and MAC address fill-ins, as setup's restore bundles have it;
+    // without one they keep their zero fallbacks.
+    if let Some(identity) = identity {
+        defaults.syscfg.extend(identity.syscfg);
+        defaults.mac_addresses.extend(identity.mac_addresses);
+    }
     // The automatic Metal plugin repair NVRAM asked for is the manual
     // remedy's boot: single-user, filesystem protection off.
     let maintenance_write = options.maintenance_write || options.bundle_repair;
@@ -546,12 +554,14 @@ fn open_host(
     // ticket names it.
     let adopt_ecid = !named && options.install.is_none();
     let built = devices.preboot.take().map(|partition| {
+        let identity = generated_identity(handoff, options.ecid);
         from_disk(
             partition,
             options,
             adopt_ecid,
             devices.host_bluetooth.is_some(),
             handoff.tsc_hz,
+            identity,
         )
     });
     // A system boots as the board it was installed on: libignition finds its
@@ -3094,6 +3104,54 @@ fn wifi_network(
         ));
     }
     Some(network)
+}
+
+/// The generated identity of the machine `ecid` in the file the loader read
+/// (`generated_identity::FILE`): none without the file or the machine's
+/// lines in it, as every setup without the opt-in has. A file it cannot take
+/// is reported, never shown, and gives none: the fill-ins keep their zeros.
+fn generated_identity(
+    handoff: &Handoff,
+    ecid: Option<u64>,
+) -> Option<stela_boot_core::generated_identity::Values> {
+    let bytes = handoff.identity.bytes as usize;
+    if bytes == 0 {
+        return None;
+    }
+    // SAFETY: the loader left the file's bytes allocated, and nothing
+    // writes them.
+    let file = unsafe {
+        core::slice::from_raw_parts(
+            layout::physical(handoff.identity.physical) as *const u8,
+            bytes,
+        )
+    };
+    let found = ecid.map(|ecid| stela_boot_core::generated_identity::for_machine(file, ecid));
+    match found {
+        Some(Ok(Some(values))) => {
+            output::arguments(format_args!(
+                "IDENTITY generated identity applied: {} board values, {} MAC addresses
+",
+                values.syscfg.len(),
+                values.mac_addresses.len()
+            ));
+            Some(values)
+        }
+        Some(Err(reason)) => {
+            output::arguments(format_args!(
+                "IDENTITY {reason}: the board values stay blank this start
+"
+            ));
+            None
+        }
+        Some(Ok(None)) | None => {
+            output::arguments(format_args!(
+                "IDENTITY identity.cfg holds no generated identity for this machine
+"
+            ));
+            None
+        }
+    }
 }
 
 /// The other saved networks (`options::WIFI_SAVED`) the loader read, whose

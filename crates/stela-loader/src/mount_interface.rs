@@ -50,6 +50,10 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// the fork's `--laptop auto|off`, as hand-written: a laptop's boot takes
 /// `--battery`, `--lid method`, `--brightness-keys` and `--trackpad mt2`
 /// unasked from what it reads of the PC, which the line does not hold.
+/// So does the fork's `identity.cfg` (`stela_boot_core::generated_identity`),
+/// which setup writes beside `stela.cfg` only with `--generated-identity`:
+/// it is a file of its own, not an option line, and its absence leaves every
+/// boot as it was.
 pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.

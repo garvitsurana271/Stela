@@ -331,6 +331,16 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         .as_ref()
         .and_then(|_| crate::wifi_menu::saved_file(&mut volume))
         .unwrap_or_default();
+    // The machines' generated identities, for a bundle built from a disk:
+    // none when the file is absent or unreadable.
+    let identity = system
+        .preboot
+        .as_ref()
+        .and_then(|_| {
+            let path = uefi::CString16::try_from(stela_boot_core::generated_identity::FILE).ok()?;
+            volume.read(uefi::fs::PathBuf::from(path)).ok()
+        })
+        .unwrap_or_default();
     let host_devices = system.storage.is_some()
         || system.preboot.is_some()
         || system.restore_source.is_some()
@@ -435,6 +445,7 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         storage,
         wifi_key,
         wifi_saved,
+        identity,
     })
 }
 
@@ -446,6 +457,7 @@ struct Inputs {
     storage: Option<stela_drivers::Handoff>,
     wifi_key: Vec<u8>,
     wifi_saved: Vec<u8>,
+    identity: Vec<u8>,
 }
 
 /// The firmware's runtime regions, and its `ResetSystem` service: zero when
@@ -806,6 +818,7 @@ fn load(
         storage,
         wifi_key,
         wifi_saved,
+        identity,
     } = inputs;
     let text = core::str::from_utf8(&options).map_err(|_| refuse!("stela.cfg is not UTF-8"))?;
     let system = System::parse(text).map_err(stela_boot_core::options::Error::message)?;
@@ -1192,6 +1205,10 @@ fn load(
             wifi_saved: Region {
                 physical: wifi_saved.as_ptr() as u64,
                 bytes: wifi_saved.len() as u64,
+            },
+            identity: Region {
+                physical: identity.as_ptr() as u64,
+                bytes: identity.len() as u64,
             },
             device_skips,
             device_needs,

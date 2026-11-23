@@ -50,6 +50,7 @@ pub mod firmware_screen;
 pub mod firmware_state;
 pub mod firmware_time;
 pub mod first_stop;
+pub mod generated_identity;
 pub mod gpu_fault;
 pub mod gpu_loss;
 pub mod gpu_requests;

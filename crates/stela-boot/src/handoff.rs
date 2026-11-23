@@ -127,6 +127,11 @@ pub struct Handoff {
     /// ESP beside the key; empty without `--wifi` or the file. The engine
     /// parses and wipes them, as it does the key's.
     pub(crate) wifi_saved: Region,
+    /// The machines' generated identities file
+    /// (`generated_identity::FILE`), read from the ESP for a boot that
+    /// builds its bundle from a disk; empty without `--preboot` or the
+    /// file, as every setup without `--generated-identity` has.
+    pub(crate) identity: Region,
     /// The PCI functions an earlier boot did not finish starting, or
     /// skipped since, as the USB's log gives them (`log_file::device_skips`).
     pub(crate) device_skips: pc::device_starts::Skips,

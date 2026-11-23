@@ -15,7 +15,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use stela_boot_core::options::{System, Uuid};
+use stela_boot_core::options::{Battery, System, Uuid};
 use stela_loader::mount_interface::{Choice, Choices};
 
 /// What setup writes, recorded on the ESP so `uninstall` can remove it.
@@ -246,9 +246,19 @@ impl Record {
         format!("{system}\n")
     }
 
-    /// The option line that boots `install`.
+    /// The option line that boots `install`. A MacBook persona's
+    /// (`super::EXPERIMENTAL_MODELS`) also gives its SMC the host's battery
+    /// (`--battery`), an option `stela.efi` already reads: a MacBook without
+    /// one is a state macOS never sees on real hardware. A laptop takes it
+    /// unasked anyway (`--laptop auto`); the line keeps it on a PC the boot
+    /// does not read as a laptop, or under `--laptop off`. A Mac mini's line
+    /// is unchanged.
     pub(super) fn boot_line(&self, install: &machines::Install) -> Result<String> {
-        Ok(self.line(install.disk.options(install.ecid)?))
+        let mut system = install.disk.options(install.ecid)?;
+        if super::experimental(&self.model) && system.battery.is_none() {
+            system.battery = Some(Battery::Host);
+        }
+        Ok(self.line(system))
     }
 
     /// `stela.cfg`: the default install. Every setup this `stela` reads

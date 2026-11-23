@@ -8493,3 +8493,37 @@ fn a_persona_stick_resumes_with_its_opt_in_and_a_mac_mini_stick_without() {
         assert_eq!(command.experimental_macbook, opted, "{model}");
     }
 }
+
+/// A MacBook persona stick's boot line gives the guest the host's battery;
+/// a Mac mini stick's is as it was, and neither's Install macOS line
+/// changes (an install takes no battery).
+#[test]
+fn a_persona_stick_boots_with_the_hosts_battery_and_a_mac_mini_stick_without() {
+    let mut f = fixture(64 * GIB, false);
+    add_installed_disk(&mut f, &[], &[]);
+    setup(&environment(&f.host), installed_command(&f)).unwrap();
+    let mut record = read_record(&environment(&f.host), &f.esp).unwrap();
+    let lines = |record: &Record| {
+        let install = record.default().unwrap();
+        (
+            record.boot_line(install).unwrap(),
+            record.install_line(install).unwrap(),
+        )
+    };
+    record.model = "Mac14,3".into();
+    let (mini_boot, mini_install) = lines(&record);
+    assert!(!mini_boot.contains("--battery"), "{mini_boot}");
+    record.model = "Mac14,2".into();
+    let (air_boot, air_install) = lines(&record);
+    assert_eq!(air_install, mini_install);
+    // Only the battery is added.
+    let words = |line: &str| {
+        let mut words: Vec<String> = line.split_whitespace().map(String::from).collect();
+        words.sort();
+        words
+    };
+    let mut expected = words(&mini_boot);
+    expected.push("--battery".into());
+    expected.sort();
+    assert_eq!(words(&air_boot), expected);
+}

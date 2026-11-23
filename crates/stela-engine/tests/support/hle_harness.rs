@@ -787,6 +787,15 @@ pub fn agree(stand_in: &StandIn, case: &Case, off: &Outcome, on: &Outcome) -> Re
         return Err(format!("{name} differs"));
     }
     match reference(stand_in.id, case) {
+        // The original returned too, so its return is the truth: Apple's
+        // memmove (26B123) returns at once when the pointers are equal and
+        // touches nothing, even on a range the model expects to fault.
+        None if stand_in.id == Id::Memmove
+            && case.x[0] == case.x[1]
+            && on.memory == case.contents =>
+        {
+            Ok(())
+        }
         None => Err("returned where the reference model faults".into()),
         Some((_, memory)) if memory != on.memory => {
             Err("memory differs from the reference model".into())

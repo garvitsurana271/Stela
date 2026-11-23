@@ -795,6 +795,7 @@ fn a_change_while_the_soc_sleeps_waits_for_its_wake() {
     let mut smc = smc.with_wake_bits(WakeBits {
         power_button: Some(0),
         rtc: None,
+        lid: None,
     });
     enable_notifications(&mut smc, &sram);
     sram.put(&code(b"slpa").to_le_bytes());
@@ -861,4 +862,49 @@ fn a_battery_joins_the_table_once_with_a_reading_and_counts_with_the_rtc_key() {
     let mut clash = Smc::new(sram, BASE, vec![(code(b"B0UC"), Key::gpio())]).unwrap();
     assert!(clash.add_battery(&on_battery()).is_err());
     assert!(clash.battery.is_none());
+}
+
+/// A MacBook's SMC (its `smc-pmu` has `has_lid_open_sensor`) answers the lid
+/// switch open whether or not it has a battery, which `AppleSMCPMU` reads on
+/// such a board battery or not; a battery added later keeps the one key. The
+/// Mac mini's has none without a battery.
+#[test]
+fn a_lid_board_answers_its_lid_open_with_or_without_a_battery() {
+    let lid_board = || {
+        let sram = Sram::default();
+        let mut keys: Vec<_> = J473_GPIO_KEYS
+            .iter()
+            .map(|name| (code(name), Key::gpio()))
+            .collect();
+        keys.push(Smc::lid_key());
+        (Smc::new(sram.clone(), BASE, keys).unwrap(), sram)
+    };
+    let count = |smc: &mut Smc| (send(smc, request(READ, 0, 4, 0, KEY_COUNT)) >> 32) as u32;
+    let (mut smc, sram) = lid_board();
+    assert_eq!(count(&mut smc), (MAC_MINI_KEYS + 1).to_be());
+    assert_eq!(read(&mut smc, &sram, b"MSLD"), [0]);
+    assert_eq!(
+        send(&mut smc, request(KEY_INFO, 0, 0, 0, code(b"MSLD"))) as u8,
+        SUCCESS
+    );
+    let mut info = vec![1];
+    info.extend_from_slice(b"ui8 ");
+    info.push(READABLE);
+    assert_eq!(sram.get(6), info);
+    assert_eq!(result(&mut smc, WRITE, 1, b"MSLD"), NOT_WRITABLE);
+    // No battery: its keys are absent.
+    assert_eq!(result(&mut smc, READ, 2, b"BPCC"), KEY_NOT_FOUND);
+
+    let (mut smc, sram) = lid_board();
+    smc.add_battery(&on_battery()).unwrap();
+    assert_eq!(
+        count(&mut smc),
+        (MAC_MINI_KEYS + TABLE.len() as u32).to_be()
+    );
+    assert_eq!(read(&mut smc, &sram, b"MSLD"), [0]);
+    smc.power(&charging(), 0);
+    assert_eq!(read(&mut smc, &sram, b"MSLD"), [0]);
+
+    let (mut smc, _) = mac_mini();
+    assert_eq!(result(&mut smc, READ, 1, b"MSLD"), KEY_NOT_FOUND);
 }

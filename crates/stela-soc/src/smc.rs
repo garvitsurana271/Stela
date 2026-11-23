@@ -539,6 +539,13 @@ impl Smc {
         })
     }
 
+    /// A lid board's lid switch, the key `AppleSMCPMU` reads on a board
+    /// whose `smc-pmu` has `has_lid_open_sensor`: `MSLD`, open
+    /// ([`battery`]). It is the board's, battery or not.
+    pub fn lid_key() -> (u32, Key) {
+        battery::lid_key()
+    }
+
     /// The `MBSW` bits the board's DeviceTree names for its wake sources.
     pub fn with_wake_bits(mut self, bits: WakeBits) -> Self {
         self.wake_bits = bits;
@@ -610,7 +617,11 @@ impl Smc {
                 missing
             ));
         }
-        let keys = battery::keys(snapshot);
+        // A lid board already has the lid switch; the battery leaves it.
+        let keys: Vec<(u32, Key)> = battery::keys(snapshot)
+            .into_iter()
+            .filter(|(name, _)| !(*name == battery::LID_CLOSED && self.keys.contains_key(name)))
+            .collect();
         if keys
             .iter()
             .any(|(name, _)| self.keys.contains_key(name) || *name == rtc::KEY)

@@ -2192,6 +2192,7 @@ fn smc_places_a_running_wrapper_its_shared_page_and_watchdog() {
         gpio_keys: alloc::vec![smc::code(b"gP16")],
         quiesced: true,
         wake_bits: stela_soc_data::smc::WakeBits::default(),
+        lid: false,
     };
     let mut devices = AppleDevices::new();
     devices
@@ -2237,6 +2238,7 @@ fn the_host_battery_reaches_the_smc_once_and_only_on_a_board_with_one() {
         gpio_keys: alloc::vec![],
         quiesced: true,
         wake_bits: stela_soc_data::smc::WakeBits::default(),
+        lid: false,
     };
     devices
         .add_aic(0x2_3b0c_0000, 1152, AicLayout::aic2(0x8000, 0))

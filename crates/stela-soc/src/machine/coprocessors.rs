@@ -109,11 +109,14 @@ impl AppleDevices {
         build: &stela_formats::builds::Build,
     ) -> Result<()> {
         let sram = smc::Sram::default();
-        let keys = placement
+        let mut keys: Vec<_> = placement
             .gpio_keys
             .iter()
             .map(|&name| (name, smc::Key::gpio()))
             .collect();
+        if placement.lid {
+            keys.push(Smc::lid_key());
+        }
         let endpoint =
             Smc::new(sram.clone(), placement.region.0, keys)?.with_wake_bits(placement.wake_bits);
         let mut rtkit = RtKit::new(

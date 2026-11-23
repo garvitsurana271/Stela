@@ -11,11 +11,13 @@ pub const fn code(name: &[u8; 4]) -> u32 {
 pub const RTC_KEY: u32 = code(b"CLKM");
 
 /// The `MBSW` bits of the wake sources the board models, from `smc-pmu`'s
-/// `event_name-bitN` names `pwrbtn` and `rtc`.
+/// `event_name-bitN` names `pwrbtn`, `rtc` and, on a MacBook, `lid` (bit 8
+/// on the 26B123 J413AP and J493AP trees; no lid wake is sent yet).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WakeBits {
     pub power_button: Option<u8>,
     pub rtc: Option<u8>,
+    pub lid: Option<u8>,
 }
 
 /// Declared key interface recovered from the original raw keyR consumer and

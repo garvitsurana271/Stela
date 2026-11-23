@@ -12,7 +12,9 @@ use stela_contracts::refuse;
 /// the tree's `pKW4` platform functions write through the nub's `smc-pmu`.
 /// `quiesced` is the nub's hand-off state (`rtkit::RtKit::quiesced`).
 /// `wake_bits` are the `MBSW` bits `smc-pmu`'s `event_name-bitN`
-/// properties name for the wake sources the board models.
+/// properties name for the wake sources the board models. `lid` is
+/// `smc-pmu`'s `has_lid_open_sensor` (J413AP and J493AP, not J473AP):
+/// `AppleSMCPMU` then reads the lid switch `MSLD` (26B123 KC 0x2db7ef0).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmcController {
     pub wrapper: (u64, u64),
@@ -22,6 +24,7 @@ pub struct SmcController {
     pub gpio_keys: Vec<u32>,
     pub quiesced: bool,
     pub wake_bits: smc::WakeBits,
+    pub lid: bool,
 }
 
 /// A platform function property is the provider's phandle, the function's
@@ -78,6 +81,7 @@ pub(super) fn smc_controller(
     }
     let mut gpio_keys = Vec::new();
     let mut wake_bits = smc::WakeBits::default();
+    let mut lid = false;
     // By name: the loader removes a hidden `smc-pmu`'s compatible, but the
     // keys its functions name are the SMC's whatever the AP binds.
     if let Some(pmu) = nub.child("smc-pmu") {
@@ -95,9 +99,13 @@ pub(super) fn smc_controller(
             match value.split(|&b| b == 0).next() {
                 Some(b"pwrbtn") => wake_bits.power_button = Some(bit),
                 Some(b"rtc") => wake_bits.rtc = Some(bit),
+                Some(b"lid") => wake_bits.lid = Some(bit),
                 _ => {}
             }
         }
+        lid = pmu
+            .first_u32("has_lid_open_sensor")
+            .is_some_and(|sensor| sensor != 0);
         let phandle = pmu
             .first_u32("AAPL,phandle")
             .ok_or(refuse!("smc-pmu has no phandle"))?;
@@ -124,6 +132,7 @@ pub(super) fn smc_controller(
         gpio_keys,
         quiesced: nub.property("quiesced").is_some(),
         wake_bits,
+        lid,
     }))
 }
 
@@ -240,8 +249,10 @@ mod tests {
             smc::WakeBits {
                 power_button: Some(0),
                 rtc: Some(48),
+                lid: None,
             }
         );
+        assert!(!placed.lid);
         // Sorted; `keyW` is not a GPIO write.
         assert_eq!(
             placed.gpio_keys,
@@ -267,5 +278,74 @@ mod tests {
         );
         assert!(models(BUTTONS, |_| None));
         assert!(!models(SMC_PMU, |_| None));
+    }
+
+    /// A MacBook's `smc-pmu` (26B123 J413AP: `has_lid_open_sensor` 1 and
+    /// `event_name-bit8` `lid`) gives the SMC a lid; a zero sensor does not.
+    #[test]
+    fn a_macbook_smc_pmu_names_its_lid_sensor_and_wake_bit() {
+        use stela_contracts::adt::encode;
+        let z = |text: &str| [text.as_bytes(), &[0]].concat();
+        let cells = |values: &[u32]| {
+            values
+                .iter()
+                .flat_map(|n| n.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let tree = |sensor: Option<u32>| {
+            let mut properties = vec![
+                ("name", z("smc-pmu")),
+                ("AAPL,phandle", cells(&[0x91])),
+                ("event_name-bit0", z("pwrbtn")),
+                ("event_name-bit8", z("lid")),
+            ];
+            if let Some(sensor) = sensor {
+                properties.push(("has_lid_open_sensor", cells(&[sensor])));
+            }
+            let properties: Vec<(&str, &[u8])> = properties
+                .iter()
+                .map(|(name, value)| (*name, value.as_slice()))
+                .collect();
+            let pmu = encode(&properties, &[]);
+            let nub = encode(
+                &[
+                    ("name", &z("iop-smc-nub")),
+                    ("compatible", &z(RTBUDDY)),
+                    ("region-base", &0x2_3fe0_0000u64.to_le_bytes()),
+                    ("region-size", &0x10_0000u64.to_le_bytes()),
+                ],
+                &[pmu],
+            );
+            let smc = encode(
+                &[
+                    ("name", &z("smc")),
+                    ("compatible", &z(ASC)),
+                    ("role", &z("SMC")),
+                    (
+                        "reg",
+                        &[0x3e40_0000u64, 0x6c000]
+                            .into_iter()
+                            .flat_map(u64::to_le_bytes)
+                            .collect::<Vec<_>>(),
+                    ),
+                    ("interrupts", &cells(&[0x1f4, 0x1f3, 0x1f6, 0x1f5])),
+                ],
+                &[nub],
+            );
+            let io = encode(&[("name", &z("arm-io"))], &[smc]);
+            encode(&[("name", &z("device-tree"))], &[io])
+        };
+        let translate = |offset| Some(0x2_0000_0000 + offset);
+        for (sensor, lid) in [(Some(1), true), (Some(0), false), (None, false)] {
+            let bytes = tree(sensor);
+            let root = Node::root(&bytes).unwrap();
+            let io = root.child("arm-io").unwrap();
+            let placed = smc_controller(&root, &io, &flat_fixture_extent(&translate))
+                .unwrap()
+                .unwrap();
+            assert_eq!(placed.lid, lid, "{sensor:?}");
+            assert_eq!(placed.wake_bits.lid, Some(8));
+            assert_eq!(placed.wake_bits.power_button, Some(0));
+        }
     }
 }

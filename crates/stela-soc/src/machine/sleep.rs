@@ -244,7 +244,9 @@ mod tests {
                     wake_bits: WakeBits {
                         power_button: Some(0),
                         rtc: Some(48),
+                        lid: None,
                     },
+                    lid: false,
                 },
                 stela_formats::builds::DEFAULT,
             )

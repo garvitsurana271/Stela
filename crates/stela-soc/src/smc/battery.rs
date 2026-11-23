@@ -61,7 +61,9 @@
 //! `MSLD` is the lid: 1 byte, 1 closed and 0 open
 //! (`AppleSMCPMU::_sendLidStateToRootDomainGated`, 0x2db9590). AppleSMCPMU
 //! reads it only on a board whose `smc-pmu` has `has_lid_open_sensor`,
-//! which J473's has not; it reads 0, open, for any other reader.
+//! which J473's has not; it reads 0, open, for any other reader. A board
+//! with the sensor (a MacBook's) has the key whether or not it has a battery
+//! ([`lid_key`]), and the battery then leaves it to the board.
 //!
 //! Notifications (event-name table at 0x12d79b8, indexed by subclass):
 //! `pow.ExternalPowerChange` (0x7101) when the AC adapter comes or goes,
@@ -166,6 +168,19 @@ pub(super) const SPACING_MILLIS: [u64; 2] = [1_000, 5_000];
 /// How soon a change that waits for the SoC to wake is looked at again.
 pub(super) const ASLEEP_RETRY_MILLIS: u64 = 1_000;
 
+/// The lid switch `MSLD`, open: the lid the host shows macOS is always
+/// open (P1 sends no lid change).
+pub(super) fn lid_key() -> (u32, Key) {
+    (
+        LID_CLOSED,
+        Key {
+            kind: code(b"ui8 "),
+            flags: READABLE,
+            value: vec![0],
+        },
+    )
+}
+
 /// The battery's keys, with `snapshot`'s values.
 pub(super) fn keys(snapshot: &PowerSnapshot) -> Vec<(u32, Key)> {
     let fixed = |kind: &[u8; 4], value: Vec<u8>| Key {
@@ -179,7 +194,7 @@ pub(super) fn keys(snapshot: &PowerSnapshot) -> Vec<(u32, Key)> {
         .map(|(&(name, kind), value)| (name, fixed(kind, value)))
         .collect();
     keys.push((PACK_COUNT, fixed(b"ui16", PACKS.to_le_bytes().to_vec())));
-    keys.push((LID_CLOSED, fixed(b"ui8 ", vec![0])));
+    keys.push(lid_key());
     keys.extend(
         LATCHES
             .iter()

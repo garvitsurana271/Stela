@@ -177,6 +177,14 @@ fn the_engine_builds_a_board_from_the_prepared_j413_tree() {
         ]
     );
     assert_eq!(found.firmware_files(), ["USB-C_HPM,46-P01-AP.bin"]);
+    // The MacBook's lid: its SMC answers `MSLD`, and bit 8 names a lid wake.
+    let smc = found.smc.as_ref().unwrap();
+    assert!(smc.lid);
+    assert_eq!(smc.wake_bits.lid, Some(8));
+    let mini = board::board(&prepared(j473(), "Mac14,3", "j473ap", 0x24)).unwrap();
+    let mini = mini.smc.as_ref().unwrap();
+    assert!(!mini.lid);
+    assert_eq!(mini.wake_bits.lid, None);
 }
 
 /// The Mac mini's prepared tree, and the admission pass alone, come out

@@ -416,6 +416,7 @@ fn sleep_waits_for_the_ap_and_a_wake_reports_its_source_in_mbsw() {
     let mut smc = smc.with_wake_bits(WakeBits {
         power_button: Some(0),
         rtc: Some(48),
+        lid: None,
     });
     write_key(&mut smc, &sram, b"NTAP", &[1]);
     // `slpa` makes the sleep pending; `waka` before the SoC slept

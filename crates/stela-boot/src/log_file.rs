@@ -115,6 +115,17 @@ static DEVICE_SKIPS: output::Global<Skips> = output::Global(core::cell::RefCell:
 static EARLIER: output::Global<Option<stela_boot_core::wifi_prompt::Earlier>> =
     output::Global(core::cell::RefCell::new(None));
 
+/// The earlier boot's newest Intel GuC record (`intel_guc::earlier`), as
+/// [`open`] read it: none when it holds none or the log was not read.
+static EARLIER_GUC: output::Global<Option<stela_boot_core::intel_guc::Record>> =
+    output::Global(core::cell::RefCell::new(None));
+
+/// The earlier boot's Intel GuC record [`open`] read.
+#[cfg_attr(not(feature = "intel"), allow(dead_code))]
+pub fn earlier_guc() -> Option<stela_boot_core::intel_guc::Record> {
+    EARLIER_GUC.0.try_borrow().ok().and_then(|record| *record)
+}
+
 /// The earlier boot [`open`] read, for the startup menu's Wi-Fi page.
 pub fn earlier() -> Option<stela_boot_core::wifi_prompt::Earlier> {
     EARLIER.0.try_borrow().ok().and_then(|earlier| *earlier)
@@ -144,6 +155,9 @@ fn read_device_skips(device: &mut dyn BlockDevice) {
     // The newest boot is in these bytes whole, this boot's marker not yet.
     if let Ok(mut earlier) = EARLIER.0.try_borrow_mut() {
         *earlier = Some(stela_boot_core::wifi_prompt::earlier(&newest));
+    }
+    if let Ok(mut record) = EARLIER_GUC.0.try_borrow_mut() {
+        *record = stela_boot_core::intel_guc::earlier(&newest);
     }
     let skips = device_starts::read(&newest);
     for function in skips.iter() {

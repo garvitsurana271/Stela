@@ -74,6 +74,8 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// So do the fork's `--tier2 on|off` and `--tier2-check`, hand-written
 /// opt-ins that run (and check) the engine's second compilation tier: no
 /// line setup writes holds them.
+/// So does the fork's `--i915-guc auto|off`, a hand-written override that
+/// starts i915 without its GuC: no line setup writes holds it.
 pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.

@@ -83,6 +83,7 @@ pub mod hpet;
 pub mod install_caution;
 pub mod install_mode;
 pub mod install_progress;
+pub mod intel_guc;
 pub mod interrupt_image;
 pub mod ioapic;
 pub mod irq_context;

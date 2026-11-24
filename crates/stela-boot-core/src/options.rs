@@ -405,6 +405,14 @@ pub const KEEP_RUNNING_ON_PANIC: &str = "--keep-running-on-panic";
 /// 13; it stays off by default until a boot has proven it.
 pub const TLBI_KEEP: &str = "--tlbi-keep";
 
+/// Whether i915 starts an Intel GPU with its GuC (`--i915-guc auto|off`,
+/// auto unless given): `auto` runs GuC submission unless the earlier boot
+/// recorded this GPU's GuC failing, when it starts i915 with
+/// `i915.enable_guc=0` (execlists); `off` always does
+/// ([`crate::intel_guc`]). A hand-written override for debugging that setup
+/// never writes, so the options revision stays 13.
+pub const I915_GUC: &str = "--i915-guc";
+
 /// With `--tlbi-keep on`, also walk every entry verification keeps in full
 /// and drop it, counted as a mismatch, where the walk differs
 /// (`--tlbi-verify-check`): a debug safety mode, hand-written like
@@ -779,6 +787,9 @@ pub struct System {
     /// [`TLBI_KEEP`]'s value, unset where the line has none
     /// ([`Self::tlbi_keep`]).
     pub tlbi_keep: Option<bool>,
+    /// [`I915_GUC`]'s value, unset where the line has none
+    /// ([`Self::i915_guc`]).
+    pub i915_guc: Option<crate::intel_guc::Setting>,
     /// Walk every entry a kept context's verification keeps in full as
     /// well ([`TLBI_VERIFY_CHECK`]).
     pub tlbi_verify_check: bool,
@@ -940,6 +951,7 @@ impl Default for System {
             host_core: None,
             keep_running_on_panic: false,
             tlbi_keep: None,
+            i915_guc: None,
             tlbi_verify_check: false,
             core_trial: false,
             tier2: None,
@@ -1181,6 +1193,11 @@ impl System {
     /// saved, since compile was 1-4% of PE time (boots 29-30, 2026-11-23).
     pub fn pack_preload(&self) -> bool {
         self.pack_preload == Some(true)
+    }
+
+    /// Whether i915 may start an Intel GPU's GuC: `--i915-guc`, else auto.
+    pub fn i915_guc(&self) -> crate::intel_guc::Setting {
+        self.i915_guc.unwrap_or_default()
     }
 
     /// Whether tier 2 runs: `--tier2 on`, or `--tier2-check`.
@@ -1567,6 +1584,7 @@ impl fmt::Display for System {
             self.tlbi_keep.map(|keep| if keep { "on" } else { "off" }),
         )?;
         line.flag(TLBI_VERIFY_CHECK, self.tlbi_verify_check)?;
+        line.value(I915_GUC, self.i915_guc.map(crate::intel_guc::Setting::name))?;
         line.flag(CORE_TRIAL, self.core_trial)?;
         line.value(TIER2, self.tier2.map(|on| if on { "on" } else { "off" }))?;
         line.flag(TIER2_CHECK, self.tier2_check)?;

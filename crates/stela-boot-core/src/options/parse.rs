@@ -60,6 +60,14 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateTlbiKeep);
                 }
             }
+            I915_GUC => {
+                let setting = value()
+                    .and_then(crate::intel_guc::Setting::parse)
+                    .ok_or(Error::I915Guc)?;
+                if options.i915_guc.replace(setting).is_some() {
+                    return Err(Error::DuplicateI915Guc);
+                }
+            }
             TLBI_VERIFY_CHECK => flag(
                 &mut options.tlbi_verify_check,
                 Error::DuplicateTlbiVerifyCheck,

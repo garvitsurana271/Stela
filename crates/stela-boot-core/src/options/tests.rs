@@ -86,6 +86,33 @@ fn a_laptop_takes_its_features_unless_laptop_off_and_the_option_round_trips() {
 }
 
 #[test]
+fn i915_takes_its_guc_unless_i915_guc_is_off_and_the_option_round_trips() {
+    use crate::intel_guc::Setting;
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(plain.i915_guc, None);
+    assert_eq!(plain.i915_guc(), Setting::Auto);
+    assert_eq!(plain.to_string(), "--system");
+    for (text, setting) in [
+        ("--system --i915-guc auto", Setting::Auto),
+        ("--system --i915-guc off", Setting::Off),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.i915_guc(), setting);
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --i915-guc", Error::I915Guc),
+        ("--system --i915-guc on", Error::I915Guc),
+        (
+            "--system --i915-guc auto --i915-guc off",
+            Error::DuplicateI915Guc,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
+#[test]
 fn a_hybrid_laptops_panel_is_copied_by_the_cpu_unless_hybrid_scanout_is_on() {
     let plain = System::parse("--system").unwrap();
     assert!(!plain.hybrid_scanout());

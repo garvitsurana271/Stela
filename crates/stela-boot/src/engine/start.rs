@@ -163,6 +163,13 @@ pub extern "sysv64" fn entry(handoff: u64) -> ! {
         && !options.bundle_repair
         && let Some(reason) = gpu::no_metal_device()
     {
+        // An Intel GPU whose GuC failed starts without it next time.
+        #[cfg(feature = "intel")]
+        if let Some(stop) = gpu::intel_guc::second_start() {
+            output::fatal(format_args!(
+                "{stop}. macOS cannot run without a GPU: {reason}"
+            ));
+        }
         output::fatal(format_args!("macOS cannot run without a GPU: {reason}"));
     }
     let boot = Boot {
@@ -3613,6 +3620,8 @@ fn start_devices(
             #[cfg(feature = "nvk")]
             gpu::display::set_hybrid_scanout(options.hybrid_scanout());
             gpu::link::choose(options.gpu_aspm());
+            #[cfg(feature = "intel")]
+            gpu::intel_guc::set_setting(options.i915_guc());
             if options.boots_macos()
                 && let Ok(work) = work
                 && let Some(mut fallback) = open_gpus(

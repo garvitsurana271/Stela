@@ -51,6 +51,12 @@ pub fn without_huc(driver: &str) -> String {
     format!("{driver}.huc_firmware_path=")
 }
 
+/// i915 without its GuC (`enable_guc=0`): execlists submission and its own
+/// frequency control, no HuC (`intel_uc.c`).
+pub fn without_guc(driver: &str) -> String {
+    format!("{driver}.enable_guc=0")
+}
+
 /// An empty path for the GSC image of Intel `driver`, which turns its
 /// security controller off.
 pub fn without_gsc(driver: &str) -> String {
@@ -130,6 +136,9 @@ mod tests {
                     without_huc(driver),
                     without_gsc(driver),
                 ]);
+                if driver == "i915" {
+                    words.push(without_guc(driver));
+                }
             }
         }
         // amdgpu's link masks for a discrete GPU (`amdgpu_drv.c`).

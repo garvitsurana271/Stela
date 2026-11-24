@@ -99,7 +99,7 @@ fn on(option: &str) -> bool {
     value(option) == "on"
 }
 
-fn forks() -> [Fork; 12] {
+fn forks() -> [Fork; 13] {
     [
         Fork {
             valid: &["--acpi-hardware"],
@@ -215,6 +215,17 @@ fn forks() -> [Fork; 12] {
             ],
             duplicate: Some(Error::DuplicatePackPreload),
         },
+        Fork {
+            valid: &["--i915-guc auto", "--i915-guc off"],
+            set: |o, t| o.i915_guc = crate::intel_guc::Setting::parse(&t["--i915-guc ".len()..]),
+            bad: &[
+                ("--i915-guc", Error::I915Guc),
+                ("--i915-guc on", Error::I915Guc),
+                ("--i915-guc OFF", Error::I915Guc),
+                ("--i915-guc 0", Error::I915Guc),
+            ],
+            duplicate: Some(Error::DuplicateI915Guc),
+        },
     ]
 }
 
@@ -263,6 +274,8 @@ fn setup_lines_and_the_stick_s_choices_mean_what_they_meant() {
         assert!(!options.core_trial);
         assert!(options.tier2.is_none() && !options.tier2_check && !options.tier2_runs());
         assert!(options.pack_preload.is_none() && !options.pack_preload());
+        assert_eq!(options.i915_guc, None);
+        assert_eq!(options.i915_guc(), crate::intel_guc::Setting::Auto);
     }
 }
 

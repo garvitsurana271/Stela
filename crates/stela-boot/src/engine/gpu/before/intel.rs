@@ -203,6 +203,14 @@ impl Drivers {
                     words.push(gpu::command_line::without_gsc(driver));
                 }
             }
+            // Execlists in place of GuC submission, after a GuC failure or
+            // by hand (`crate::engine::gpu::intel_guc`).
+            if driver == "i915"
+                && let Some(platform) = self.i915.as_ref().map(|platform| platform.name)
+                && crate::engine::gpu::intel_guc::off_for(device, platform)
+            {
+                words.push(gpu::command_line::without_guc(driver));
+            }
         }
         words
     }

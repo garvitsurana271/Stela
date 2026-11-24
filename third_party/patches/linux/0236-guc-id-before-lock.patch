@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Garvit Surana <251430630+garvitsurana271@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:31:07 +0000
+Subject: [PATCH] fix(i915): a kernel built with CONFIG_STELA takes a context's
+ guc_id from the IDA before submission_state's lock, where the IDA's blocking
+ allocation under that IRQs-off lock was refused and Raptor Lake P's GuC
+ submission enable failed with -EAGAIN
+
+new_guc_id calls ida_alloc_range with GFP_KERNEL | __GFP_RETRY_MAYFAIL
+under submission_state.lock, a spin_lock_irqsave. The first kernel
+context's pin needs a new IDA bitmap and xarray node; Linux's slab serves
+that from its free lists, Stela's refuses a blocking request in an atomic
+context ("cache allocation policy or context"). new_guc_id then failed
+with -ENOMEM, steal_guc_id found no unpinned guc_id and returned -EAGAIN
+on each of pin_guc_id's four tries, so guc_init_submission, and with it
+intel_guc_submission_enable, failed with -EAGAIN: "GT0: GuC initialization
+failed -11", "Enabling uc failed (-5)", a wedged GT, and Mesa's ANV then
+refused the GPU for want of context isolation.
+
+pin_guc_id may sleep, so it now reserves the guc_id with the same flags
+before taking the lock and the locked part takes the reservation; one it
+does not take is freed after the lock. Under the lock, without a
+reservation, the IDA is asked with GFP_NOWAIT only. set_ctx_id_mapping's
+GFP_ATOMIC store, which Stela serves only from a ready slot, says when it
+fails, as a context missing from the lookup loses its G2H messages.
+---
+ .../gpu/drm/i915/gt/uc/intel_guc_submission.c | 82 ++++++++++++++++++-
+ 1 file changed, 80 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+index 788e59cdfac9b80706acb722855b1413fe1f4ff3..dd6101f1aa4f89cc803ef480b1a28cc172752fd3 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_guc_submission.c
+@@ -580,14 +580,30 @@ static inline void set_ctx_id_mapping(struct intel_guc *guc, u32 id,
+ 				      struct intel_context *ce)
+ {
+ 	unsigned long flags;
++#if IS_ENABLED(CONFIG_STELA)
++	void *old;
++#endif
+ 
+ 	/*
+ 	 * xarray API doesn't have xa_save_irqsave wrapper, so calling the
+ 	 * lower level functions directly.
+ 	 */
+ 	xa_lock_irqsave(&guc->context_lookup, flags);
++#if IS_ENABLED(CONFIG_STELA)
++	/*
++	 * Stela's slab serves a GFP_ATOMIC request only from a slot it holds
++	 * ready, never by growing, so a failed store is said: a context the
++	 * lookup lacks has its G2H messages dropped as for an unknown guc_id.
++	 */
++	old = __xa_store(&guc->context_lookup, id, ce, GFP_ATOMIC);
++	xa_unlock_irqrestore(&guc->context_lookup, flags);
++	if (unlikely(xa_is_err(old)))
++		guc_err(guc, "guc_id %u has no lookup entry: %d\n", id,
++			xa_err(old));
++#else
+ 	__xa_store(&guc->context_lookup, id, ce, GFP_ATOMIC);
+ 	xa_unlock_irqrestore(&guc->context_lookup, flags);
++#endif
+ }
+ 
+ static inline void clr_ctx_id_mapping(struct intel_guc *guc, u32 id)
+@@ -2262,7 +2278,30 @@ static void guc_submit_request(struct i915_request *rq)
+ 	spin_unlock_irqrestore(&sched_engine->lock, flags);
+ }
+ 
+-static int new_guc_id(struct intel_guc *guc, struct intel_context *ce)
++#if IS_ENABLED(CONFIG_STELA)
++/*
++ * The guc_id an unlocked caller took from the IDA before submission_state's
++ * lock (pin_guc_id): ida_alloc_range under that lock, which holds IRQs off,
++ * makes its blocking allocations of the IDA's bitmap and xarray node in an
++ * atomic context, which Linux's slab serves from its free lists and Stela's
++ * refuses ("cache allocation policy or context"). The refused allocation
++ * failed new_guc_id with -ENOMEM, steal_guc_id found no guc_id to take at
++ * the first kernel context's pin and GuC submission's enable failed with
++ * -EAGAIN, wedging Raptor Lake P's GT ("GuC initialization failed -11").
++ */
++static int guc_id_reserve(struct intel_guc *guc, gfp_t gfp)
++{
++	return ida_alloc_range(&guc->submission_state.guc_ids,
++			       NUMBER_MULTI_LRC_GUC_ID(guc),
++			       guc->submission_state.num_guc_ids - 1, gfp);
++}
++#endif
++
++static int new_guc_id(struct intel_guc *guc, struct intel_context *ce
++#if IS_ENABLED(CONFIG_STELA)
++		      , int *reserved
++#endif
++		      )
+ {
+ 	int ret;
+ 
+@@ -2273,11 +2312,20 @@ static int new_guc_id(struct intel_guc *guc, struct intel_context *ce)
+ 					      NUMBER_MULTI_LRC_GUC_ID(guc),
+ 					      order_base_2(ce->parallel.number_children
+ 							   + 1));
++#if IS_ENABLED(CONFIG_STELA)
++	else if (*reserved >= 0) {
++		ret = *reserved;
++		*reserved = -ENOENT;
++	} else
++		/* Under the lock: only storage the IDA already holds. */
++		ret = guc_id_reserve(guc, GFP_NOWAIT | __GFP_NOWARN);
++#else
+ 	else
+ 		ret = ida_alloc_range(&guc->submission_state.guc_ids,
+ 				      NUMBER_MULTI_LRC_GUC_ID(guc),
+ 				      guc->submission_state.num_guc_ids - 1,
+ 				      GFP_KERNEL | __GFP_RETRY_MAYFAIL | __GFP_NOWARN);
++#endif
+ 	if (unlikely(ret < 0))
+ 		return ret;
+ 
+@@ -2356,14 +2404,22 @@ static int steal_guc_id(struct intel_guc *guc, struct intel_context *ce)
+ 	}
+ }
+ 
+-static int assign_guc_id(struct intel_guc *guc, struct intel_context *ce)
++static int assign_guc_id(struct intel_guc *guc, struct intel_context *ce
++#if IS_ENABLED(CONFIG_STELA)
++			 , int *reserved
++#endif
++			 )
+ {
+ 	int ret;
+ 
+ 	lockdep_assert_held(&guc->submission_state.lock);
+ 	GEM_BUG_ON(intel_context_is_child(ce));
+ 
++#if IS_ENABLED(CONFIG_STELA)
++	ret = new_guc_id(guc, ce, reserved);
++#else
+ 	ret = new_guc_id(guc, ce);
++#endif
+ 	if (unlikely(ret < 0)) {
+ 		if (intel_context_is_parent(ce))
+ 			return -ENOSPC;
+@@ -2389,16 +2445,34 @@ static int pin_guc_id(struct intel_guc *guc, struct intel_context *ce)
+ {
+ 	int ret = 0;
+ 	unsigned long flags, tries = PIN_GUC_ID_TRIES;
++#if IS_ENABLED(CONFIG_STELA)
++	int reserved;
++#endif
+ 
+ 	GEM_BUG_ON(atomic_read(&ce->guc_id.ref));
+ 
+ try_again:
++#if IS_ENABLED(CONFIG_STELA)
++	/*
++	 * pin_guc_id may sleep (it sleeps below between its tries), so the
++	 * IDA's storage is allocated here, before the lock. A reservation the
++	 * locked part does not take goes back after it.
++	 */
++	reserved = -ENOENT;
++	if (context_guc_id_invalid(ce) && !intel_context_is_parent(ce))
++		reserved = guc_id_reserve(guc, GFP_KERNEL | __GFP_RETRY_MAYFAIL |
++					  __GFP_NOWARN);
++#endif
+ 	spin_lock_irqsave(&guc->submission_state.lock, flags);
+ 
+ 	might_lock(&ce->guc_state.lock);
+ 
+ 	if (context_guc_id_invalid(ce)) {
++#if IS_ENABLED(CONFIG_STELA)
++		ret = assign_guc_id(guc, ce, &reserved);
++#else
+ 		ret = assign_guc_id(guc, ce);
++#endif
+ 		if (ret)
+ 			goto out_unlock;
+ 		ret = 1;	/* Indidcates newly assigned guc_id */
+@@ -2409,6 +2483,10 @@ try_again:
+ 
+ out_unlock:
+ 	spin_unlock_irqrestore(&guc->submission_state.lock, flags);
++#if IS_ENABLED(CONFIG_STELA)
++	if (reserved >= 0)
++		ida_free(&guc->submission_state.guc_ids, reserved);
++#endif
+ 
+ 	/*
+ 	 * -EAGAIN indicates no guc_id are available, let's retire any
+-- 
+2.43.0
+

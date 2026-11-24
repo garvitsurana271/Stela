@@ -24,6 +24,8 @@ pub(super) mod display;
 mod file;
 #[cfg(feature = "nvk")]
 pub(super) mod gate;
+#[cfg(feature = "intel")]
+pub(super) mod intel_guc;
 pub(super) mod link;
 /// `xtask guest`'s objects of the StelaGPU kext.
 #[cfg(feature = "nvk")]
@@ -1178,6 +1180,8 @@ impl Platform for Host {
         super::step_watchdog::progress();
         let message = message.to_str().unwrap_or("(not UTF-8)").trim_end();
         self.report(format_args!("<{level}> {message}"));
+        #[cfg(feature = "intel")]
+        intel_guc::observe(level, message);
         #[cfg(feature = "nvk")]
         gate::driver_line(message);
         // KERN_ALERT to KERN_ERR; KERN_EMERG is a terminal stop's own report.

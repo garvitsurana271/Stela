@@ -196,6 +196,11 @@ pub(crate) struct MockBackend {
     /// The bytes of memory the driver has: an allocation past them fails
     /// as out of memory until memory is destroyed.
     pub(crate) memory_limit: Option<u64>,
+    /// A wait on a semaphore lets the GPU finish everything submitted
+    /// first ([`Self::finish`]), as a GPU still running does while the
+    /// caller waits; the waits made, by semaphore, value and timeout.
+    pub(crate) finish_on_wait: bool,
+    pub(crate) waits: Vec<(Semaphore, u64, u64)>,
     /// The bytes of each live allocation, by memory.
     pub(crate) live_memory: BTreeMap<u64, u64>,
     /// How often the device asked for the driver's heaps.
@@ -725,7 +730,11 @@ impl Backend for MockBackend {
         self.semaphores.insert(semaphore.0, value);
         Ok(())
     }
-    fn wait_semaphore(&mut self, semaphore: Semaphore, value: u64, _: u64) -> Result<bool> {
+    fn wait_semaphore(&mut self, semaphore: Semaphore, value: u64, timeout: u64) -> Result<bool> {
+        self.waits.push((semaphore, value, timeout));
+        if self.finish_on_wait {
+            self.finish();
+        }
         Ok(self.semaphores[&semaphore.0] >= value)
     }
     fn submit(&mut self, segments: &[Segment]) -> Result<()> {

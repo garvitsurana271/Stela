@@ -3872,6 +3872,117 @@ fn a_device_on_a_share_refuses_what_the_share_would_not_hold() {
         .unwrap();
 }
 
+/// A device on a share that would refuse an allocation while released
+/// memory waits for the GPU's work in flight waits for that work, retires
+/// it and makes the allocation, with a note of its own, where it refused
+/// it as out of memory: a burst a frame ahead of the GPU (Setup's glass UI
+/// on a Vega 7, ten command buffers behind) failed WindowServer's commit.
+/// What the share would not hold with nothing in flight is still refused,
+/// with no wait.
+#[test]
+fn a_device_short_of_memory_waits_for_the_work_in_flight_before_it_refuses() {
+    use super::reclaim::RETIRE_WAIT_NS;
+    use super::share::ShareState;
+    fn state() -> Option<ShareState> {
+        Some(ShareState {
+            held: 400 << 20,
+            limit: 1024 << 20,
+        })
+    }
+    let mut backend = MockBackend::new();
+    backend.finish_on_wait = true;
+    let mut device = device_on(backend);
+    device.share_memory(state);
+    // 1024M less a 64M margin and Linux's 400M hold 448M of the guest's at
+    // 1.25 bytes each: seven 64M buffers.
+    let private = options(StorageMode::Private);
+    let mut buffers: Vec<_> = (0..7)
+        .map(|_| device.new_buffer(64 << 20, private).unwrap())
+        .collect();
+    assert_eq!(
+        device.new_buffer(64 << 20, private).err(),
+        Some(Error::OutOfMemory)
+    );
+    assert!(device.backend().waits.is_empty(), "nothing was in flight");
+    while device.take_memory_note().is_some() {}
+    // Two released while work that may read them runs wait for it.
+    let running = submit(&mut device);
+    for buffer in buffers.drain(..2) {
+        device.destroy_buffer(buffer).unwrap();
+    }
+    assert_eq!(device.memory().deferred_bytes, 128 << 20);
+    buffers.push(device.new_buffer(64 << 20, private).unwrap());
+    let timeline = device.timeline;
+    assert_eq!(
+        device.backend().waits,
+        [(timeline, running, RETIRE_WAIT_NS)]
+    );
+    assert_eq!(device.completed_serial(), running);
+    assert_eq!(device.memory().deferred_bytes, 0);
+    assert_eq!(device.out_of_memory_averted(), 1);
+    let note = device.take_memory_note().unwrap();
+    assert!(
+        note.starts_with("OUT OF MEMORY AVERTED 1: ")
+            && note.contains(
+                " was made once the GPU finished 1 command buffers, whose retirement freed 128M"
+            )
+            && note.ends_with("; the GPU's share of RAM: Linux holds 400M of 1024M"),
+        "{note}"
+    );
+    // One more fits beside the six; past it the share refuses, with nothing
+    // in flight to wait for.
+    buffers.push(device.new_buffer(64 << 20, private).unwrap());
+    assert_eq!(
+        device.new_buffer(64 << 20, private).err(),
+        Some(Error::OutOfMemory)
+    );
+    assert_eq!(device.backend().waits.len(), 1);
+    assert_eq!(device.out_of_memory_averted(), 1);
+}
+
+/// Work in flight that does not finish within the wait leaves the
+/// allocation refused, as before; once it completes the memory is free.
+#[test]
+fn a_device_whose_work_in_flight_runs_on_refuses_after_its_wait() {
+    use super::reclaim::RETIRE_WAIT_NS;
+    use super::share::ShareState;
+    fn state() -> Option<ShareState> {
+        Some(ShareState {
+            held: 400 << 20,
+            limit: 1024 << 20,
+        })
+    }
+    let mut device = device_on(MockBackend::new());
+    device.share_memory(state);
+    let private = options(StorageMode::Private);
+    let mut buffers: Vec<_> = (0..7)
+        .map(|_| device.new_buffer(64 << 20, private).unwrap())
+        .collect();
+    let running = submit(&mut device);
+    for buffer in buffers.drain(..2) {
+        device.destroy_buffer(buffer).unwrap();
+    }
+    assert_eq!(
+        device.new_buffer(64 << 20, private).err(),
+        Some(Error::OutOfMemory)
+    );
+    let timeline = device.timeline;
+    assert_eq!(
+        device.backend().waits,
+        [(timeline, running, RETIRE_WAIT_NS)]
+    );
+    assert_eq!(device.memory().deferred_bytes, 128 << 20);
+    assert_eq!(device.out_of_memory_averted(), 0);
+    let note = device.take_memory_note().unwrap();
+    assert!(
+        note.starts_with("OUT OF MEMORY 1: ") && note.contains("it kept nothing to free;"),
+        "{note}"
+    );
+    complete(&mut device, running);
+    assert_eq!(device.memory().deferred_bytes, 0);
+    device.new_buffer(64 << 20, private).unwrap();
+}
+
 /// A test build's cap makes the device's allocations run out of memory at
 /// that many bytes held, with the same freeing and the same notes as a
 /// driver that is full.

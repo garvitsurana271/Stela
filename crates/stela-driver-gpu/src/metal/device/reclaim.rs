@@ -15,6 +15,18 @@
 //! ([`Device::note_memory_step`]), so a log shows how full the device memory
 //! was before anything failed.
 //!
+//! What the GPU's work in flight holds back is freed only as that work
+//! completes: released objects it may still read, and the upload chunks it
+//! carries. So when freeing what the device keeps is not enough, the device
+//! waits, at most [`RETIRE_WAIT_NS`], for the GPU to finish what it was
+//! given, retires it and frees again before the allocation fails: a burst
+//! of allocations a frame ahead of the GPU (Setup's Liquid Glass UI, which
+//! blurs full-screen RGBA16F targets) then waits for the frames it replaces
+//! rather than fails a WindowServer commit, which ends WindowServer. The
+//! share's and a test build's caps still refuse what they would not hold.
+//! An allocation the wait saved leaves a note of its own
+//! ([`Device::note_saved`]).
+//!
 //! A test build may hold the device to a count of bytes
 //! ([`VRAM_CAP`](crate::metal::vulkan::physical::VRAM_CAP)), at which its
 //! allocations run out of memory as a full driver's would: a GPU with much
@@ -39,6 +51,12 @@ use alloc::{collections::VecDeque, format, string::String, sync::Arc};
 /// Notes the device keeps until a call takes them.
 const NOTES: usize = 8;
 
+/// The longest a device out of memory waits for the GPU to finish the work
+/// in flight: about twice the slowest frame measured, 112 ms of GPU time for
+/// one frame of Setup's Liquid Glass UI on a Vega 7 (gfx 9.3) with ten
+/// command buffers in flight.
+pub const RETIRE_WAIT_NS: u64 = 250_000_000;
+
 /// What a device out of memory gave up to try again, in bytes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Reclaimed {
@@ -48,11 +66,27 @@ pub struct Reclaimed {
     pub chunks: u64,
     /// Released objects a bounded retirement had left undestroyed.
     pub released: u64,
+    /// The command buffers that finished while the device waited for the
+    /// work in flight, and the bytes their retirement freed: released
+    /// objects they held back (upload chunks they carried count in
+    /// `chunks`).
+    pub retired: usize,
+    pub retired_bytes: u64,
 }
 
 impl Reclaimed {
     fn any(&self) -> bool {
-        self.recycled != 0 || self.chunks != 0 || self.released != 0
+        self.recycled != 0 || self.chunks != 0 || self.released != 0 || self.retired_bytes != 0
+    }
+
+    fn and(self, more: Self) -> Self {
+        Self {
+            recycled: self.recycled + more.recycled,
+            chunks: self.chunks + more.chunks,
+            released: self.released + more.released,
+            retired: self.retired + more.retired,
+            retired_bytes: self.retired_bytes + more.retired_bytes,
+        }
     }
 }
 
@@ -64,6 +98,12 @@ const STEP_BYTES: u64 = 64 << 20;
 #[derive(Debug, Default)]
 pub(super) struct Shortage {
     count: u64,
+    /// The allocations made only once the work in flight retired.
+    saved: u64,
+    /// The device polls to retire the work in flight
+    /// ([`Device::retire_in_flight`]); an allocation that makes waits no
+    /// more.
+    retiring: bool,
     next_step: u64,
     notes: VecDeque<String>,
 }
@@ -142,14 +182,74 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         if !matches!(first, Err(Error::OutOfMemory)) || self.host_call_withdrawn() {
             return first;
         }
-        let reclaimed = self.reclaim()?;
-        let made = if reclaimed.any() && !self.over_cap() && !self.share_refuses(bytes) {
+        let mut reclaimed = self.reclaim()?;
+        let mut made = if reclaimed.any() && self.would_hold(bytes) {
             make(&mut self.backend)
         } else {
             first
         };
-        self.note_shortage(what, reclaimed, made.is_ok());
+        // Still short: what the work in flight holds back, once it is done.
+        let mut saved = false;
+        if matches!(made, Err(Error::OutOfMemory)) && !self.host_call_withdrawn() {
+            let retired = self.retire_in_flight();
+            if retired.retired != 0 {
+                let more = retired.and(self.reclaim()?);
+                reclaimed = reclaimed.and(more);
+                if more.any() && self.would_hold(bytes) {
+                    made = make(&mut self.backend);
+                    saved = made.is_ok();
+                }
+            }
+        }
+        let what = what();
+        match saved {
+            true => self.note_saved(&what, reclaimed),
+            false => self.note_shortage(&what, reclaimed, made.is_ok()),
+        }
         made
+    }
+
+    /// Whether neither a test build's cap nor the share refuses an
+    /// allocation of `bytes`.
+    fn would_hold(&mut self, bytes: u64) -> bool {
+        !self.over_cap() && !self.share_refuses(bytes)
+    }
+
+    /// Waits, at most [`RETIRE_WAIT_NS`], for the GPU to finish the work it
+    /// was given whole, when that work holds back released objects or upload
+    /// chunks ([`super::queue::Queue::retiring_serial`]), and retires what
+    /// finished, a wait that timed out included: the command buffers retired
+    /// and the bytes of released objects their retirement destroyed. Nothing
+    /// when no such work runs, the device is lost or the wait fails, or
+    /// within an allocation the retirement itself made.
+    fn retire_in_flight(&mut self) -> Reclaimed {
+        if self.lost || self.shortage.retiring {
+            return Reclaimed::default();
+        }
+        let Some(serial) = self.queue.retiring_serial(!self.deferred.is_empty()) else {
+            return Reclaimed::default();
+        };
+        let (flights, allocated) = (self.queue.in_flight_count(), self.allocated);
+        if let Err(error) = self
+            .backend
+            .wait_semaphore(self.timeline, serial, RETIRE_WAIT_NS)
+        {
+            if error == Error::DeviceLost {
+                self.mark_lost();
+            }
+            return Reclaimed::default();
+        }
+        self.shortage.retiring = true;
+        let polled = self.poll();
+        self.shortage.retiring = false;
+        if polled.is_err() {
+            return Reclaimed::default();
+        }
+        Reclaimed {
+            retired: flights.saturating_sub(self.queue.in_flight_count()),
+            retired_bytes: allocated.saturating_sub(self.allocated),
+            ..Reclaimed::default()
+        }
     }
 
     /// Whether a test build's cap leaves the device no memory: it holds as
@@ -237,6 +337,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             recycled,
             chunks,
             released,
+            ..Reclaimed::default()
         })
     }
 
@@ -262,17 +363,24 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         bytes
     }
 
-    fn note_shortage(&mut self, what: impl FnOnce() -> String, reclaimed: Reclaimed, made: bool) {
+    fn note_shortage(&mut self, what: &str, reclaimed: Reclaimed, made: bool) {
         self.shortage.count += 1;
         let count = self.shortage.count;
         if !count.is_power_of_two() || self.shortage.notes.len() >= NOTES {
             return;
         }
         let mib = |bytes: u64| bytes >> 20;
+        let waited = match reclaimed.retired {
+            0 => String::new(),
+            retired => format!(
+                " once the GPU finished {retired} command buffers, whose retirement freed {}M,",
+                mib(reclaimed.retired_bytes)
+            ),
+        };
         let outcome = match (reclaimed.any(), made) {
-            (false, _) => String::from("it kept nothing to free"),
+            (false, _) => format!("it kept nothing to free{}", waited.trim_end_matches(',')),
             (true, made) => format!(
-                "it freed recycled={}M chunks={}M released={}M and tried again, which {}",
+                "it freed recycled={}M chunks={}M released={}M{waited} and tried again, which {}",
                 mib(reclaimed.recycled),
                 mib(reclaimed.chunks),
                 mib(reclaimed.released),
@@ -282,9 +390,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let held = self.memory();
         let driver = self.driver_heaps();
         self.shortage.notes.push_back(format!(
-            "OUT OF MEMORY {count}: {} failed; {outcome}; the device holds allocated={}M \
+            "OUT OF MEMORY {count}: {what} failed; {outcome}; the device holds allocated={}M \
              deferred={}M behind {} command buffers recycled={}M chunks={}M; {driver}{}",
-            what(),
             mib(held.allocated),
             mib(held.deferred_bytes),
             held.in_flight,
@@ -292,6 +399,41 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             mib(held.chunks.bytes),
             self.share_note(),
         ));
+    }
+
+    /// Counts an allocation made only once the work in flight retired
+    /// ([`Self::retire_in_flight`]), among the shortages too, and notes the
+    /// first and each power of two after: what was made, what the wait and
+    /// the freeing gave, and what the device holds now.
+    fn note_saved(&mut self, what: &str, reclaimed: Reclaimed) {
+        self.shortage.count += 1;
+        self.shortage.saved += 1;
+        let saved = self.shortage.saved;
+        if !saved.is_power_of_two() || self.shortage.notes.len() >= NOTES {
+            return;
+        }
+        let mib = |bytes: u64| bytes >> 20;
+        let held = self.memory();
+        self.shortage.notes.push_back(format!(
+            "OUT OF MEMORY AVERTED {saved}: {what} was made once the GPU finished {} command \
+             buffers, whose retirement freed {}M, and the device freed recycled={}M chunks={}M \
+             released={}M; the device holds allocated={}M deferred={}M behind {} command \
+             buffers{}",
+            reclaimed.retired,
+            mib(reclaimed.retired_bytes),
+            mib(reclaimed.recycled),
+            mib(reclaimed.chunks),
+            mib(reclaimed.released),
+            mib(held.allocated),
+            mib(held.deferred_bytes),
+            held.in_flight,
+            self.share_note(),
+        ));
+    }
+
+    /// The allocations made only once the work in flight retired.
+    pub fn out_of_memory_averted(&self) -> u64 {
+        self.shortage.saved
     }
 
     /// The driver's heaps as it counts them now, for a note. Not asked

@@ -949,6 +949,53 @@ fn receive_config_for(version: u8, receive: &Ring) -> u32 {
     config
 }
 
+/// Linux rtl_rar_set's writes of `mac` to the station address registers,
+/// high word first, each read back through the bus; the configuration
+/// registers are unlocked around it by the caller.
+fn write_station<R: Registers, T: Timer>(
+    hw: &Hardware<'_, R, T>,
+    mac: Mac,
+) -> Result<(), BlockError> {
+    let r = hw.registers;
+    let low = u32::from_le_bytes(mac.0[..4].try_into().expect("MAC low word"));
+    let high = u32::from(u16::from_le_bytes([mac.0[4], mac.0[5]]));
+    r.write32(MAC4, high);
+    r.read8(COMMAND);
+    r.write32(MAC0, low);
+    r.read8(COMMAND);
+    if hw.revision.version == 34 {
+        // Linux rtl_rar_exgmac_set: both EXGMAC address representations,
+        // including reserved bytes which may keep stale firmware state.
+        hw.eri_write(0xe0, 15, low)?;
+        hw.eri_write(0xe4, 15, high)?;
+        hw.eri_write(
+            0xf0,
+            15,
+            u32::from(u16::from_le_bytes([mac.0[0], mac.0[1]])) << 16,
+        )?;
+        hw.eri_write(
+            0xf4,
+            15,
+            u32::from_le_bytes(mac.0[2..].try_into().expect("MAC upper word")),
+        )?;
+    }
+    Ok(())
+}
+
+/// A running chip's station address changed to `mac`, as Linux's
+/// rtl_set_mac_address does: rtl_rar_set with the configuration registers
+/// unlocked, and locked again whatever came of it.
+fn adopt_station<R: Registers, T: Timer>(
+    hw: &Hardware<'_, R, T>,
+    mac: Mac,
+) -> Result<(), BlockError> {
+    let r = hw.registers;
+    r.write8(CONFIG_LOCK, CONFIG_UNLOCKED);
+    let result = write_station(hw, mac);
+    r.write8(CONFIG_LOCK, CONFIG_LOCKED);
+    result
+}
+
 fn publish<R: Registers, T: Timer>(
     hw: &Hardware<'_, R, T>,
     rx: &Ring,
@@ -959,28 +1006,7 @@ fn publish<R: Registers, T: Timer>(
     let revision = hw.revision;
     r.write8(CONFIG_LOCK, CONFIG_UNLOCKED);
     let result: Result<(), BlockError> = (|| {
-        let low = u32::from_le_bytes(mac.0[..4].try_into().expect("MAC low word"));
-        let high = u32::from(u16::from_le_bytes([mac.0[4], mac.0[5]]));
-        r.write32(MAC4, high);
-        r.read8(COMMAND);
-        r.write32(MAC0, low);
-        r.read8(COMMAND);
-        if revision.version == 34 {
-            // Linux rtl_rar_exgmac_set: both EXGMAC address representations,
-            // including reserved bytes which may keep stale firmware state.
-            hw.eri_write(0xe0, 15, low)?;
-            hw.eri_write(0xe4, 15, high)?;
-            hw.eri_write(
-                0xf0,
-                15,
-                u32::from(u16::from_le_bytes([mac.0[0], mac.0[1]])) << 16,
-            )?;
-            hw.eri_write(
-                0xf4,
-                15,
-                u32::from_le_bytes(mac.0[2..].try_into().expect("MAC upper word")),
-            )?;
-        }
+        write_station(hw, mac)?;
         // Linux rtl_set_rx_max_size, where rtl_hw_start writes it: no frame
         // passes one receive buffer.
         r.write16(RX_MAXIMUM, rx.receive_maximum());
@@ -1066,6 +1092,23 @@ impl Link for Realtek {
     }
     fn signals(&self) -> bool {
         self.signalled
+    }
+    fn adopts_station(&self) -> bool {
+        true
+    }
+    /// The station address registers rewritten ([`adopt_station`]); the
+    /// receive filter keeps its broadcast, multicast and own-address
+    /// acceptance, which now names `mac`.
+    fn adopt_station(&mut self, mac: Mac) -> bool {
+        if !mac.is_valid() || self.device.read32(TX_CONFIG) == u32::MAX {
+            return false;
+        }
+        let hardware = Hardware::new(&self.device, &self.clock, self.revision, self.function);
+        let adopted = adopt_station(&hardware, mac).is_ok();
+        if adopted {
+            self.mac = mac;
+        }
+        adopted
     }
     fn diagnostic(&mut self) -> Option<String> {
         if self.device.read32(TX_CONFIG) == u32::MAX {

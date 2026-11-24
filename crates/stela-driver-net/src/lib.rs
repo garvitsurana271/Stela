@@ -213,6 +213,19 @@ pub trait Link {
     fn take_join(&mut self) -> Option<Join> {
         None
     }
+    /// Whether [`Self::adopt_station`] can work on this adapter, known
+    /// without touching it: a wired adapter whose driver writes its station
+    /// address registers, as Linux's `ndo_set_mac_address` does.
+    fn adopts_station(&self) -> bool {
+        false
+    }
+    /// Receive frames sent to `mac` from now on, in place of the adapter's
+    /// own address, and send from it ([`Self::mac`]): whether it did. The
+    /// guest network moves macOS, whose address is the first adapter's, to
+    /// another adapter so.
+    fn adopt_station(&mut self, _mac: Mac) -> bool {
+        false
+    }
 }
 
 mod timing;

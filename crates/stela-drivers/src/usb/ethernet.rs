@@ -286,6 +286,20 @@ impl Backend {
             Self::Asix(c) => c.link_down().await,
         }
     }
+    async fn set_station(&mut self, mac: Mac) -> Result<(), BlockError> {
+        match self {
+            Self::Realtek(_) => Err(BlockError::Unsupported(
+                "RTL815x station address change not implemented",
+            )),
+            Self::Asix(c) => c.set_station(mac).await,
+        }
+    }
+    fn last_phy(&self) -> Option<u16> {
+        match self {
+            Self::Realtek(_) => None,
+            Self::Asix(c) => c.last_phy(),
+        }
+    }
     async fn stop(&mut self) -> Result<(), BlockError> {
         match self {
             Self::Realtek(chip) => chip.stop().await,
@@ -347,6 +361,18 @@ enum Work {
     ResetOutput,
 }
 
+impl Work {
+    /// The work's name in the link's state line.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Carrier => "carrier",
+            Self::LinkDown => "link-down",
+            Self::ClearInput => "clear-input",
+            Self::ResetOutput => "reset-output",
+        }
+    }
+}
+
 /// Device work run a step per link call, each step ending at the first
 /// control transfer, command or wait not yet complete, so no call holds the
 /// processor for the seconds a slow device's transfers may take. It holds
@@ -394,6 +420,18 @@ pub struct UsbEthernet {
     carrier: bool,
     closed: bool,
     stopped: bool,
+    /// A station address [`Link::adopt_station`] took, written to the chip
+    /// at the start of the next carrier check.
+    station: Option<Mac>,
+    /// What the link's state line ([`Link::diagnostic`]) gives: carrier
+    /// checks ended, links lost, the PHY status the last check read and the
+    /// failure that closed the link. 0.6.0 kept none for a USB adapter, so
+    /// an AX88179A whose link went down 107 ms after it came up, and never
+    /// came back, left no line of why.
+    checks: u32,
+    downs: u32,
+    phy: Option<u16>,
+    failure: Option<String>,
     pub firmware: Option<firmware::Receipt>,
     /// Why the chip runs without its firmware patch: the file was missing
     /// or failed validation, and r8152 then starts the chip unpatched.
@@ -522,6 +560,11 @@ impl UsbEthernet {
             carrier: false,
             closed: false,
             stopped: false,
+            station: None,
+            checks: 0,
+            downs: 0,
+            phy: None,
+            failure: None,
             firmware,
             firmware_skipped,
             rx_dropped: 0,
@@ -552,9 +595,19 @@ impl UsbEthernet {
         });
     }
 
+    /// The carrier check, which first writes a station address the link
+    /// took since the last one ([`Link::adopt_station`]).
     fn begin_carrier(&mut self) {
-        self.begin(Work::Carrier, |mut chip| async move {
-            let result = chip.carrier().await;
+        let station = self.station.take();
+        self.begin(Work::Carrier, move |mut chip| async move {
+            let written = match station {
+                Some(mac) => chip.set_station(mac).await,
+                None => Ok(()),
+            };
+            let result = match written {
+                Ok(()) => chip.carrier().await,
+                Err(error) => Err(error),
+            };
             Finished { chip, result }
         });
     }
@@ -602,6 +655,7 @@ impl UsbEthernet {
                 return Poll::Pending;
             };
             let work = self.running.take().unwrap().work;
+            let name = work.name();
             self.chip = Some(finished.chip);
             if let Err(error) = finished
                 .result
@@ -609,6 +663,7 @@ impl UsbEthernet {
             {
                 self.closed = true;
                 self.carrier = false;
+                self.failure = Some(format!("{name}: {error}"));
                 return Poll::Ready(Err(error));
             }
         }
@@ -619,6 +674,8 @@ impl UsbEthernet {
     fn finished(&mut self, work: Work, linked: bool) -> Result<(), BlockError> {
         match work {
             Work::Carrier => {
+                self.checks = self.checks.saturating_add(1);
+                self.phy = self.chip.as_ref().and_then(Backend::last_phy);
                 // A clock that keeps no deadline checks at every call.
                 self.link_due = self
                     .controller
@@ -628,6 +685,7 @@ impl UsbEthernet {
                     .ok();
                 if self.carrier && !linked {
                     self.carrier = false;
+                    self.downs = self.downs.saturating_add(1);
                     self.begin_link_down();
                 } else {
                     self.carrier = linked;
@@ -780,6 +838,46 @@ impl UsbEthernet {
 impl Link for UsbEthernet {
     fn mac(&self) -> Mac {
         self.mac
+    }
+    /// What the link keeps of its own state, with no register read and no
+    /// address: the work under way, whether a failure closed the link and
+    /// which, the carrier, the checks and losses so far and the PHY status
+    /// the last check read.
+    fn diagnostic(&mut self) -> Option<String> {
+        let phy = self.phy.map_or(alloc::string::String::from("-"), |phy| {
+            format!("{phy:#06x}")
+        });
+        Some(format!(
+            "work={} closed={} carrier={} checks={} downs={} physr={phy} station_pending={} failure={}",
+            self.running
+                .as_ref()
+                .map_or("none", |running| running.work.name()),
+            self.closed,
+            self.carrier,
+            self.checks,
+            self.downs,
+            self.station.is_some(),
+            self.failure.as_deref().unwrap_or("-"),
+        ))
+    }
+    fn adopts_station(&self) -> bool {
+        match (&self.binding.kind, &self.chip) {
+            (Kind::Asix(_), Some(Backend::Asix(chip))) => chip.sets_station(),
+            (Kind::Asix(identity), None) => !matches!(identity, asix::Identity::Ax88772 { .. }),
+            _ => false,
+        }
+    }
+    /// Taken at once and written to the chip at the start of the next
+    /// carrier check, a step at a time as the link's other work.
+    fn adopt_station(&mut self, mac: Mac) -> bool {
+        if !self.adopts_station() || self.closed || !mac.is_valid() {
+            return false;
+        }
+        self.station = Some(mac);
+        self.mac = mac;
+        // The check that writes it is due now.
+        self.link_due = None;
+        true
     }
     fn carrier(&mut self) -> bool {
         self.update_carrier().is_ok() && self.carrier

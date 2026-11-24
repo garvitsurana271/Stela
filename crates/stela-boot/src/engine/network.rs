@@ -229,6 +229,14 @@ impl RootLink {
         Some(self.device.take_join())
     }
 
+    /// [`Link::adopt_station`] for a service turn, as
+    /// [`Self::transmit_now`].
+    fn adopt_now(&mut self, mac: Mac) -> Option<bool> {
+        // SAFETY: as in `carrier`.
+        let _root = unsafe { RestoreRoot::try_enter(self.root) }?;
+        Some(self.device.adopt_station(mac))
+    }
+
     /// [`Link::receive`] for a service turn, as [`Self::transmit_now`].
     fn receive_now(&mut self) -> Option<Result<Option<Vec<u8>>, LinkError>> {
         // SAFETY: as in `carrier`.
@@ -805,12 +813,40 @@ impl stela_runtime::restore::tss::Transport for Offline {
     }
 }
 
+/// A started wired adapter macOS's network may move to ([`GuestNetwork`]).
+struct Spare {
+    link: RootLink,
+    /// Since when its carrier has been up, in ms from the guest network's
+    /// opening; none while down.
+    up_since: Option<u64>,
+    /// Whether it refused the guest's station address: it is not tried
+    /// again.
+    refused: bool,
+}
+
 /// The guest's USB Ethernet adapter bridged to a host adapter of its own
 /// (`--guest-network`). The adapter keeps the host adapter's station
 /// address, so the guest is that adapter on the host's network and the
 /// adapter needs no promiscuous mode. Frames move between engine slices.
+///
+/// The other started wired adapters whose drivers can take another station
+/// address stay started as spares: while the host adapter has no carrier
+/// and one of them has a link that held, macOS moves to it, which takes the
+/// guest's address (`network_link::guest_switch`). A 0.6.0 boot kept the
+/// adapter chosen at the start, with or without a link, for the whole boot.
 pub struct GuestNetwork {
     link: RootLink,
+    /// The guest's station address: the first host adapter's, which a
+    /// spare takes when macOS moves to it.
+    guest_mac: Mac,
+    spares: Vec<Spare>,
+    /// Since when the host adapter's carrier has been down, and up, in ms
+    /// from [`Self::opened`]; it counts as down from the opening.
+    down_since: Option<u64>,
+    up_since: Option<u64>,
+    /// Whether this link's wired network was recorded for the next boot's
+    /// menu, once it held (`network_link::WIRED_STEADY_MS`).
+    wired_recorded: bool,
     up: Option<bool>,
     /// The guest adapter's counters at the last status, for [`Self::report`].
     counters: stela_soc::machine::UsbNetworkCounters,
@@ -974,7 +1010,9 @@ impl GuestNetwork {
     /// runs, has taken its adapter first ([`HostNetwork::open`]), so the
     /// guest never takes the only adapter with a cable from an install.
     /// `ssid` is the configured Wi-Fi network's name, hidden in what a Wi-Fi
-    /// adapter's link says.
+    /// adapter's link says. The wired adapters left that can take the
+    /// guest's station address are taken from `links` as spares
+    /// ([`Self::carrier`]); the rest stay there, to be stopped.
     pub fn open(links: &mut Links, ssid: Option<&str>) -> Result<Self> {
         if links.devices.is_empty() {
             return Err(refuse!(
@@ -998,8 +1036,33 @@ impl GuestNetwork {
             super::ident::Kind::Network,
             format_args!("{}", device.location()),
         );
+        let guest_mac = device.mac();
+        let mut spares = Vec::new();
+        let mut at = 0;
+        while at < links.devices.len() {
+            let candidate = &links.devices[at];
+            if candidate.wireless() || !candidate.adopts_station() {
+                at += 1;
+                continue;
+            }
+            let spare = links.devices.remove(at);
+            output::arguments(format_args!(
+                "GUEST NETWORK spare adapter {} kept started: macOS moves to it while its own has no link\n",
+                spare.location()
+            ));
+            spares.push(Spare {
+                link: RootLink::new(spare, links.root, None),
+                up_since: None,
+                refused: false,
+            });
+        }
         Ok(Self {
             link: RootLink::new(device, links.root, ssid),
+            guest_mac,
+            spares,
+            down_since: Some(0),
+            up_since: None,
+            wired_recorded: false,
             up: None,
             counters: Default::default(),
             refused: false,
@@ -1018,7 +1081,7 @@ impl GuestNetwork {
     }
 
     pub fn mac(&self) -> Mac {
-        self.link.mac()
+        self.guest_mac
     }
 
     /// The host adapter's carrier, looked at once per [`CARRIER_MILLIS`],
@@ -1026,15 +1089,25 @@ impl GuestNetwork {
     /// macOS sees a host link without carrier as an unplugged cable, and
     /// asks for an address again when it comes up. Each change is logged,
     /// so a log tells a host link that never came up from one whose frames
-    /// went missing. `None` between looks, or while another processor is
-    /// inside the host drivers.
+    /// went missing. While it has none, the spares are looked at too, and
+    /// macOS moves to one whose link held ([`Self::move_to_spare`]). `None`
+    /// between looks, or while another processor is inside the host
+    /// drivers.
     pub fn carrier(&mut self) -> Option<bool> {
         if self.carrier.is_some() && output::millis_since(self.carrier_checked) < CARRIER_MILLIS {
             return None;
         }
         let carrier = self.link.carrier_now()?;
         self.carrier_checked = output::now();
+        let now = output::millis_since(self.opened);
         if self.carrier.replace(carrier) != Some(carrier) {
+            if carrier {
+                self.up_since = Some(now);
+                self.down_since = None;
+            } else {
+                self.up_since = None;
+                self.down_since.get_or_insert(now);
+            }
             // What the adapter's own work took at most on the way to the
             // change: a Wi-Fi keeper's association, which held PE 0 for
             // 101 ms in boot 23, now waits across turns.
@@ -1049,12 +1122,18 @@ impl GuestNetwork {
                 self.link.device.location(),
                 if carrier { "up" } else { "down" }
             ));
-            // The next boot's menu leaves its Wi-Fi page closed after a
-            // boot whose wired network was up (`wifi_prompt`).
-            if carrier && !self.link.device.wireless() {
-                let line = stela_boot_core::wifi_prompt::Record::Wired.line();
-                output::arguments(format_args!("{line}"));
-            }
+        }
+        // The next boot's menu leaves its Wi-Fi page closed after a boot
+        // whose wired network was up (`wifi_prompt`): once its link held,
+        // so a port that blinks up for a moment does not close it.
+        if carrier
+            && !self.wired_recorded
+            && !self.link.device.wireless()
+            && network_link::steady(self.up_since, now, network_link::WIRED_STEADY_MS)
+        {
+            self.wired_recorded = true;
+            let line = stela_boot_core::wifi_prompt::Record::Wired.line();
+            output::arguments(format_args!("{line}"));
         }
         // What a Wi-Fi join came to, for the next boot's menu.
         if let Some(Some(join)) = self.link.join_now()
@@ -1062,7 +1141,76 @@ impl GuestNetwork {
         {
             output::arguments(format_args!("{}", record.line()));
         }
+        if !carrier && self.move_to_spare(now) {
+            // The new adapter's carrier is looked at, and logged, next.
+            return Some(false);
+        }
         Some(carrier)
+    }
+
+    /// While the host adapter has no carrier, each spare's, and macOS moved
+    /// to the first whose link held once the adapter's has been down long
+    /// enough (`network_link::guest_switch`): the spare takes the guest's
+    /// station address and the adapter becomes a spare. Whether it moved.
+    fn move_to_spare(&mut self, now: u64) -> bool {
+        for spare in self.spares.iter_mut().filter(|spare| !spare.refused) {
+            let Some(up) = spare.link.carrier_now() else {
+                return false;
+            };
+            spare.up_since = match up {
+                true => spare.up_since.or(Some(now)),
+                false => None,
+            };
+        }
+        let since: Vec<Option<u64>> = self
+            .spares
+            .iter()
+            .map(|spare| spare.up_since.filter(|_| !spare.refused))
+            .collect();
+        let Some(index) = network_link::guest_switch(now, self.down_since, &since) else {
+            return false;
+        };
+        let spare = &mut self.spares[index];
+        match spare.link.adopt_now(self.guest_mac) {
+            Some(true) => {}
+            Some(false) => {
+                spare.refused = true;
+                spare.up_since = None;
+                output::arguments(format_args!(
+                    "GUEST NETWORK spare adapter {} refused the guest's station address; macOS stays\n",
+                    spare.link.device.location()
+                ));
+                return false;
+            }
+            None => return false,
+        }
+        let held = since[index].map_or(0, |up| now.saturating_sub(up));
+        let down = self.down_since.map_or(0, |down| now.saturating_sub(down));
+        let spare = self.spares.remove(index);
+        let old = core::mem::replace(&mut self.link, spare.link);
+        output::arguments(format_args!(
+            "GUEST NETWORK moved to host adapter {} from {}: no link there for {down} ms, a link here for {held} ms\n",
+            self.link.device.location(),
+            old.device.location()
+        ));
+        super::ident::set(
+            super::ident::Kind::Network,
+            format_args!("{}", self.link.device.location()),
+        );
+        self.spares.push(Spare {
+            link: old,
+            up_since: None,
+            refused: false,
+        });
+        // The new adapter's carrier is looked at at once, its change logged
+        // and its receive signal pointed as the first link's was.
+        self.carrier = None;
+        self.down_since = Some(now);
+        self.up_since = None;
+        self.wired_recorded = false;
+        self.longest_step = None;
+        self.retargeted = false;
+        true
     }
 
     /// Report the guest's link state as `status` gives it.

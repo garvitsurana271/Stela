@@ -533,3 +533,102 @@ fn a_protective_mbr_is_its_boot_signature_and_a_type_0xee_entry() {
     assert!(!protective(&[0; 512]));
     assert!(!protective(&[0x55; 511]));
 }
+
+/// What a firmware reported for disks it lists without a usable size: the
+/// UFS logical unit of a Lenovo 500w Gen 5 reported 0 bytes, and its
+/// geometry divided by zero in `entry_blocks` when the picker drew it.
+const NO_SIZE: [Disk; 3] = [
+    Disk {
+        block_bytes: 0,
+        blocks: 1 << 20,
+    },
+    Disk {
+        block_bytes: 4096,
+        blocks: 0,
+    },
+    Disk {
+        block_bytes: 0,
+        blocks: 0,
+    },
+];
+
+#[test]
+fn a_disk_that_reports_no_size_has_no_usable_blocks_and_never_panics() {
+    for disk in NO_SIZE {
+        assert!(!disk.reports_size(), "{disk:?}");
+        assert_eq!(disk.usable(), None, "{disk:?}");
+        assert!(
+            Disk::new(disk.block_bytes, disk.blocks).is_err(),
+            "{disk:?}"
+        );
+        // Every query answers, whatever it answers, instead of panicking.
+        let _ = (disk.entry_blocks(), disk.first_usable(), disk.last_usable());
+        let _ = disk.minimum_blocks();
+        let mut reads = 0;
+        let found = read(disk, |_, _| {
+            reads += 1;
+            Ok(Vec::new())
+        });
+        assert!(found.is_err(), "{disk:?}");
+        assert_eq!(reads, 0, "{disk:?} was read");
+        assert!(plan(disk, None, request(), counter()).is_err(), "{disk:?}");
+        assert!(parse_header(disk, 1, &[0; 512]).is_err(), "{disk:?}");
+        let table = Table {
+            disk_guid: Guid([1; 16]),
+            partitions: Vec::new(),
+            slots: Vec::new(),
+        };
+        assert!(encode(disk, &table).is_err(), "{disk:?}");
+    }
+}
+
+#[test]
+fn a_disk_too_small_for_a_gpt_has_no_usable_blocks() {
+    for block_bytes in [512, 4096] {
+        let least = Disk {
+            block_bytes,
+            blocks: 1,
+        }
+        .minimum_blocks();
+        // 512-byte blocks: 2 * (2 + 32) + 1; 4096-byte blocks: 2 * (2 + 4) + 1.
+        assert_eq!(least, if block_bytes == 512 { 69 } else { 13 });
+        for blocks in [1, 2, 3, least / 2, least - 1] {
+            let disk = Disk {
+                block_bytes,
+                blocks,
+            };
+            assert!(disk.reports_size());
+            assert_eq!(disk.usable(), None, "{disk:?}");
+            assert!(Disk::new(block_bytes, blocks).is_err(), "{disk:?}");
+            // The usable range does not underflow on a tiny disk.
+            assert_eq!(
+                disk.last_usable(),
+                blocks.saturating_sub(2 + disk.entry_blocks())
+            );
+            assert!(read(disk, |_, _| Ok(Vec::new())).is_err());
+        }
+        // The smallest disk that holds one has two usable blocks.
+        let disk = Disk::new(block_bytes, least).unwrap();
+        let (first, end) = disk.usable().unwrap();
+        assert_eq!(end - first, 2);
+    }
+}
+
+#[test]
+fn a_valid_disk_keeps_its_geometry_and_usable_range() {
+    assert_eq!(Disk::new(DISK.block_bytes, DISK.blocks).unwrap(), DISK);
+    assert_eq!(DISK.entry_blocks(), 32);
+    assert_eq!(DISK.first_usable(), 34);
+    assert_eq!(DISK.last_usable(), DISK.blocks - 34);
+    assert_eq!(DISK.usable(), Some((34, DISK.blocks - 33)));
+    let big = Disk::new(4096, DISK.blocks / 8).unwrap();
+    assert_eq!(big.usable(), Some((6, big.blocks - 5)));
+    // A block size no GPT here is written with keeps its usable range,
+    // as before, and `new` still refuses it.
+    let odd = Disk {
+        block_bytes: 8192,
+        blocks: 1 << 20,
+    };
+    assert_eq!(odd.usable(), Some((4, (1 << 20) - 3)));
+    assert!(Disk::new(odd.block_bytes, odd.blocks).is_err());
+}

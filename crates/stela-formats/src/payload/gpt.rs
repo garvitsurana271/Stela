@@ -193,6 +193,12 @@ impl Partition {
 }
 
 /// A disk's geometry: logical block size and number of blocks.
+///
+/// The fields are whatever the firmware reported, which may be nothing: a
+/// UFS logical unit with no media reports a block size of 0, or 0 blocks.
+/// [`Disk::new`] accepts only a geometry a GPT fits on, and [`Disk::usable`]
+/// says whether one does; the methods below never panic on any geometry,
+/// and for one that holds a GPT they are exact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Disk {
     pub block_bytes: u64,
@@ -200,22 +206,56 @@ pub struct Disk {
 }
 
 impl Disk {
-    /// The blocks the 16 KiB entry array takes at each end.
+    /// `block_bytes` and `blocks` as a geometry every function here
+    /// accepts: a supported block size, and at least [`Disk::minimum_blocks`].
+    pub fn new(block_bytes: u64, blocks: u64) -> Result<Self, PayloadError> {
+        let disk = Self {
+            block_bytes,
+            blocks,
+        };
+        disk.validate()?;
+        Ok(disk)
+    }
+
+    /// The blocks the 16 KiB entry array takes at each end. A block size of
+    /// 0, which no GPT has, counts as 1 byte rather than dividing by zero.
     pub fn entry_blocks(&self) -> u64 {
-        ENTRY_ARRAY_BYTES.div_ceil(self.block_bytes)
+        ENTRY_ARRAY_BYTES.div_ceil(self.block_bytes.max(1))
     }
 
     pub fn first_usable(&self) -> u64 {
         2 + self.entry_blocks()
     }
 
+    /// Inclusive; 0 on a disk too small for a GPT rather than underflowing.
     pub fn last_usable(&self) -> u64 {
-        self.blocks - 2 - self.entry_blocks()
+        self.blocks
+            .saturating_sub(2)
+            .saturating_sub(self.entry_blocks())
+    }
+
+    /// The fewest blocks a GPT fits on, as the reader has always required:
+    /// the protective MBR, a header and an entry array at each end, and two
+    /// usable blocks.
+    pub fn minimum_blocks(&self) -> u64 {
+        2 * (2 + self.entry_blocks()) + 1
+    }
+
+    /// Whether the disk reports a size at all: a block size and blocks.
+    pub fn reports_size(&self) -> bool {
+        self.block_bytes != 0 && self.blocks != 0
+    }
+
+    /// The blocks a partition may use, `first_usable` to `last_usable + 1`;
+    /// `None` when the disk reports no size or is too small for a GPT.
+    pub fn usable(&self) -> Option<(u64, u64)> {
+        (self.reports_size() && self.blocks >= self.minimum_blocks())
+            .then(|| (self.first_usable(), self.last_usable() + 1))
     }
 
     fn validate(&self) -> Result<(), PayloadError> {
         if !matches!(self.block_bytes, 512 | 1024 | 2048 | 4096)
-            || self.blocks < 2 * (2 + self.entry_blocks()) + 1
+            || self.blocks < self.minimum_blocks()
         {
             return Err(PayloadError::Disk("unsupported block size or tiny disk"));
         }

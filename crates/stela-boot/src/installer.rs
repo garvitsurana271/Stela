@@ -87,11 +87,17 @@ struct Disk {
 
 impl Disk {
     fn bytes(&self) -> u64 {
-        self.geometry.blocks * self.geometry.block_bytes
+        self.geometry
+            .blocks
+            .saturating_mul(self.geometry.block_bytes)
     }
 
+    /// A MiB in blocks, at least one; one on a disk that reports no block
+    /// size, which the picker refuses (`chosen_disk::size_refusal`).
     fn mib_blocks(&self) -> u64 {
-        (MIB / self.geometry.block_bytes).max(1)
+        MIB.checked_div(self.geometry.block_bytes)
+            .unwrap_or(1)
+            .max(1)
     }
 
     fn partition(&self, index: usize) -> &gpt::Partition {
@@ -626,9 +632,12 @@ fn disks() -> Vec<Disk> {
         if started.as_deref() == Some(path.as_str()) {
             continue;
         }
+        // As the firmware reports it, which may be no size at all: a UFS
+        // logical unit without media reported 0 bytes. Such a disk is
+        // listed, refused, and never read as a GPT.
         let geometry = gpt::Disk {
             block_bytes: u64::from(media.block_size()),
-            blocks: media.last_block() + 1,
+            blocks: media.last_block().checked_add(1).unwrap_or(0),
         };
         let serial = disk_serial(handle, &path);
         // What a disk without a serial number offers, which says why.
@@ -654,14 +663,16 @@ fn disks() -> Vec<Disk> {
             speed: None,
             caution: disk_speed::caution(rotation, None),
         };
-        let found = gpt::read(geometry, |lba, blocks| {
-            disk.read(lba, blocks)
-                .map_err(|error| stela_formats::payload::PayloadError::Io(error.to_string()))
-        });
-        match found {
-            Ok(Found::Table { table, .. }) => disk.table = Some(table),
-            Ok(Found::Blank | Found::Interrupted) => {}
-            Err(_) => disk.foreign = true,
+        if geometry.usable().is_some() {
+            let found = gpt::read(geometry, |lba, blocks| {
+                disk.read(lba, blocks)
+                    .map_err(|error| stela_formats::payload::PayloadError::Io(error.to_string()))
+            });
+            match found {
+                Ok(Found::Table { table, .. }) => disk.table = Some(table),
+                Ok(Found::Blank | Found::Interrupted) => {}
+                Err(_) => disk.foreign = true,
+            }
         }
         // Why Stela's own drivers cannot reach the disk, if they cannot.
         disk.refusal = crate::pci_io::disk_controller(handle)
@@ -675,6 +686,7 @@ fn disks() -> Vec<Disk> {
         .map(|disk| chosen_disk::Candidate {
             serial: disk.serial.as_deref(),
             bytes: disk.bytes(),
+            size: chosen_disk::size_refusal(disk.geometry),
             controller: disk.refusal,
         })
         .collect();
@@ -1204,12 +1216,13 @@ impl Picker {
     }
 }
 
-/// `disk`'s partitions and the free space of a MiB or more between them.
+/// `disk`'s partitions and the free space of a MiB or more between them;
+/// none on a disk that reports no size or is too small for a GPT, which
+/// the picker refuses.
 fn segments_of(disk: &Disk) -> Vec<Segment> {
-    let (first, end) = (
-        disk.geometry.first_usable(),
-        disk.geometry.last_usable() + 1,
-    );
+    let Some((first, end)) = disk.geometry.usable() else {
+        return Vec::new();
+    };
     if disk.foreign {
         return vec![Segment {
             first,

@@ -172,6 +172,13 @@ impl Drivers {
                 self.names()
             ));
         }
+        output::arguments(format_args!(
+            "GPU {address}: {} starts with panel self refresh, panel replay and framebuffer \
+             compression off: Stambha's console draws the display's buffer with the CPU and \
+             sends no flush, so with them a later line, a stop's reason among them, never \
+             reaches the panel\n",
+            self.names()
+        ));
         if let Some(file) = kept {
             output::arguments(format_args!(
                 "GPU {address}: {} loads its security controller (GSC) firmware {file} only so \
@@ -197,6 +204,9 @@ impl Drivers {
             if table {
                 words.push(gpu::command_line::video_bios_table(driver, VBT));
             }
+            // The console's lines, a stop's reason among them, reach the
+            // panel (`command_line::front_buffer_shown`).
+            words.extend(gpu::command_line::front_buffer_shown(driver));
             if controllers.is_some() {
                 words.push(gpu::command_line::without_huc(driver));
                 if kept.is_none() {

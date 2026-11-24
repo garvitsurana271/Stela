@@ -328,6 +328,20 @@ bool stela_linux_cache_prime(struct kmem_cache *cache)
 	return grow_cache(cache, GFP_KERNEL | __GFP_NOWARN) != NULL;
 }
 
+/* An allocation that fails without a line of its own, said once for each
+ * cache and kind (the owner says each text once): a nonblocking request that
+ * finds no ready slot, which this slab never grows a cache for, or a growth
+ * that got no backing. i915's i915_active nodes, taken only with GFP_ATOMIC
+ * under GuC submission, failed this way with nothing in the log, and each of
+ * Mesa's submissions with them with -ENOMEM. */
+static void say_cache_failure(const struct kmem_cache *cache, const char *kind)
+{
+	char text[96];
+
+	snprintf(text, sizeof(text), "%s from cache %s", kind, cache->name);
+	stela_linux_unsupported(text);
+}
+
 void *kmem_cache_alloc_noprof(struct kmem_cache *cache, gfp_t flags)
 {
 	cache = require_cache(cache);
@@ -347,11 +361,15 @@ void *kmem_cache_alloc_noprof(struct kmem_cache *cache, gfp_t flags)
 	while (slab && !slab->free_count)
 		slab = slab->next;
 	if (!slab) {
-		if (!gfpflags_allow_blocking(flags))
+		if (!gfpflags_allow_blocking(flags)) {
+			say_cache_failure(cache, "nonblocking allocation with no ready slot");
 			return NULL;
+		}
 		slab = grow_cache(cache, flags);
-		if (!slab)
+		if (!slab) {
+			say_cache_failure(cache, "growth without backing");
 			return NULL;
+		}
 	}
 	/* A constructor may have performed recursive allocations. */
 	if (cache->live == SIZE_MAX)

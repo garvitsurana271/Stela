@@ -3621,7 +3621,10 @@ fn start_devices(
             gpu::display::set_hybrid_scanout(options.hybrid_scanout());
             gpu::link::choose(options.gpu_aspm());
             #[cfg(feature = "intel")]
-            gpu::intel_guc::set_setting(options.i915_guc());
+            {
+                gpu::intel_guc::set_setting(options.i915_guc());
+                gpu::intel_guc::set_earlier(handoff.intel_guc_earlier);
+            }
             if options.boots_macos()
                 && let Ok(work) = work
                 && let Some(mut fallback) = open_gpus(

@@ -1282,6 +1282,7 @@ fn load(
             stop_record: crate::stop_record::services(),
             runtime_regions: runtime.regions,
             serial_present: crate::serial::present(),
+            intel_guc_earlier: crate::log_file::earlier_guc(),
         });
     }
     // SAFETY: boot services ended; the completed root maps this code and

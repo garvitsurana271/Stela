@@ -86,7 +86,7 @@ fn a_laptop_takes_its_features_unless_laptop_off_and_the_option_round_trips() {
 }
 
 #[test]
-fn i915_takes_its_guc_unless_i915_guc_is_off_and_the_option_round_trips() {
+fn i915_guc_takes_auto_off_or_on_and_the_option_round_trips() {
     use crate::intel_guc::Setting;
     let plain = System::parse("--system").unwrap();
     assert_eq!(plain.i915_guc, None);
@@ -95,6 +95,7 @@ fn i915_takes_its_guc_unless_i915_guc_is_off_and_the_option_round_trips() {
     for (text, setting) in [
         ("--system --i915-guc auto", Setting::Auto),
         ("--system --i915-guc off", Setting::Off),
+        ("--system --i915-guc on", Setting::On),
     ] {
         let options = System::parse(text).unwrap();
         assert_eq!(options.i915_guc(), setting);
@@ -102,7 +103,7 @@ fn i915_takes_its_guc_unless_i915_guc_is_off_and_the_option_round_trips() {
     }
     for (text, error) in [
         ("--system --i915-guc", Error::I915Guc),
-        ("--system --i915-guc on", Error::I915Guc),
+        ("--system --i915-guc ON", Error::I915Guc),
         (
             "--system --i915-guc auto --i915-guc off",
             Error::DuplicateI915Guc,

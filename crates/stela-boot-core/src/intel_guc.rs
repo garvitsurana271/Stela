@@ -9,7 +9,9 @@
 //! failed probe's interrupt line is retired for good. So the boot that sees
 //! the GuC fail writes a [`RECORD`] line in its log, and the next boot,
 //! reading it back as the Wi-Fi page's record is read
-//! (`stela-boot`'s `log_file`), starts i915 with `i915.enable_guc=0`: its
+//! (`stela-boot`'s `log_file`, handed to the engine with the rest of the
+//! loader's reading: the engine runs a copy of the image taken before any
+//! static was set), starts i915 with `i915.enable_guc=0`: its
 //! execlists submission, which every Gen12 part has, with i915's own
 //! frequency and RC6 control in place of the GuC's SLPC. A boot without the
 //! GuC writes the record again, so the boots after it stay without it.
@@ -17,28 +19,36 @@
 //! A record names the device and this build ([`BUILD`]); one of another
 //! device (the stick moved to another PC) or another build (a newer fix to
 //! try) is passed over and the GuC is tried again. `--i915-guc off` turns
-//! the GuC off by hand; `--i915-guc auto`, the default, follows the record.
+//! the GuC off by hand and `--i915-guc on` asks for it, the record still
+//! followed; `--i915-guc auto`, the default, is off on Alder Lake P and
+//! Raptor Lake P or U in this test build ([`off_by_default`]) and follows
+//! the record elsewhere.
 use alloc::{format, string::String};
 
 /// What each record line starts with, after the log's time stamp.
 pub const RECORD: &str = "INTEL GUC RECORD ";
 /// The build whose records this one follows.
-pub const BUILD: &str = "dev64-1";
+pub const BUILD: &str = "dev64-2";
 /// The marker line each boot's log starts with.
 const BOOT: &str = "=== STELA BOOT ";
 
 /// The hand-written `--i915-guc` setting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Setting {
-    /// The GuC, unless the earlier boot recorded it failing.
+    /// The platform's default ([`off_by_default`]); elsewhere the GuC,
+    /// unless the earlier boot recorded it failing.
     #[default]
     Auto,
     /// No GuC: execlists submission.
     Off,
+    /// The GuC, unless the earlier boot recorded it failing, also where
+    /// this build starts without it by default.
+    On,
 }
 
 impl Setting {
-    const NAMES: [(&'static str, Self); 2] = [("auto", Self::Auto), ("off", Self::Off)];
+    const NAMES: [(&'static str, Self); 3] =
+        [("auto", Self::Auto), ("off", Self::Off), ("on", Self::On)];
 
     pub fn parse(word: &str) -> Option<Self> {
         Self::NAMES
@@ -62,6 +72,15 @@ impl Setting {
 /// for submission by default; DG2 and Meteor Lake are left as they are.
 pub fn falls_back(platform: &str) -> bool {
     matches!(platform, "ALDERLAKE_P" | "ALDERLAKE_S" | "DG1")
+}
+
+/// Whether this test build starts the platform without its GuC unless
+/// `--i915-guc on` asks for it: Alder Lake P, whose table holds Raptor Lake
+/// P and U (dev64's a7a0, Ashu's a7ab) and Alder Lake N. Their GuC started
+/// in dev64-1, and each of Mesa's submissions still failed, so this build
+/// tests execlists in one boot.
+pub fn off_by_default(platform: &str) -> bool {
+    platform == "ALDERLAKE_P"
 }
 
 /// How a boot's GuC failed.
@@ -179,30 +198,33 @@ impl Record {
 pub fn earlier(stream: &[u8]) -> Option<Record> {
     let text = String::from_utf8_lossy(stream);
     let boot = text.rfind(BOOT).map_or(&text[..], |at| &text[at..]);
-    boot.lines().filter_map(Record::parse).last()
+    boot.lines().rev().find_map(Record::parse)
 }
 
 /// Whether this boot starts i915's GuC, and why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// GuC submission, as i915's default.
+    /// GuC submission: i915's default, or `--i915-guc on`.
     Guc,
     /// No GuC: `--i915-guc off`.
     OffByHand,
+    /// No GuC: this build's default on the platform ([`off_by_default`]).
+    OffByDefault,
     /// No GuC: the earlier boot's record of this device.
     Fallback(Cause),
 }
 
 impl Mode {
-    /// The mode for `device` under `setting` and the earlier boot's
-    /// `record`.
-    pub fn decide(setting: Setting, record: Option<Record>, device: u16) -> Self {
+    /// The mode for `device`, of i915's `platform`, under `setting` and the
+    /// earlier boot's `record`.
+    pub fn decide(setting: Setting, record: Option<Record>, device: u16, platform: &str) -> Self {
         match (setting, record) {
             (Setting::Off, _) => Self::OffByHand,
-            (Setting::Auto, Some(record)) if record.device == device => {
+            (Setting::Auto, _) if off_by_default(platform) => Self::OffByDefault,
+            (Setting::Auto | Setting::On, Some(record)) if record.device == device => {
                 Self::Fallback(record.cause)
             }
-            (Setting::Auto, _) => Self::Guc,
+            (Setting::Auto | Setting::On, _) => Self::Guc,
         }
     }
 
@@ -230,6 +252,11 @@ impl Mode {
             Self::OffByHand => format!(
                 "INTEL GUC off ({BUILD}): --i915-guc off, starting i915 on {device:04x} without \
                  GuC (execlists)\n"
+            ),
+            Self::OffByDefault => format!(
+                "INTEL GUC off ({BUILD}): this test build's default on Alder Lake P and Raptor \
+                 Lake P or U, starting i915 on {device:04x} without GuC (execlists); \
+                 --i915-guc on starts it with GuC submission\n"
             ),
             Self::Fallback(cause) => format!(
                 "INTEL GUC fallback ({BUILD}): GuC failed last boot ({}), starting i915 on \

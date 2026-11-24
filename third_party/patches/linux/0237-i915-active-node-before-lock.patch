@@ -1,0 +1,271 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Garvit Surana <251430630+garvitsurana271@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:46:16 +0000
+Subject: [PATCH] fix(i915): a kernel built with CONFIG_STELA takes an
+ i915_active node with a blocking allocation before the tree's IRQs-off lock,
+ and says where an execbuf fails and the first user requests that pass and
+ complete, where every Mesa submission on Raptor Lake P failed with -ENOMEM
+ and the Vulkan device was reported lost
+
+active_instance allocates the node of a new (i915_active, timeline) pair
+with GFP_ATOMIC under ref->tree_lock. Linux's slab serves that by growing
+a cache from atomic reserves; Stela's serves a nonblocking request only
+from a slot it already holds and never grows a cache for one. The only
+blocking allocation from i915's active_node cache is
+i915_active_acquire_preallocate_barrier's, which intel_context_active_acquire
+skips under GuC submission, so with the GuC the cache never had a slot:
+the first execbuf of Mesa's ANV failed in eb_move_to_gpu, through
+_i915_vma_move_to_active and i915_active_add_request, with -ENOMEM, as did
+each of Mesa's 80 retries over about 17 s, and ANV then reported
+VK_ERROR_DEVICE_LOST (dev64's a7a0, Ashu's a7ab). Under execlists the few
+slots the barriers grew run out once an execbuf names more buffers than
+they hold.
+
+A caller that may sleep (not in_atomic, IRQs on) now takes its node with
+GFP_KERNEL before the lock, as Linux once did ("Preallocate a replacement,
+just in case"); an unused one is freed after it. A node still missing is
+said once.
+
+i915_gem_do_execbuffer says, at notice level, the stage, error, buffer
+count, flags, engine and submission mode of its first four failures and
+its first three passes, and i915_request_retire says the first three user
+requests it retires with the time since their emission, so one boot tells
+whether submission and its completion interrupt work.
+---
+ .../gpu/drm/i915/gem/i915_gem_execbuffer.c    | 58 +++++++++++++++++++
+ drivers/gpu/drm/i915/i915_active.c            | 30 ++++++++++
+ drivers/gpu/drm/i915/i915_request.c           | 15 +++++
+ 3 files changed, 103 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+index d5aadced7da0cf55c707d6077a9250f8e1128f64..c65ad2c96eb22f14fc13d62fb5bbf1f90f08cfbc 100644
+--- a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+@@ -3334,6 +3334,42 @@ eb_requests_create(struct i915_execbuffer *eb, struct dma_fence *in_fence,
+ 	return out_fence;
+ }
+ 
++#if IS_ENABLED(CONFIG_STELA)
++/*
++ * The first execbuf calls that fail, each with its stage, its error and
++ * what it carried, and the first that pass: Mesa retries an -ENOMEM for
++ * about 17 s and then reports its device lost, with no line saying where
++ * in i915 the error arose (Raptor Lake P, dev64-1).
++ */
++static atomic_t stela_eb_failures = ATOMIC_INIT(0);
++static atomic_t stela_eb_passes = ATOMIC_INIT(0);
++
++static void stela_eb_report(struct drm_i915_private *i915,
++			    const struct drm_i915_gem_execbuffer2 *args,
++			    const char *stage, const char *engine,
++			    const char *submission, int err)
++{
++	if (!err) {
++		if (atomic_inc_return(&stela_eb_passes) <= 3)
++			drm_notice(&i915->drm,
++				   "execbuf passed: %u buffers on %s (%s submission)\n",
++				   args->buffer_count, engine, submission);
++		return;
++	}
++	if (err == -EINTR || err == -ERESTARTSYS)
++		return;
++	if (atomic_inc_return(&stela_eb_failures) > 4)
++		return;
++	drm_notice(&i915->drm,
++		   "execbuf failed at %s: %d; %u buffers, flags %#llx, on %s (%s submission)\n",
++		   stage, err, args->buffer_count,
++		   (unsigned long long)args->flags, engine, submission);
++}
++#define STELA_EB_STAGE(name) (stela_stage = (name))
++#else
++#define STELA_EB_STAGE(name) do { } while (0)
++#endif
++
+ static int
+ i915_gem_do_execbuffer(struct drm_device *dev,
+ 		       struct drm_file *file,
+@@ -3346,6 +3382,10 @@ i915_gem_do_execbuffer(struct drm_device *dev,
+ 	struct sync_file *out_fence = NULL;
+ 	int out_fence_fd = -1;
+ 	int err;
++#if IS_ENABLED(CONFIG_STELA)
++	const char *stela_stage = "its start";
++	const char *stela_engine = "none", *stela_submission = "unknown";
++#endif
+ 
+ 	BUILD_BUG_ON(__EXEC_INTERNAL_FLAGS & ~__I915_EXEC_ILLEGAL_FLAGS);
+ 	BUILD_BUG_ON(__EXEC_OBJECT_INTERNAL_FLAGS &
+@@ -3396,10 +3436,12 @@ i915_gem_do_execbuffer(struct drm_device *dev,
+ 	if (args->flags & I915_EXEC_IS_PINNED)
+ 		eb.batch_flags |= I915_DISPATCH_PINNED;
+ 
++	STELA_EB_STAGE("extensions");
+ 	err = parse_execbuf2_extensions(args, &eb);
+ 	if (err)
+ 		goto err_ext;
+ 
++	STELA_EB_STAGE("fence array");
+ 	err = add_fence_array(&eb);
+ 	if (err)
+ 		goto err_ext;
+@@ -3425,20 +3467,29 @@ i915_gem_do_execbuffer(struct drm_device *dev,
+ 		}
+ 	}
+ 
++	STELA_EB_STAGE("eb_create");
+ 	err = eb_create(&eb);
+ 	if (err)
+ 		goto err_out_fence;
+ 
+ 	GEM_BUG_ON(!eb.lut_size);
+ 
++	STELA_EB_STAGE("eb_select_context");
+ 	err = eb_select_context(&eb);
+ 	if (unlikely(err))
+ 		goto err_destroy;
+ 
++	STELA_EB_STAGE("eb_select_engine (context state)");
+ 	err = eb_select_engine(&eb);
+ 	if (unlikely(err))
+ 		goto err_context;
++#if IS_ENABLED(CONFIG_STELA)
++	stela_engine = eb.context->engine->name;
++	stela_submission = intel_engine_uses_guc(eb.context->engine) ?
++		"GuC" : "execlists";
++#endif
+ 
++	STELA_EB_STAGE("eb_lookup_vmas");
+ 	err = eb_lookup_vmas(&eb);
+ 	if (err) {
+ 		eb_release_vmas(&eb, true);
+@@ -3447,6 +3498,7 @@ i915_gem_do_execbuffer(struct drm_device *dev,
+ 
+ 	i915_gem_ww_ctx_init(&eb.ww, true);
+ 
++	STELA_EB_STAGE("eb_relocate_parse (pin engine, validate vmas)");
+ 	err = eb_relocate_parse(&eb);
+ 	if (err) {
+ 		/*
+@@ -3461,10 +3513,12 @@ i915_gem_do_execbuffer(struct drm_device *dev,
+ 	}
+ 
+ 	ww_acquire_done(&eb.ww.ctx);
++	STELA_EB_STAGE("eb_capture_stage");
+ 	err = eb_capture_stage(&eb);
+ 	if (err)
+ 		goto err_vma;
+ 
++	STELA_EB_STAGE("eb_requests_create (request alloc, fences)");
+ 	out_fence = eb_requests_create(&eb, in_fence, out_fence_fd);
+ 	if (IS_ERR(out_fence)) {
+ 		err = PTR_ERR(out_fence);
+@@ -3475,6 +3529,7 @@ i915_gem_do_execbuffer(struct drm_device *dev,
+ 			goto err_vma;
+ 	}
+ 
++	STELA_EB_STAGE("eb_submit (move to GPU, emit)");
+ 	err = eb_submit(&eb);
+ 
+ err_request:
+@@ -3529,6 +3584,9 @@ err_in_fence:
+ 	dma_fence_put(in_fence);
+ err_ext:
+ 	put_fence_array(eb.fences, eb.num_fences);
++#if IS_ENABLED(CONFIG_STELA)
++	stela_eb_report(i915, args, stela_stage, stela_engine, stela_submission, err);
++#endif
+ 	return err;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/i915_active.c b/drivers/gpu/drm/i915/i915_active.c
+index aa77def0bc0d2fecbc4838c8b68edee4e1ccc67b..e9a0ada1669b0669dc27a67e0ae418b02314b192 100644
+--- a/drivers/gpu/drm/i915/i915_active.c
++++ b/drivers/gpu/drm/i915/i915_active.c
+@@ -289,11 +289,29 @@ active_instance(struct i915_active *ref, u64 idx)
+ {
+ 	struct active_node *node;
+ 	struct rb_node **p, *parent;
++#if IS_ENABLED(CONFIG_STELA)
++	struct active_node *prealloc = NULL;
++#endif
+ 
+ 	node = __active_lookup(ref, idx);
+ 	if (likely(node))
+ 		return &node->base;
+ 
++#if IS_ENABLED(CONFIG_STELA)
++	/*
++	 * Stela's slab serves a GFP_ATOMIC request only from a slot it holds
++	 * ready and never grows a cache for one. The only blocking allocation
++	 * from this cache is a barrier's preallocation, which GuC submission
++	 * skips (intel_context_active_acquire), so with the GuC every node
++	 * below failed and every execbuf returned -ENOMEM from
++	 * eb_move_to_gpu; with execlists the few slots the barriers grew ran
++	 * out under an execbuf of many buffers. A caller that may sleep takes
++	 * its node here, before the IRQs-off lock, as Linux once did.
++	 */
++	if (!in_atomic() && !irqs_disabled())
++		prealloc = kmem_cache_alloc(slab_cache, GFP_KERNEL);
++#endif
++
+ 	spin_lock_irq(&ref->tree_lock);
+ 	GEM_BUG_ON(i915_active_is_idle(ref));
+ 
+@@ -316,7 +334,12 @@ active_instance(struct i915_active *ref, u64 idx)
+ 	 * XXX: We should preallocate this before i915_active_ref() is ever
+ 	 *  called, but we cannot call into fs_reclaim() anyway, so use GFP_ATOMIC.
+ 	 */
++#if IS_ENABLED(CONFIG_STELA)
++	node = prealloc ?: kmem_cache_alloc(slab_cache, GFP_ATOMIC);
++	prealloc = NULL;
++#else
+ 	node = kmem_cache_alloc(slab_cache, GFP_ATOMIC);
++#endif
+ 	if (!node)
+ 		goto err;
+ 
+@@ -330,11 +353,18 @@ active_instance(struct i915_active *ref, u64 idx)
+ out:
+ 	WRITE_ONCE(ref->cache, node);
+ 	spin_unlock_irq(&ref->tree_lock);
++#if IS_ENABLED(CONFIG_STELA)
++	if (prealloc)
++		kmem_cache_free(slab_cache, prealloc);
++#endif
+ 
+ 	return &node->base;
+ 
+ err:
+ 	spin_unlock_irq(&ref->tree_lock);
++#if IS_ENABLED(CONFIG_STELA)
++	pr_notice_once("i915: no memory for an i915_active node (timeline %llu)\n", idx);
++#endif
+ 
+ 	return NULL;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_request.c b/drivers/gpu/drm/i915/i915_request.c
+index d2c7b1090df0813afd11e34831ad5e49d1bba0e1..83d12d71cdf089546ef866f271ceded769da0cb7 100644
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -365,6 +365,21 @@ bool i915_request_retire(struct i915_request *rq)
+ 	GEM_BUG_ON(!i915_sw_fence_signaled(&rq->submit));
+ 	trace_i915_request_retire(rq);
+ 	i915_request_mark_complete(rq);
++#if IS_ENABLED(CONFIG_STELA)
++	{
++		/* The first user requests the GPU finished: its breadcrumb
++		 * reached the HWSP and the retire saw it. */
++		static atomic_t said = ATOMIC_INIT(0);
++
++		if (rq->context != rq->engine->kernel_context &&
++		    !intel_context_is_barrier(rq->context) &&
++		    atomic_inc_return(&said) <= 3)
++			drm_notice(&rq->i915->drm,
++				   "request %llx:%lld on %s completed, retired %u ms after its emission\n",
++				   rq->fence.context, rq->fence.seqno, rq->engine->name,
++				   jiffies_to_msecs(jiffies - rq->emitted_jiffies));
++	}
++#endif
+ 
+ 	__rq_cancel_watchdog(rq);
+ 

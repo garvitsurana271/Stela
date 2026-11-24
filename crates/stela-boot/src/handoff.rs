@@ -164,6 +164,11 @@ pub struct Handoff {
     /// engine runs a copy of this image taken before any Rust state
     /// existed, so it learns the result here, not from its own statics.
     pub(crate) serial_present: bool,
+    /// The earlier boot's Intel GuC record, as the loader read it from the
+    /// USB's log (`log_file::earlier_guc`), for the same reason: dev64-1's
+    /// engine read its own copy of that static, never set, and started the
+    /// GuC again after a boot whose GuC failed.
+    pub(crate) intel_guc_earlier: Option<stela_boot_core::intel_guc::Record>,
 }
 
 /// A read of the firmware's real-time clock: its time as UTC and its

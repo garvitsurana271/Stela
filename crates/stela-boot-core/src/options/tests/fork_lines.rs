@@ -216,11 +216,10 @@ fn forks() -> [Fork; 13] {
             duplicate: Some(Error::DuplicatePackPreload),
         },
         Fork {
-            valid: &["--i915-guc auto", "--i915-guc off"],
+            valid: &["--i915-guc auto", "--i915-guc off", "--i915-guc on"],
             set: |o, t| o.i915_guc = crate::intel_guc::Setting::parse(&t["--i915-guc ".len()..]),
             bad: &[
                 ("--i915-guc", Error::I915Guc),
-                ("--i915-guc on", Error::I915Guc),
                 ("--i915-guc OFF", Error::I915Guc),
                 ("--i915-guc 0", Error::I915Guc),
             ],

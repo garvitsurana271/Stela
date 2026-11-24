@@ -1,0 +1,19 @@
+[   11.426] HOST FIRMWARE phase=before-ebs images=400 bytes=229486025 read_ms=0 catalog_ms=116
+[   11.427] STEP o Reading Stambha's settings (4 s) ms=4322
+[   11.458] STEP Checking the internal SSD and NVRAM t=11.458
+[   11.515] STEP o Checking the internal SSD and NVRAM ms=56
+=== STELA BOOT 22 === version=0.6.1 firmware_clock=2026-11-24T19:52:37
+[   25.997] INTEL GUC on (dev64-1): i915 starts a7a0 with GuC submission and its guc_id taken before the lock; a GuC failure makes the next start go without it
+[   44.535] GPU DRIVER Vulkan device not created for the GPU at PciBusInfo { domain: 0, bus: 0, device: 2, function: 0 }: ERROR_DEVICE_LOST
+[   44.536] GPU 0000:00:02.0: Metal could not open: Device(DeviceLost)
+[   44.536] GPU SUMMARY 0000:00:02.0 8086:a7a0 rev 0x04 Intel Iris Xe Graphics: driver i915 1.6.0 device=0xa7a0 rev=0x4 eus=96; guc=none; memory=5072M; integrated: its memory is the GPU's share of RAM, of which Linux holds 66M of 5072M; the driver gave no memory size; no Vulkan device
+[   44.536] GPU FALLBACK 0000:00:02.0 Intel Iris Xe Graphics: i915 bound it, and its Metal device did not open: Metal could not open: Device(DeviceLost); it still shows the screens wired to it; no other GPU of this PC can draw in its place
+[   44.536] GPU USE draws macOS: none; shows the display: the Intel Iris Xe Graphics at 0000:00:02.0
+[   45.404] BOOT LOG boot=8 offset=0x810000 bytes=0x400000 head=0x43462f
+[   45.406] RTC ANCHOR ticks=0x2d8c429 unix=1795515029
+[   45.409] BUNDLE REPAIR NVRAM result of the last repair: every required step passed and the directories were created
+[   45.409] INTEL GUC RECORD failed device=a7a0 cause=metal build=dev64-1
+[   45.409] 
+[   45.409] STELA FATAL Intel graphics needs a second start; restart the PC. The GuC failed (the Metal device did not open), and the next start runs i915 without it. macOS cannot run without a GPU: no Metal device opened on the GPUs that started; the lines above say why
+[   45.409] GPU firmware left running: the stop is on the CPU that unloads it, and i915's unload is not run from a stop there
+[   45.412] STELA STOPPED code=0x11; power off to continue

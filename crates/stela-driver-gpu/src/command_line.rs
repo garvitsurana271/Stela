@@ -57,6 +57,22 @@ pub fn without_guc(driver: &str) -> String {
     format!("{driver}.enable_guc=0")
 }
 
+/// The Intel display features off that keep a CPU write to the scanned-out
+/// buffer from reaching the panel without a flush i915's front-buffer
+/// tracking sees (DIRTYFB, a page flip): panel self refresh and panel replay,
+/// where the panel shows its own copy of the last frame, and framebuffer
+/// compression, where the plane scans out a compressed copy. Stela's console
+/// draws the display's front buffer with the CPU and flushes nothing, so on
+/// dev64's eDP panel every line after the display's take, the stop's reason
+/// among them, never showed.
+pub fn front_buffer_shown(driver: &str) -> [String; 3] {
+    [
+        format!("{driver}.enable_psr=0"),
+        format!("{driver}.enable_panel_replay=0"),
+        format!("{driver}.enable_fbc=0"),
+    ]
+}
+
 /// An empty path for the GSC image of Intel `driver`, which turns its
 /// security controller off.
 pub fn without_gsc(driver: &str) -> String {
@@ -136,6 +152,7 @@ mod tests {
                     without_huc(driver),
                     without_gsc(driver),
                 ]);
+                words.extend(front_buffer_shown(driver));
                 if driver == "i915" {
                     words.push(without_guc(driver));
                 }

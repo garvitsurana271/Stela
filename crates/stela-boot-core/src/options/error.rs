@@ -266,7 +266,7 @@ impl Error {
             Self::Tier2CheckOff => "--tier2-check runs tier 2, which --tier2 off turns off",
             Self::PackPreload => "--pack-preload takes on or off",
             Self::DuplicatePackPreload => "duplicate --pack-preload",
-            Self::I915Guc => "--i915-guc takes auto or off",
+            Self::I915Guc => "--i915-guc takes auto, off or on",
             Self::DuplicateI915Guc => "duplicate --i915-guc",
             Self::DuplicateAudioHpet => "duplicate audio HPET handoff",
             Self::DuplicateNativePciIoapic => "duplicate native PCI IOAPIC handoff",

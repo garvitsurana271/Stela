@@ -154,6 +154,12 @@ impl Source {
         }
     }
 
+    /// The remote image's reader, when the source is one: its step and its
+    /// reason for a stop before the guest (`Remote::gave_up`).
+    pub fn remote_reader(&self) -> Option<Rc<RefCell<Remote>>> {
+        self.remote.clone()
+    }
+
     /// Reads the image ahead without waiting.
     pub fn pump(&mut self) {
         if let Some(remote) = &self.remote {

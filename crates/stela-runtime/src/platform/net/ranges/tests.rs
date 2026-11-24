@@ -28,6 +28,13 @@ struct Mock {
     open_errors: VecDeque<NetError>,
     read_errors: VecDeque<NetError>,
     now: u64,
+    /// A read hands over bytes at most once in this many milliseconds.
+    trickle_ms: u64,
+    next_at: u64,
+    /// The clock past which a test's read has waited too long: a read that
+    /// never gives up fails the test instead of hanging it.
+    give_up_by: u64,
+    waitings: Vec<Waiting>,
 }
 
 impl Mock {
@@ -42,6 +49,10 @@ impl Mock {
             open_errors: VecDeque::new(),
             read_errors: VecDeque::new(),
             now: 0,
+            trickle_ms: 0,
+            next_at: 0,
+            give_up_by: u64::MAX,
+            waitings: Vec::new(),
         }
     }
 }
@@ -62,9 +73,10 @@ impl RangeSource for Mock {
         if let Some(error) = self.read_errors.pop_front() {
             return Err(error);
         }
-        if self.stalled {
+        if self.stalled || self.now < self.next_at {
             return Ok(false);
         }
+        self.next_at = self.now + self.trickle_ms;
         let n = (self.chunk as u64).min(range.last + 1 - range.next);
         let bytes: Vec<u8> = (range.next..range.next + n).map(byte).collect();
         range.next += n;
@@ -79,6 +91,7 @@ impl RangeSource for Mock {
     fn wait(&mut self, micros: u64) -> Result<(), NetError> {
         self.now += (micros / 1000).max(1);
         self.waits += 1;
+        assert!(self.now < self.give_up_by, "the read never gave up");
         Ok(())
     }
 
@@ -93,6 +106,14 @@ impl RangeSource for Mock {
 
     fn state(&mut self, range: &Range) -> String {
         alloc::format!("next={}", range.next)
+    }
+
+    fn status(&self, _: &Range) -> Option<u16> {
+        Some(206)
+    }
+
+    fn waiting(&mut self, waiting: Waiting) {
+        self.waitings.push(waiting);
     }
 }
 
@@ -346,7 +367,13 @@ fn a_failed_range_says_what_it_got_and_a_failed_read_ahead_is_noted() {
     reader.pump();
     assert_eq!(failed(&reader), 2);
     let source = reader.source();
-    let note = source.notes.last().unwrap();
+    // Its line is followed by the range's end (`Ranges::stop`).
+    let note = &source.notes[source.notes.len() - 2];
+    assert!(
+        source.notes.last().unwrap().contains(" ended status="),
+        "{:?}",
+        source.notes
+    );
     assert!(
         note.starts_with("REMOTE IMAGE read-ahead range at ")
             && note.contains(" failed: ")
@@ -355,4 +382,208 @@ fn a_failed_range_says_what_it_got_and_a_failed_read_ahead_is_noted() {
     );
     assert_eq!(source.live, 0);
     read(&mut reader, 12000, 100).unwrap();
+}
+
+/// The reads before the guest give up after two minutes without a byte,
+/// with the stop's plain reason, where a silent server held the boot for
+/// the install's whole budget (about a quarter of an hour) with nothing on
+/// the screen or in the log.
+#[test]
+fn before_the_guest_a_silent_server_gives_up_after_two_minutes() {
+    let mut reader = ranges();
+    reader.before_guest();
+    reader.source_mut().stalled = true;
+    reader.source_mut().give_up_by = 20 * 60 * 1000;
+    let started = reader.source().now;
+    assert!(read(&mut reader, GIB, READ).is_err());
+    let waited = reader.source().now - started;
+    assert!(
+        (QUIET_BEFORE_GUEST_MS..QUIET_BEFORE_GUEST_MS + 1000).contains(&waited),
+        "gave up after {waited} ms"
+    );
+    let gave_up = reader.gave_up().expect("a reason").clone();
+    assert!(
+        matches!(gave_up, GaveUp::Quiet { last: None, .. }),
+        "{gave_up:?}"
+    );
+    assert_eq!(
+        alloc::format!("{gave_up}"),
+        "Couldn't download macOS from Apple: no data for 2 minutes. Check the network, or put \
+         the install files on the USB with stambha."
+    );
+    // Each wait was told, its quiet growing to the limit.
+    let source = reader.source();
+    let quiet: Vec<u64> = source.waitings.iter().map(|w| w.quiet_ms).collect();
+    assert!(quiet.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(*quiet.last().unwrap() >= QUIET_BEFORE_GUEST_MS - 200);
+    // The range's end was noted, with no first byte.
+    assert!(
+        source.notes.iter().any(|note| note
+            .starts_with("REMOTE IMAGE range 1 ended status=206 got=0 first_byte=none open=")),
+        "{:?}",
+        source.notes
+    );
+    assert_eq!(source.live, 0);
+}
+
+/// A range that fails at once each time gives up after six tries before the
+/// guest, and each try's line and wait say so ("1/6"), where twenty tries
+/// over seven and a half minutes ran first.
+#[test]
+fn before_the_guest_failing_tries_give_up_after_six() {
+    let mut reader = ranges();
+    reader.before_guest();
+    reader.source_mut().give_up_by = 5 * 60 * 1000;
+    for _ in 0..ATTEMPTS {
+        reader.source_mut().open_errors.push_back(NetError::Reset);
+    }
+    assert_eq!(read(&mut reader, GIB, READ), Err(NetError::Reset));
+    assert_eq!(
+        reader.gave_up(),
+        Some(&GaveUp::Attempts {
+            attempts: ATTEMPTS_BEFORE_GUEST,
+            last: NetError::Reset
+        })
+    );
+    let source = reader.source();
+    assert!(source.now < 60_000, "gave up after {} ms", source.now);
+    for attempt in 1..=ATTEMPTS_BEFORE_GUEST {
+        let line = alloc::format!(
+            "REMOTE IMAGE range at {GIB} failed ({attempt}/{ATTEMPTS_BEFORE_GUEST}): "
+        );
+        assert!(
+            source.notes.iter().any(|note| note.starts_with(&line)),
+            "{line} in {:?}",
+            source.notes
+        );
+    }
+    // The waits before each next try say which it is and when it comes.
+    let retry = source
+        .waitings
+        .iter()
+        .find(|w| w.failures == 3)
+        .expect("a wait after the third failure");
+    assert_eq!(retry.attempts, ATTEMPTS_BEFORE_GUEST);
+    assert!(retry.retry_in_ms.is_some_and(|ms| ms <= backoff_ms(3)));
+    let reason = alloc::format!("{}", reader.gave_up().unwrap());
+    assert!(
+        reason.starts_with("Couldn't download macOS from Apple: 6 tries failed, the last with: "),
+        "{reason}"
+    );
+}
+
+/// A server that sends a little at a time keeps the reads before the guest
+/// going for longer than two minutes in all: only silence ends them.
+#[test]
+fn before_the_guest_a_slow_server_is_waited_for() {
+    let mut reader = ranges();
+    reader.before_guest();
+    reader.source_mut().chunk = 4096;
+    reader.source_mut().trickle_ms = 10_000;
+    read(&mut reader, 0, 16 * 4096).unwrap();
+    assert!(reader.source().now > QUIET_BEFORE_GUEST_MS);
+    assert_eq!(reader.gave_up(), None);
+    assert_eq!(reader.received(), 16 * 4096);
+}
+
+/// A refusal no try mends is named for the stop before the guest.
+#[test]
+fn before_the_guest_a_refusal_is_named() {
+    let mut reader = ranges();
+    reader.before_guest();
+    reader
+        .source_mut()
+        .open_errors
+        .push_back(NetError::Status(404));
+    assert_eq!(read(&mut reader, GIB, READ), Err(NetError::Status(404)));
+    assert_eq!(
+        reader.gave_up(),
+        Some(&GaveUp::Refused(NetError::Status(404)))
+    );
+}
+
+/// Once the guest runs (the first bound), the install's own twenty tries
+/// apply again and the transport hears no waits.
+#[test]
+fn once_the_guest_runs_the_install_budget_applies() {
+    let mut reader = ranges();
+    reader.before_guest();
+    reader.bound();
+    reader.source_mut().open_errors.push_back(NetError::Reset);
+    assert!(matches!(
+        read(&mut reader, GIB, READ),
+        Err(NetError::Timeout(_))
+    ));
+    let source = reader.source();
+    let line = alloc::format!("REMOTE IMAGE range at {GIB} failed (1/{ATTEMPTS}): ");
+    assert!(
+        source.notes.iter().any(|note| note.starts_with(&line)),
+        "{:?}",
+        source.notes
+    );
+    assert!(source.waitings.is_empty());
+    assert_eq!(reader.gave_up(), None);
+}
+
+/// Each range's end is noted with its status, the bytes it got, when its
+/// first byte came and how long it was open.
+#[test]
+fn a_ranges_end_says_its_status_bytes_and_times() {
+    let mut reader = ranges();
+    reader.source_mut().chunk = 4096;
+    read(&mut reader, 0, 6000).unwrap();
+    reader.source_mut().read_errors.push_back(NetError::Reset);
+    read(&mut reader, 6000, 6000).unwrap();
+    let source = reader.source();
+    let ended = source
+        .notes
+        .iter()
+        .find(|note| note.starts_with("REMOTE IMAGE range 1 ended "))
+        .expect("the first range's end");
+    assert!(
+        ended.starts_with("REMOTE IMAGE range 1 ended status=206 got=8192 first_byte=0 ms open=")
+            && ended.ends_with(" ms\n"),
+        "{ended}"
+    );
+    assert_eq!(reader.received(), 12288);
+}
+
+/// The step's line names what arrived, the silence and the next try.
+#[test]
+fn a_waits_screen_line_names_the_silence_and_the_next_try() {
+    let waiting = |received, quiet_ms, failures, retry_in_ms| {
+        Waiting {
+            received,
+            quiet_ms,
+            failures,
+            attempts: ATTEMPTS_BEFORE_GUEST,
+            retry_in_ms,
+        }
+        .screen()
+    };
+    assert_eq!(waiting(512 << 10, 300, 0, None), "512 KB read");
+    assert_eq!(waiting(3 << 20, 300, 0, None), "3 MB read");
+    assert_eq!(waiting(0, 31_500, 0, None), "0 KB read, no data for 31 s");
+    assert_eq!(
+        waiting(0, 45_000, 2, Some(3_200)),
+        "try 3/6 in 4 s, no data for 45 s"
+    );
+    assert_eq!(waiting(0, 46_000, 2, None), "try 3/6, no data for 46 s");
+}
+
+/// The reason names the last read's failure: a read that succeeds after
+/// one that gave up leaves none, so a later, unrelated stop is not told as
+/// a download that gave up.
+#[test]
+fn a_read_after_one_that_gave_up_clears_the_reason() {
+    let mut reader = ranges();
+    reader.before_guest();
+    reader
+        .source_mut()
+        .open_errors
+        .push_back(NetError::Status(404));
+    assert!(read(&mut reader, GIB, READ).is_err());
+    assert!(reader.gave_up().is_some());
+    read(&mut reader, GIB, READ).unwrap();
+    assert_eq!(reader.gave_up(), None);
 }

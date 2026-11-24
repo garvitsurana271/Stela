@@ -21,6 +21,14 @@
 //! ([`SEGMENT_BYTES`] in all), so a request that reads several members
 //! again from its first finds those it already read.
 //!
+//! Before the guest runs ([`Ranges::before_guest`]) the reads wait for the
+//! network, but no longer than [`QUIET_BEFORE_GUEST_MS`] without a byte, and
+//! [`ATTEMPTS_BEFORE_GUEST`] attempts at one range: a boot that streams the
+//! image then stops with the cause ([`GaveUp`]) within about two minutes,
+//! where it waited out the install's whole budget, a quarter of an hour,
+//! with nothing on the screen. [`RangeSource::waiting`] hears each wait.
+//! Each range's end is noted with its status, bytes and times.
+//!
 //! The transport is a [`RangeSource`], so the boot's network and tests
 //! serve the same logic.
 use super::NetError;
@@ -48,6 +56,100 @@ pub const ATTEMPTS: u32 = 20;
 /// The longest wait between two attempts at one range, so that a network
 /// that comes back is used again within half a minute.
 pub const BACKOFF_CAP_MS: u64 = 30_000;
+
+/// Attempts at one range before the guest runs ([`Ranges::before_guest`]):
+/// their waits (1, 2, 4, 8 and 16 s) end within a minute where every
+/// attempt fails at once, and [`QUIET_BEFORE_GUEST_MS`] ends them where
+/// each waits out its connection's idle timeout.
+pub const ATTEMPTS_BEFORE_GUEST: u32 = 6;
+/// How long a read before the guest runs goes without a byte from the
+/// server before it fails ([`GaveUp::Quiet`]): no install has waited this
+/// long for the first bytes of a working server, and a tester's boot waited
+/// about ten minutes in silence before he reset it.
+pub const QUIET_BEFORE_GUEST_MS: u64 = 120_000;
+
+/// Why the reads before the guest gave up ([`Ranges::gave_up`]), which
+/// displays as the stop's plain reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GaveUp {
+    /// No byte arrived for `quiet_ms`; `last` is the last attempt's
+    /// failure, if one failed.
+    Quiet {
+        quiet_ms: u64,
+        last: Option<NetError>,
+    },
+    /// Every one of `attempts` attempts at one range failed, the last with
+    /// `last`.
+    Attempts { attempts: u32, last: NetError },
+    /// The server refused in a way no attempt mends, such as a status other
+    /// than a partial range or a changed image.
+    Refused(NetError),
+}
+
+impl fmt::Display for GaveUp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Couldn't download macOS from Apple: ")?;
+        match self {
+            Self::Quiet { quiet_ms, last } => {
+                let seconds = quiet_ms / 1000;
+                match seconds % 60 {
+                    0 => write!(f, "no data for {} minutes", seconds / 60)?,
+                    _ => write!(f, "no data for {seconds} s")?,
+                }
+                if let Some(last) = last {
+                    write!(f, " (the last try: {last})")?;
+                }
+            }
+            Self::Attempts { attempts, last } => {
+                write!(f, "{attempts} tries failed, the last with: {last}")?;
+            }
+            Self::Refused(error) => write!(f, "the server refused: {error}")?,
+        }
+        f.write_str(". Check the network, or put the install files on the USB with stambha.")
+    }
+}
+
+/// What a read before the guest runs is waiting for, at each of its waits
+/// ([`RangeSource::waiting`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Waiting {
+    /// Body bytes every range received so far.
+    pub received: u64,
+    /// Milliseconds since the read started or last received a byte.
+    pub quiet_ms: u64,
+    /// The range's failed attempts in a row, and the attempts it has.
+    pub failures: u32,
+    pub attempts: u32,
+    /// Milliseconds until the next attempt, while one is due.
+    pub retry_in_ms: Option<u64>,
+}
+
+impl Waiting {
+    /// The running step's line on the screen: what arrived, how long the
+    /// server has been silent, and which try comes next and when.
+    pub fn screen(&self) -> String {
+        let quiet = self.quiet_ms / 1000;
+        let next = self.failures + 1;
+        let attempts = self.attempts;
+        match (self.retry_in_ms, self.failures) {
+            (Some(ms), _) => alloc::format!(
+                "try {next}/{attempts} in {} s, no data for {quiet} s",
+                ms.div_ceil(1000)
+            ),
+            (None, 0) if quiet < 2 => alloc::format!("{} read", amount(self.received)),
+            (None, 0) => alloc::format!("{} read, no data for {quiet} s", amount(self.received)),
+            (None, _) => alloc::format!("try {next}/{attempts}, no data for {quiet} s"),
+        }
+    }
+}
+
+/// `bytes` for the screen, in KB below a megabyte.
+fn amount(bytes: u64) -> String {
+    match bytes < 1 << 20 {
+        true => alloc::format!("{} KB", bytes >> 10),
+        false => alloc::format!("{} MB", bytes >> 20),
+    }
+}
 
 /// The wait before a range's next attempt after `failures` consecutive
 /// failures (at least one): a second, doubling, at most [`BACKOFF_CAP_MS`].
@@ -88,6 +190,13 @@ pub trait RangeSource {
     fn state(&mut self, _range: &Self::Range) -> String {
         String::new()
     }
+    /// The HTTP status `range`'s response head carried, once it arrived.
+    fn status(&self, _range: &Self::Range) -> Option<u16> {
+        None
+    }
+    /// A read before the guest runs ([`Ranges::before_guest`]) is about to
+    /// wait: what it has and waits for, for the screen and the log.
+    fn waiting(&mut self, _waiting: Waiting) {}
 }
 
 struct Stream<R> {
@@ -97,6 +206,11 @@ struct Stream<R> {
     range: Option<R>,
     /// The object offset the open range started at.
     opened: u64,
+    /// The open range's number (`Ranges::ranges` when it opened), when it
+    /// opened and when its first body byte arrived, for its end's line.
+    number: u64,
+    opened_ms: u64,
+    first_byte_ms: Option<u64>,
     /// The farthest byte a read asked for since the buffer started.
     wanted: u64,
     /// When a read last used the stream, on [`Ranges::tick`].
@@ -138,6 +252,13 @@ pub struct Ranges<S: RangeSource> {
     since: u64,
     /// The last read failed only because its time ran out.
     blocked: bool,
+    /// Body bytes every range received.
+    received: u64,
+    /// Whether the reads are the ones before the guest runs, bounded by
+    /// [`QUIET_BEFORE_GUEST_MS`] and [`ATTEMPTS_BEFORE_GUEST`].
+    before_guest: bool,
+    /// Why a read before the guest gave up, for the stop's reason.
+    gave_up: Option<GaveUp>,
 }
 
 impl<S: RangeSource> Ranges<S> {
@@ -153,6 +274,35 @@ impl<S: RangeSource> Ranges<S> {
             bounded: false,
             since: 0,
             blocked: false,
+            received: 0,
+            before_guest: false,
+            gave_up: None,
+        }
+    }
+
+    /// The reads from now on are the ones before the guest runs, until
+    /// [`Ranges::bound`]: each waits for the network, but fails after
+    /// [`QUIET_BEFORE_GUEST_MS`] without a byte or [`ATTEMPTS_BEFORE_GUEST`]
+    /// failed attempts at one range, which [`Ranges::gave_up`] then names.
+    pub fn before_guest(&mut self) {
+        self.before_guest = true;
+    }
+
+    /// Why a read before the guest gave up, if one did.
+    pub fn gave_up(&self) -> Option<&GaveUp> {
+        self.gave_up.as_ref()
+    }
+
+    /// Body bytes every range received so far.
+    pub fn received(&self) -> u64 {
+        self.received
+    }
+
+    /// The attempts one range has: fewer before the guest runs.
+    fn attempts(&self) -> u32 {
+        match self.before_guest {
+            true => ATTEMPTS_BEFORE_GUEST,
+            false => ATTEMPTS,
         }
     }
 
@@ -183,6 +333,8 @@ impl<S: RangeSource> Ranges<S> {
     /// [`BUDGET_MS`] in all, until the next call: a caller that serves on a
     /// processor whose guest waits bounds each of its turns.
     pub fn bound(&mut self) {
+        // The guest runs: the install's own budget applies from now on.
+        self.before_guest = false;
         self.bounded = true;
         self.since = self.source.millis();
     }
@@ -202,10 +354,30 @@ impl<S: RangeSource> Ranges<S> {
         capacity
     }
 
+    /// Closes stream `at`'s open range, noting how it ended: its HTTP
+    /// status, the bytes it got, when the first came and how long it was
+    /// open.
     fn stop(&mut self, at: usize) {
-        if let Some(range) = self.streams[at].range.take() {
-            self.source.close(range);
-        }
+        let Some(range) = self.streams[at].range.take() else {
+            return;
+        };
+        let status = self.source.status(&range);
+        self.source.close(range);
+        let now = self.source.millis();
+        let stream = &self.streams[at];
+        let got = stream.end() - stream.opened;
+        let first = match stream.first_byte_ms {
+            Some(first) => alloc::format!("{} ms", first.saturating_sub(stream.opened_ms)),
+            None => String::from("none"),
+        };
+        let status = match status {
+            Some(status) => alloc::format!("{status}"),
+            None => String::from("none"),
+        };
+        let (number, open) = (stream.number, now.saturating_sub(stream.opened_ms));
+        self.source.note(format_args!(
+            "REMOTE IMAGE range {number} ended status={status} got={got} first_byte={first} open={open} ms\n"
+        ));
     }
 
     /// What a failing range of stream `at` got and its transport's state
@@ -241,6 +413,9 @@ impl<S: RangeSource> Ranges<S> {
                 buffer: VecDeque::with_capacity(ahead + KEEP + SLACK),
                 range: None,
                 opened: offset,
+                number: 0,
+                opened_ms: 0,
+                first_byte_ms: None,
                 wanted: offset,
                 used: 0,
                 failures: 0,
@@ -295,15 +470,20 @@ impl<S: RangeSource> Ranges<S> {
     }
 
     /// Takes what has arrived for a stream, opening a range at its buffer's
-    /// end first when none is open.
-    fn step(&mut self, at: usize) -> Result<(), NetError> {
+    /// end first when none is open; `now` is the caller's clock reading,
+    /// for the range's times.
+    fn step(&mut self, at: usize, now: u64) -> Result<(), NetError> {
         if self.streams[at].range.is_none() {
             let (first, last) = (self.streams[at].end(), self.len - 1);
             let range = self.source.open(first, last)?;
-            self.streams[at].range = Some(range);
-            self.streams[at].opened = first;
             self.ranges += 1;
             let ranges = self.ranges;
+            let stream = &mut self.streams[at];
+            stream.range = Some(range);
+            stream.opened = first;
+            stream.number = ranges;
+            stream.opened_ms = now;
+            stream.first_byte_ms = None;
             self.source.note(format_args!(
                 "REMOTE IMAGE range {ranges} stream {at} bytes={first}-{last}\n"
             ));
@@ -311,8 +491,16 @@ impl<S: RangeSource> Ranges<S> {
         let stream = &mut self.streams[at];
         let range = stream.range.as_mut().expect("opened above");
         let buffer = &mut stream.buffer;
-        let done = self.source.read(range, &mut |body| buffer.extend(body))?;
-        if done {
+        let before = buffer.len();
+        let result = self.source.read(range, &mut |body| buffer.extend(body));
+        let arrived = (self.streams[at].buffer.len() - before) as u64;
+        if arrived > 0 {
+            self.received += arrived;
+            if self.streams[at].first_byte_ms.is_none() {
+                self.streams[at].first_byte_ms = Some(now);
+            }
+        }
+        if result? {
             self.stop(at);
         }
         Ok(())
@@ -322,57 +510,98 @@ impl<S: RangeSource> Ranges<S> {
     /// [`BUDGET_MS`] since the bound, taking what already arrived even when
     /// none is, and after a failure not before its backoff ends; unbounded,
     /// waiting those out. A failure's count goes on across bounded reads.
+    /// Before the guest runs, the read gives up ([`Ranges::gave_up`]) after
+    /// [`QUIET_BEFORE_GUEST_MS`] without a byte, [`ATTEMPTS_BEFORE_GUEST`]
+    /// failed attempts or a failure no attempt mends, and each of its waits
+    /// is told to the transport first ([`RangeSource::waiting`]).
     fn fill(&mut self, at: usize, until: u64) -> Result<(), NetError> {
         let started = match self.bounded {
             true => self.since,
             false => self.source.millis(),
         };
+        // When this read last received a byte, and the last attempt's
+        // failure since, for the reason it gives up before the guest.
+        let (mut heard, mut last) = (started, None);
         let mut looked = false;
         while self.streams[at].end() < until {
-            let spent = self.source.millis().saturating_sub(started);
+            let now = self.source.millis();
+            let spent = now.saturating_sub(started);
             if self.bounded && spent >= BUDGET_MS && looked {
                 return Err(self.block("the read's time ran out"));
+            }
+            let quiet_ms = now.saturating_sub(heard);
+            if self.before_guest && quiet_ms >= QUIET_BEFORE_GUEST_MS {
+                return Err(self.give_up(at, GaveUp::Quiet { quiet_ms, last }));
             }
             looked = true;
             let (failures, failed_at) = (self.streams[at].failures, self.streams[at].failed_at);
             if failures > 0 {
                 let backoff = backoff_ms(failures);
-                if self.source.millis().saturating_sub(failed_at) < backoff {
+                if now.saturating_sub(failed_at) < backoff {
                     if self.bounded {
                         return Err(self.block("the range waits before it is asked again"));
                     }
                     // The network is served through the wait: the other
                     // stream's connection and the link's own traffic go on.
                     loop {
-                        let waited = self.source.millis().saturating_sub(failed_at);
+                        let now = self.source.millis();
+                        let waited = now.saturating_sub(failed_at);
                         if waited >= backoff {
                             break;
                         }
-                        self.source.wait(((backoff - waited) * 1000).min(WAIT_US))?;
+                        let mut wait = (backoff - waited) * 1000;
+                        if self.before_guest {
+                            // The look above gives up once the quiet is
+                            // spent, before the next attempt is due.
+                            let quiet_ms = now.saturating_sub(heard);
+                            if quiet_ms >= QUIET_BEFORE_GUEST_MS {
+                                break;
+                            }
+                            wait = wait.min((QUIET_BEFORE_GUEST_MS - quiet_ms) * 1000);
+                            self.waiting(at, quiet_ms, Some(backoff - waited));
+                        }
+                        self.source.wait(wait.min(WAIT_US))?;
                     }
+                    continue;
                 }
             }
             let before = self.streams[at].end();
-            if let Err(error) = self.step(at) {
+            if let Err(error) = self.step(at, now) {
+                if self.streams[at].end() > before {
+                    heard = now;
+                }
                 let detail = self.failed(at);
-                self.stop(at);
-                let stream = &mut self.streams[at];
                 if !error.retryable() {
-                    stream.failures = 0;
+                    self.stop(at);
+                    self.streams[at].failures = 0;
+                    if self.before_guest {
+                        self.gave_up = Some(GaveUp::Refused(error.clone()));
+                    }
                     return Err(error);
                 }
-                stream.failures += 1;
-                let failures = stream.failures;
+                self.streams[at].failures += 1;
+                let failures = self.streams[at].failures;
+                let attempts = self.attempts();
                 self.source.note(format_args!(
-                    "REMOTE IMAGE range at {before} failed ({failures}/{ATTEMPTS}): {error}; {detail}\n"
+                    "REMOTE IMAGE range at {before} failed ({failures}/{attempts}): {error}; {detail}\n"
                 ));
-                if failures == ATTEMPTS {
+                // The range's own end follows its failure's line.
+                self.stop(at);
+                if failures >= attempts {
                     self.streams[at].failures = 0;
+                    if self.before_guest {
+                        self.gave_up = Some(GaveUp::Attempts {
+                            attempts,
+                            last: error.clone(),
+                        });
+                    }
                     return Err(error);
                 }
                 self.streams[at].failed_at = self.source.millis();
+                last = Some(error);
             } else if self.streams[at].end() > before {
                 self.streams[at].failures = 0;
+                heard = now;
             } else if self.streams[at].range.is_some() {
                 let wait = match self.bounded {
                     true => BUDGET_MS.saturating_sub(spent) * 1000,
@@ -382,6 +611,9 @@ impl<S: RangeSource> Ranges<S> {
                 if wait == 0 {
                     continue;
                 }
+                if self.before_guest {
+                    self.waiting(at, quiet_ms, None);
+                }
                 if let Err(error) = self.source.wait(wait.min(WAIT_US)) {
                     self.stop(at);
                     return Err(error);
@@ -389,6 +621,27 @@ impl<S: RangeSource> Ranges<S> {
             }
         }
         Ok(())
+    }
+
+    /// Tells the transport what a read before the guest waits for.
+    fn waiting(&mut self, at: usize, quiet_ms: u64, retry_in_ms: Option<u64>) {
+        let waiting = Waiting {
+            received: self.received,
+            quiet_ms,
+            failures: self.streams[at].failures,
+            attempts: self.attempts(),
+            retry_in_ms,
+        };
+        self.source.waiting(waiting);
+    }
+
+    /// A read before the guest gives up for `why`: its range ends, and
+    /// [`Ranges::gave_up`] keeps the reason for the stop.
+    fn give_up(&mut self, at: usize, why: GaveUp) -> NetError {
+        self.stop(at);
+        self.streams[at].failures = 0;
+        self.gave_up = Some(why);
+        NetError::Timeout("no data from the image's server")
     }
 
     /// A bounded read that ran out of time: the ranges keep filling between
@@ -412,7 +665,8 @@ impl<S: RangeSource> Ranges<S> {
             if stream.buffer.len() >= share || stream.end() >= self.len {
                 continue;
             }
-            if let Err(error) = self.step(at) {
+            let now = self.source.millis();
+            if let Err(error) = self.step(at, now) {
                 let (end, detail) = (self.streams[at].end(), self.failed(at));
                 self.source.note(format_args!(
                     "REMOTE IMAGE read-ahead range at {end} failed: {error}; {detail}\n"
@@ -437,6 +691,9 @@ impl<S: RangeSource> ReadAt for Ranges<S> {
     }
 
     fn read_at(&mut self, offset: u64, out: &mut [u8]) -> Result<(), NetError> {
+        // The reason names the last read's failure, not one a caller
+        // already got past.
+        self.gave_up = None;
         let until = offset
             .checked_add(out.len() as u64)
             .ok_or(NetError::Invalid("remote image offset overflow"))?;

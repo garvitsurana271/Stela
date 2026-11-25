@@ -417,7 +417,8 @@ fn report(reason: &str) {
     }
 }
 
-/// A lost device's reopen failed since the pump last looked ([`report`]).
+/// A lost device's reopen failed, or a kernel driver said its GPU stopped
+/// answering, since the pump last looked ([`report`], [`driver_line`]).
 static LOSS_DUE: AtomicBool = AtomicBool::new(false);
 
 /// The kernel drivers' lines that a GPU stopped answering, each GPU's
@@ -429,9 +430,13 @@ static SILENT: SilentLines<4, 320> = SilentLines::new();
 static FAULTS: FaultLines<12, 320> = FaultLines::new();
 
 /// A line a kernel driver printed: one that says its GPU stopped answering
-/// is kept for [`watch_losses`], one of a GPU fault for the fault dump.
+/// is kept for [`watch_losses`], which the next pump runs (no reopen can
+/// work after it, and none may be tried while a client holds objects of the
+/// lost device), one of a GPU fault for the fault dump.
 pub(in crate::engine) fn driver_line(line: &str) {
-    SILENT.observe(line);
+    if SILENT.observe(line) {
+        LOSS_DUE.store(true, Ordering::Release);
+    }
     FAULTS.observe(line);
     // What the port above reads when its GPU went silent or came back.
     if let Some(event) = gpu_loss::link_event(line)
@@ -447,12 +452,15 @@ pub(in crate::engine) fn driver_line(line: &str) {
 }
 
 /// End the boot once no GPU can serve macOS again: every GPU that serves
-/// Metal is lost and did not reopen ([`gpu_loss::verdict`]). Until then each
-/// new WindowServer is refused and dies, on a frozen screen. The stop is
-/// the one a boot without a GPU makes, with which GPU was lost and what
-/// its driver said of it. A reopen that gives a device changes nothing.
-/// Each look follows a reopen that failed, so a GPU whose driver said
-/// nothing is judged by reopens tried across its reset's time.
+/// Metal is lost and did not reopen, or its driver said it stopped
+/// answering ([`gpu_loss::verdict`]). Until then each new WindowServer is
+/// refused and dies, on a frozen screen. The stop is the one a boot without
+/// a GPU makes, with which GPU was lost and what its driver said of it. A
+/// reopen that gives a device changes nothing. A look follows a reopen that
+/// failed, so a GPU whose driver said nothing is judged by reopens tried
+/// across its reset's time, or a driver's line that its GPU stopped
+/// answering; until such a GPU's device is lost too, as its first work that
+/// fails makes it, each pump looks again.
 pub(super) fn watch_losses() {
     if !LOSS_DUE.swap(false, Ordering::AcqRel) {
         return;
@@ -486,6 +494,9 @@ pub(super) fn watch_losses() {
         .collect();
     if let Some(reason) = gpu_loss::verdict(&gpus) {
         output::fatal(reason);
+    }
+    if gpus.iter().any(|gpu| gpu.silent.is_some() && !gpu.lost) {
+        LOSS_DUE.store(true, Ordering::Release);
     }
 }
 

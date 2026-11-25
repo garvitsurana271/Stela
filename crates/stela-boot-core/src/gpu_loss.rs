@@ -3,7 +3,10 @@
 //! goes on. When it does not and no other GPU serves Metal, every new
 //! WindowServer is refused and dies, and the screen stays frozen: Stela then
 //! stops as a boot without a GPU does, with which GPU was lost and what its
-//! kernel driver said of it.
+//! kernel driver said of it. A lost GPU whose driver said it stopped
+//! answering is lost for good at once: no reopen can work on it, and one is
+//! tried only once no client holds an object of the lost device, which a
+//! client may never let go of.
 use alloc::{format, string::String, vec::Vec};
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -49,7 +52,7 @@ pub fn link_event(line: &str) -> Option<&'static str> {
 
 /// Which recovery the port above a GPU that stopped answering still
 /// allows, for one boot-log line. Stela tries none of them: the session
-/// ends at the GPU's first failed reopen.
+/// ends once the GPU is lost.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Recovery {
     /// The port could not be read.
@@ -113,17 +116,16 @@ pub struct Gpu<'a> {
 }
 
 impl Gpu<'_> {
-    /// Whether the GPU is lost and will not reopen: a reopen failed and its
-    /// driver said it stopped answering (it then fails every later one), or
-    /// [`REOPEN_ATTEMPTS`] failed in a row over at least [`REOPEN_SPAN_MS`].
-    /// A lost GPU no reopen was tried on yet, or tried only within that
-    /// time, may still come back.
+    /// Whether the GPU is lost and will not reopen: its driver said it
+    /// stopped answering, after which every reopen fails, whether or not
+    /// one was tried yet; or [`REOPEN_ATTEMPTS`] failed in a row over at
+    /// least [`REOPEN_SPAN_MS`]. A lost GPU its driver said nothing of, with
+    /// no reopen tried yet or tried only within that time, may still come
+    /// back.
     fn gone(&self) -> bool {
         self.lost
-            && match self.silent {
-                Some(_) => self.failed_reopens >= 1,
-                None => self.failed_reopens >= REOPEN_ATTEMPTS && self.failing_ms >= REOPEN_SPAN_MS,
-            }
+            && (self.silent.is_some()
+                || (self.failed_reopens >= REOPEN_ATTEMPTS && self.failing_ms >= REOPEN_SPAN_MS))
     }
 }
 
@@ -141,15 +143,22 @@ pub fn verdict(gpus: &[Gpu<'_>]) -> Option<String> {
     let each: Vec<String> = gpus
         .iter()
         .map(|gpu| {
-            let tries = match gpu.failed_reopens {
-                1 => String::from("1 try"),
-                tries => format!("{tries} tries over {} s", gpu.failing_ms / 1000),
-            };
-            let error = gpu.error.unwrap_or("no error named");
             let said = match gpu.silent {
                 Some(line) => format!("Its driver said: {line}"),
                 None => String::from("Its driver did not say that it left the bus"),
             };
+            let tries = match gpu.failed_reopens {
+                0 => {
+                    return format!(
+                        "the GPU {} was lost while macOS ran and left the bus, so no reopen was \
+                         tried. {said}",
+                        gpu.name
+                    );
+                }
+                1 => String::from("1 try"),
+                tries => format!("{tries} tries over {} s", gpu.failing_ms / 1000),
+            };
+            let error = gpu.error.unwrap_or("no error named");
             format!(
                 "the GPU {} was lost while macOS ran and did not reopen ({tries}, last: \
                  {error}). {said}",
@@ -288,7 +297,6 @@ mod tests {
         assert_eq!(verdict(&[gpu(false, 0, None)]), None);
         // Lost, its connections still open: no reopen was tried.
         assert_eq!(verdict(&[gpu(true, 0, None)]), None);
-        assert_eq!(verdict(&[gpu(true, 0, Some(GONE))]), None);
         // One failed reopen with no word from the driver may be a passing
         // refusal: the next client tries again.
         assert_eq!(verdict(&[gpu(true, 1, None)]), None);
@@ -301,6 +309,20 @@ mod tests {
         assert_eq!(verdict(&[soon]), None);
         // A reopen that gave a device counts none, whatever came before.
         assert_eq!(verdict(&[gpu(false, 0, Some(GONE))]), None);
+    }
+
+    /// A client that keeps objects of the lost device keeps every reopen
+    /// from being tried: a GPU its driver said left the bus ends the session
+    /// all the same, where WindowServer was refused for 10 minutes until
+    /// macOS's watchdog panicked.
+    #[test]
+    fn a_gpu_off_the_bus_ends_the_session_once_lost_with_no_reopen_tried() {
+        let reason = verdict(&[gpu(true, 0, Some(GONE))]).expect("stops");
+        assert!(reason.starts_with(LOST));
+        assert!(reason[LOST.len()..].starts_with(
+            "the GPU 0000:02:00.0 was lost while macOS ran and left the bus, so no reopen was \
+             tried. Its driver said: nouveau 0000:02:00.0: stopped answering: BOOT_0 read"
+        ));
     }
 
     #[test]

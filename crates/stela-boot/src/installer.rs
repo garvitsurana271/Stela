@@ -72,6 +72,10 @@ struct Disk {
     bus: &'static str,
     /// Its GPT; `None` on a blank disk or one with another scheme.
     table: Option<Table>,
+    /// The blocks its GPT's headers give partitions, `first` to `end`;
+    /// `None` without a table. Another tool may give fewer than the
+    /// geometry's: Linux's fdisk starts them at 1 MiB.
+    usable: Option<(u64, u64)>,
     /// Data without a GPT, which only erasing the disk replaces.
     foreign: bool,
     /// Why it cannot take macOS, when it cannot.
@@ -145,6 +149,18 @@ impl Disk {
         Ok(disk_plan::Ends {
             head: self.read(head.lba, head.blocks)?,
             tail: self.read(tail.lba, tail.blocks)?,
+        })
+    }
+
+    /// The blocks the disk's GPT headers give partitions, `first` to `end`,
+    /// from the primary's, or the backup's when the primary does not parse;
+    /// `None` when neither does.
+    fn header_usable(&mut self) -> Option<(u64, u64)> {
+        let last = self.geometry.blocks.checked_sub(1)?;
+        [1, last].into_iter().find_map(|lba| {
+            let block = self.read(lba, 1).ok()?;
+            let info = gpt::parse_header(self.geometry, lba, &block).ok()??;
+            Some((info.first_usable, info.last_usable.checked_add(1)?))
         })
     }
 
@@ -648,6 +664,7 @@ fn disks() -> Vec<Disk> {
             bus: bus(&path),
             serial,
             table: None,
+            usable: None,
             foreign: false,
             refusal: None,
             rotation,
@@ -666,6 +683,9 @@ fn disks() -> Vec<Disk> {
         // Why Stela's own drivers cannot reach the disk, if they cannot.
         disk.refusal = crate::pci_io::disk_controller(handle)
             .and_then(|function| stela_drivers::probe::disk_refusal(&function));
+        if disk.table.is_some() {
+            disk.usable = disk.header_usable();
+        }
         disks.push(disk);
     }
     // Stela's own drivers must reach each disk, and find it again by a
@@ -1217,6 +1237,12 @@ fn segments_of(disk: &Disk) -> Vec<Segment> {
             content: Content::Foreign,
         }];
     }
+    // Only the blocks the GPT's own headers give partitions, which may be
+    // fewer than the geometry's: the plan's check refuses a partition
+    // outside them.
+    let (first, end) = disk
+        .usable
+        .map_or((first, end), |(low, high)| (first.max(low), end.min(high)));
     let mut kept: Vec<(usize, &gpt::Partition)> = match &disk.table {
         Some(table) => table.partitions.iter().enumerate().collect(),
         None => Vec::new(),

@@ -8,6 +8,7 @@ use crate::bus::{
     pci::{
         Address, Bar, Function,
         owned::OwnedConfig,
+        placement,
         requester::{
             ClaimError, FunctionRole, RequesterBinding, StoppedRequester,
             preparation::PreparingRequester,
@@ -140,6 +141,28 @@ pub unsafe trait NativeServices {
 
     /// The mapping permission that issues [`Self::map_bar`]'s mappings.
     fn authority(&self) -> Result<owned::Authority, ServiceError>;
+
+    /// A place for memory BAR `index` of the function at `address`, which
+    /// the firmware left unassigned ([`placement::unassigned`]), for the
+    /// caller to program: the span the mount reserves for it, at the same
+    /// bus and physical address. It lies in `firmware`'s root bridge
+    /// windows and every window of the bridges above the function, clear of
+    /// `firmware`'s claims, of every range the firmware's memory map lists,
+    /// of every BAR and bridge window the mount's PCI census read and of
+    /// every range the mount has reserved ([`placement::place`]). The mount
+    /// logs what it placed, or why it placed nothing.
+    ///
+    /// Only for a function the caller is about to drive for input, whose
+    /// configuration it owns, with that BAR still at zero.
+    fn place_bar(
+        &self,
+        _address: Address,
+        _index: u8,
+        _request: placement::Request,
+        _firmware: &placement::Firmware,
+    ) -> Result<owned::Resource, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
 
     /// The DMA domain for the requester `binding` names. The domain keeps the
     /// binding, and with it the configuration epoch it keeps.

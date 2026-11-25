@@ -4,6 +4,7 @@ use alloc::rc::Rc;
 use core::{any::Any, cell::RefCell, cmp::Reverse, fmt};
 use stela_boot_core::ecam::topology;
 use stela_drivers::bus::dma::mapping::DmaError;
+use stela_drivers::bus::pci::placement;
 use stela_drivers::{
     bus::pci::{
         ConfigEffect, ConfigError, ConfigFailure,
@@ -336,6 +337,79 @@ impl<'a> ContainedPci<'a> {
     }
 }
 
+/// What the census read of the memory around one function: see
+/// [`Source::fabric_memory`].
+pub(crate) struct FabricMemory {
+    pub(crate) claimed: Vec<core::ops::Range<u64>>,
+    pub(crate) upstream: Vec<placement::BridgeWindows>,
+    /// The function's own dwords 0x10 through 0x3c at the census.
+    pub(crate) own: placement::Words,
+}
+
+impl Source {
+    /// What the census read of the memory the captured functions decode,
+    /// for placing a BAR of the function at `address` around it: every BAR,
+    /// expansion ROM and bridge window ([`placement::decoded`]) as claims,
+    /// except the windows of the bridges above `address`, which come
+    /// apart, nearest first, as the windows the BAR must lie in. Refused
+    /// with a sentence when the fabric is not parked, or the census left a
+    /// function out or could not read one: what such a function decodes is
+    /// unknown.
+    pub(crate) fn fabric_memory(&self, address: Address) -> Result<FabricMemory, String> {
+        let cohort = self
+            .pci_slots
+            .0
+            .try_borrow()
+            .map_err(|_| String::from("the PCI census is in use"))?;
+        let Cohort::Parked(fabric) = &*cohort else {
+            return Err(String::from("no PCI census was kept"));
+        };
+        if !fabric.left_out.is_empty() {
+            return Err(String::from(
+                "the PCI census left functions out, and what they decode is unknown",
+            ));
+        }
+        let find = |address: Address| {
+            fabric
+                .slots
+                .binary_search_by_key(&address, |slot| slot.address)
+                .map(|index| &fabric.slots[index])
+                .map_err(|_| alloc::format!("{address} is not in the PCI census"))
+        };
+        let own = find(address)?;
+        let mut above = Vec::new();
+        let mut route = own.route;
+        while let topology::Parent::Bridge(bridge) = route {
+            above.push(bridge);
+            route = find(bridge)?.route;
+        }
+        let mut claimed = Vec::new();
+        let mut upstream = Vec::new();
+        for slot in &fabric.slots {
+            let words = slot.words.ok_or_else(|| {
+                alloc::format!("the PCI census could not read {}'s BARs", slot.address)
+            })?;
+            let (claims, windows) = placement::decoded(&words, slot.header.bridge.is_some());
+            claimed.extend(claims);
+            if let Some(windows) = windows
+                && !above.contains(&slot.address)
+            {
+                claimed.extend(windows.ranges());
+            }
+        }
+        for bridge in above {
+            let slot = find(bridge)?;
+            let words = slot.words.expect("every slot's words were read above");
+            upstream.extend(placement::decoded(&words, true).1);
+        }
+        Ok(FabricMemory {
+            claimed,
+            upstream,
+            own: own.words.expect("every slot's words were read above"),
+        })
+    }
+}
+
 /// The parked functions a recheck reads.
 #[derive(Clone, Copy)]
 pub(crate) enum PciScope {
@@ -537,6 +611,10 @@ struct Slot {
     route: topology::Parent,
     /// A bridge stopped, sealed and refused alone (`Cause::BridgeBuses`).
     misconfigured: Option<census::Misconfigured>,
+    /// Dwords 0x10 through 0x3c as the census read them, before any
+    /// driver: where its BARs, windows and ROM decode
+    /// ([`Source::fabric_memory`]). None where a read failed.
+    words: Option<placement::Words>,
     forwarding: Option<Forwarding>,
     /// The writes a bus reset admits through this parked function's
     /// custody: its state saved before the reset, each written back once.
@@ -875,6 +953,7 @@ struct Input {
     /// dword as found, the topology sees no forwarding, and containment
     /// refuses it alone once it is stopped.
     misconfigured: Option<census::Misconfigured>,
+    words: Option<placement::Words>,
 }
 
 enum Observed {
@@ -993,6 +1072,18 @@ impl Input {
         let (window, span) = reader
             .geometry
             .function(address, reader.source.platform.wire().roots())?;
+        // Read only, and kept only to place a BAR the firmware left at zero
+        // around them: a failed read keeps nothing and refuses no function.
+        let mut words: placement::Words = [0; 12];
+        let words = words
+            .iter_mut()
+            .zip((0x10u16..).step_by(4))
+            .try_for_each(|(word, offset)| {
+                *word = reader.read32(address, offset)?;
+                Ok::<_, Error>(())
+            })
+            .ok()
+            .map(|()| words);
         Ok(Observed::Function(Self {
             address,
             window,
@@ -1005,6 +1096,7 @@ impl Input {
             },
             plan: Rc::new(plan),
             misconfigured,
+            words,
         }))
     }
 }
@@ -1752,6 +1844,7 @@ impl Source {
             ancestor,
             route,
             misconfigured: input.misconfigured,
+            words: input.words,
             forwarding: None,
             restore,
         })

@@ -732,6 +732,42 @@ fn a_discovered_device_gets_only_its_blocks_versions_files() {
 }
 
 #[test]
+fn navi_48_gets_the_dcn_file_amdgpu_names_its_display_by() {
+    // An RX 9070 XT's table (Pilot's log): GC 12.0.1, PSP and SMU 14.0.3,
+    // SDMA 7.0.1, VCN 5.0.0 and DCN 4.1.0, which amdgpu takes as 4.0.1.
+    let navi_48 = discovered(&[
+        (11, 12, 0, 1),
+        (255, 14, 0, 3),
+        (1, 14, 0, 3),
+        (42, 7, 0, 1),
+        (12, 5, 0, 0),
+        (271, 4, 1, 0),
+    ]);
+    for member in [
+        "amdgpu/dcn_4_0_1_dmcub.bin",
+        "amdgpu/gc_12_0_1_rlc.bin",
+        "amdgpu/psp_14_0_3_sos.bin",
+        "amdgpu/smu_14_0_3.bin",
+        "amdgpu/sdma_7_0_1.bin",
+    ] {
+        assert!(navi_48.contains(&member), "{member}");
+    }
+    assert!(
+        !navi_48.iter().any(|member| media_file(member)),
+        "{navi_48:?}"
+    );
+    assert!(
+        !navi_48.iter().any(|member| member.contains("vcn")),
+        "{navi_48:?}"
+    );
+    // A table that already says 4.0.1 keeps the file, and the rename
+    // reaches no other block or DCN version.
+    assert!(discovered(&[(271, 4, 0, 1)]).contains(&"amdgpu/dcn_4_0_1_dmcub.bin"));
+    assert!(!discovered(&[(11, 4, 1, 0)]).contains(&"amdgpu/dcn_4_0_1_dmcub.bin"));
+    assert!(!discovered(&[(271, 4, 1, 1)]).contains(&"amdgpu/dcn_4_0_1_dmcub.bin"));
+}
+
+#[test]
 fn every_discovered_file_is_attributed_to_a_block_or_a_family() {
     // Each file the superset holds is one some discovery table selects, so
     // narrowing drops none a device could ask for.

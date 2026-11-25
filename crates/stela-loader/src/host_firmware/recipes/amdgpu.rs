@@ -280,18 +280,29 @@ fn file_version(rest: &str) -> Option<(u8, u8, u8)> {
     Some((major, minor, numbers.next().unwrap_or(0)))
 }
 
+/// The version amdgpu names a discovered block's files after: the table's,
+/// but DCN 4.1.0 (Navi 44 and 48), which `amdgpu_discovery.c` sets to 4.0.1
+/// because "DC code expects version 4.0.1", so the display core asks for
+/// `dcn_4_0_1_dmcub.bin`.
+fn effective_version(ip: &DiscoveredIp) -> (u8, u8, u8) {
+    match (ip.hw_id, (ip.major, ip.minor, ip.revision)) {
+        (271, (4, 1, 0)) => (4, 0, 1),
+        (_, version) => version,
+    }
+}
+
 /// Whether amdgpu asks a device whose discovery table lists `ips` for
 /// `member`: a file named after a block's version when the table lists
-/// that block at that version, and a discovery-only family's files when
-/// its graphics version is the table's; never a media engine's
-/// ([`media`]).
+/// that block at that version, as amdgpu takes it ([`effective_version`]),
+/// and a discovery-only family's files when its graphics version is the
+/// table's; never a media engine's ([`media`]).
 pub fn discovered_may_load(ips: &[DiscoveredIp], member: &str) -> bool {
     let Some(name) = member.strip_prefix("amdgpu/").filter(|name| !media(name)) else {
         return false;
     };
     let listed = |hw_id: u16, version: (u8, u8, u8)| {
         ips.iter()
-            .any(|ip| ip.hw_id == hw_id && (ip.major, ip.minor, ip.revision) == version)
+            .any(|ip| ip.hw_id == hw_id && effective_version(ip) == version)
     };
     for &(block, hw_id) in BLOCK_IPS {
         if let Some(rest) = name

@@ -517,6 +517,330 @@ fn entries_the_table_cannot_hold_are_refused_not_moved() {
     );
 }
 
+/// `header` with `value` at byte `at` and its checksum made anew, as
+/// another tool writes a field of it.
+fn relabel(header: &mut [u8], at: usize, value: &[u8]) {
+    header[at..at + value.len()].copy_from_slice(value);
+    reseal(header);
+}
+
+/// `header`'s checksum made anew over the bytes its size names.
+fn reseal(header: &mut [u8]) {
+    let size = le32(header, 12) as usize;
+    header[16..20].fill(0);
+    let crc = crc32(&header[..size]);
+    header[16..20].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// The primary and backup headers [`encode`] writes for `table`, each
+/// changed by `edit` as another tool lays the GPT out.
+fn headers(disk: Disk, table: &Table, edit: impl Fn(u64, &mut Vec<u8>)) -> (Vec<u8>, Vec<u8>) {
+    let writes = encode(disk, table).unwrap();
+    let (mut primary, mut backup) = (writes[3].bytes.clone(), writes[1].bytes.clone());
+    edit(1, &mut primary);
+    edit(disk.blocks - 1, &mut backup);
+    (primary, backup)
+}
+
+/// Linux's fdisk (libfdisk): the usable blocks from 1 MiB.
+fn fdisk(disk: Disk) -> impl Fn(u64, &mut Vec<u8>) {
+    move |_, header: &mut Vec<u8>| {
+        relabel(header, 40, &(ALIGNMENT / disk.block_bytes).to_le_bytes())
+    }
+}
+
+fn data_table(partitions: Vec<Partition>) -> Table {
+    Table {
+        disk_guid: Guid([7; 16]),
+        partitions,
+        slots: Vec::new(),
+    }
+}
+
+#[test]
+fn a_rewrite_keeps_another_tools_headers_but_for_their_checksums() {
+    for block_bytes in [512, 4096] {
+        let disk = Disk {
+            block_bytes,
+            blocks: DISK.blocks * 512 / block_bytes,
+        };
+        let mib = ALIGNMENT / block_bytes;
+        let was = data_table(vec![data_partition(1, mib)]);
+        let (primary, backup) = headers(disk, &was, fdisk(disk));
+        assert_eq!(
+            kept_layout(disk, &primary, &backup),
+            Ok(Usable {
+                first: mib,
+                last: disk.last_usable(),
+            })
+        );
+        let mut table = was.clone();
+        table.add(data_partition(2, 100 * mib));
+        let writes = encode_keeping(disk, &table, &primary, &backup).unwrap();
+        let lbas: Vec<u64> = writes.iter().map(|write| write.lba).collect();
+        let last = disk.blocks - 1;
+        assert_eq!(lbas, [last - disk.entry_blocks(), last, 2, 1, 0]);
+        // The headers differ from the disk's only in their checksums, and
+        // parse back to the table, its usable blocks the disk's own.
+        for (write, was) in [(&writes[3], &primary), (&writes[1], &backup)] {
+            let changed: Vec<usize> = (0..block_bytes as usize)
+                .filter(|&at| write.bytes[at] != was[at])
+                .collect();
+            assert!(
+                changed
+                    .iter()
+                    .all(|at| (16..20).contains(at) || (88..92).contains(at)),
+                "{changed:?}"
+            );
+            let info = parse_header(disk, write.lba, &write.bytes)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (info.first_usable, info.last_usable),
+                (mib, disk.last_usable())
+            );
+        }
+        assert_eq!(read_back(disk, &writes), table);
+        let info = keepable(disk, last, &writes[1].bytes).unwrap();
+        assert_eq!(
+            parse_entries(&info, &writes[0].bytes).unwrap(),
+            table,
+            "{block_bytes}"
+        );
+    }
+}
+
+#[test]
+fn on_a_disk_encode_laid_out_a_rewrite_that_keeps_writes_what_encode_writes() {
+    for block_bytes in [512, 1024, 2048, 4096] {
+        let disk = Disk {
+            block_bytes,
+            blocks: DISK.blocks * 512 / block_bytes,
+        };
+        let mib = ALIGNMENT / block_bytes;
+        let was = data_table(vec![data_partition(1, mib), data_partition(3, 50 * mib)]);
+        let (primary, backup) = headers(disk, &was, |_, _| {});
+        let mut table = was.clone();
+        table.add(data_partition(2, 100 * mib));
+        assert_eq!(
+            encode_keeping(disk, &table, &primary, &backup).unwrap(),
+            encode(disk, &table).unwrap(),
+            "{block_bytes}"
+        );
+    }
+}
+
+#[test]
+fn a_rewrite_that_keeps_refuses_a_partition_outside_the_headers_usable_blocks() {
+    let mib = ALIGNMENT / DISK.block_bytes;
+    let was = data_table(vec![data_partition(1, mib)]);
+    let (primary, backup) = headers(DISK, &was, fdisk(DISK));
+    // Before the first usable block fdisk names, though after encode's,
+    // and past a last usable block narrowed by a MiB.
+    let mut early = was.clone();
+    early.add(Partition {
+        first_lba: 34,
+        last_lba: mib - 1,
+        ..data_partition(2, 0)
+    });
+    assert_eq!(
+        encode_keeping(DISK, &early, &primary, &backup),
+        Err(PayloadError::Disk("partition outside the usable range"))
+    );
+    let narrowed = |_: u64, header: &mut Vec<u8>| {
+        relabel(header, 48, &(DISK.last_usable() - mib).to_le_bytes())
+    };
+    let (primary, backup) = headers(DISK, &was, narrowed);
+    let mut late = was.clone();
+    late.add(Partition {
+        first_lba: DISK.last_usable() - mib + 1,
+        last_lba: DISK.last_usable(),
+        ..data_partition(2, 0)
+    });
+    assert_eq!(
+        encode_keeping(DISK, &late, &primary, &backup),
+        Err(PayloadError::Disk("partition outside the usable range"))
+    );
+    // Another disk's GUID.
+    let other = Table {
+        disk_guid: Guid([8; 16]),
+        ..was.clone()
+    };
+    assert_eq!(
+        encode_keeping(DISK, &other, &primary, &backup),
+        Err(PayloadError::Disk(
+            "the table's disk GUID is not the one its headers name"
+        ))
+    );
+}
+
+#[test]
+fn headers_a_rewrite_does_not_keep_are_refused_naming_the_field() {
+    let last = DISK.blocks - 1;
+    let was = data_table(vec![data_partition(1, 2048)]);
+    let exactly = |field, found, kept| Unkept::Field {
+        field,
+        found,
+        kept: Kept::Exactly(kept),
+    };
+    type Edit = fn(u64, &mut Vec<u8>);
+    let cases: [(Edit, u64, Unkept); 13] = [
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 8, &0x0001_0001u32.to_le_bytes())
+                }
+            },
+            1,
+            exactly("revision", 0x0001_0001, 0x0001_0000),
+        ),
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 80, &64u32.to_le_bytes())
+                }
+            },
+            1,
+            exactly("entry count", 64, 128),
+        ),
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 80, &256u32.to_le_bytes())
+                }
+            },
+            1,
+            exactly("entry count", 256, 128),
+        ),
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 84, &256u32.to_le_bytes())
+                }
+            },
+            1,
+            exactly("entry size", 256, 128),
+        ),
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 72, &3u64.to_le_bytes())
+                }
+            },
+            1,
+            exactly("entry array LBA", 3, 2),
+        ),
+        (
+            |lba, h| {
+                if lba != 1 {
+                    relabel(h, 72, &(lba - 33).to_le_bytes())
+                }
+            },
+            last,
+            exactly("entry array LBA", last - 33, last - 32),
+        ),
+        // Cloned from a smaller disk.
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 32, &1_000_000u64.to_le_bytes())
+                }
+            },
+            1,
+            exactly("other copy's LBA", 1_000_000, last),
+        ),
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 12, &96u32.to_le_bytes())
+                }
+            },
+            1,
+            exactly("header size", 96, 92),
+        ),
+        // Over the primary entry array, and the backup's.
+        (
+            |_, h| relabel(h, 40, &33u64.to_le_bytes()),
+            1,
+            Unkept::Field {
+                field: "first usable LBA",
+                found: 33,
+                kept: Kept::AtLeast(34),
+            },
+        ),
+        (
+            |lba, h| relabel(h, 48, &(lba.max(DISK.blocks - 1) - 32).to_le_bytes()),
+            1,
+            Unkept::Field {
+                field: "last usable LBA",
+                found: last - 32,
+                kept: Kept::AtMost(last - 33),
+            },
+        ),
+        // The copies disagree.
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 40, &2048u64.to_le_bytes())
+                }
+            },
+            last,
+            Unkept::Disagree {
+                field: "first usable LBA",
+                primary: 2048,
+                backup: 34,
+            },
+        ),
+        (
+            |lba, h| {
+                if lba != 1 {
+                    relabel(h, 56, &[9; 16])
+                }
+            },
+            last,
+            Unkept::OtherDisk,
+        ),
+        (|_, _| {}, 1, Unkept::Missing),
+    ];
+    for (index, (edit, lba, why)) in cases.into_iter().enumerate() {
+        let (mut primary, backup) = headers(DISK, &was, edit);
+        if why == Unkept::Missing {
+            primary.fill(0);
+        }
+        assert_eq!(
+            kept_layout(DISK, &primary, &backup),
+            Err((lba, why)),
+            "{index}"
+        );
+        assert_eq!(
+            encode_keeping(DISK, &was, &primary, &backup),
+            Err(PayloadError::Disk(
+                "the disk's GPT headers are not ones a rewrite keeps"
+            )),
+            "{index}"
+        );
+    }
+    // A damaged header: its checksum.
+    let (mut primary, backup) = headers(DISK, &was, |_, _| {});
+    primary[20] ^= 1;
+    assert_eq!(
+        kept_layout(DISK, &primary, &backup),
+        Err((1, Unkept::Damaged("GPT header CRC mismatch")))
+    );
+    assert_eq!(
+        alloc::format!(
+            "{}",
+            Unkept::Field {
+                field: "first usable LBA",
+                found: 33,
+                kept: Kept::AtLeast(34),
+            }
+        ),
+        "a GPT header names another layout than the one a rewrite keeps: its first usable LBA \
+         is 33, where a rewrite keeps 34 or more"
+    );
+}
+
 #[test]
 fn a_protective_mbr_is_its_boot_signature_and_a_type_0xee_entry() {
     let plan = plan(DISK, None, request(), counter()).unwrap();

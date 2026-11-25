@@ -115,6 +115,7 @@ pub mod posted_call;
 pub mod power_button;
 pub mod prediction_lines;
 pub mod process_fault;
+pub mod profile_window;
 pub mod psf;
 pub mod ram;
 pub mod random;

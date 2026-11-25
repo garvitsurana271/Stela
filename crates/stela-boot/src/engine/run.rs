@@ -673,21 +673,28 @@ fn device_exits_report<H: Host>(
 /// sampling PE's vector base (`v+offset`, `v-offset`), which moves with the
 /// kernel's slide, so runs compare across slides; EL0 PCs as they are.
 /// Every [`HOT_TOTAL_BEATS`] beats, the samples since the first beat
-/// ([`hot_total_report`]).
+/// ([`hot_total_report`]). The samples are the board's table drained every
+/// [`HOT_DRAIN_MILLIS`] ([`ProfileTables::drain_hot`]), so `other` counts
+/// only what one drain's table had no room for.
 fn hot_blocks_report<H: Host>(
     machine: &mut Machine<H, parallel::Board>,
     dynamic: &mut step_timing::DynamicSites,
     total: &mut step_timing::HotBlocks,
+    tables: &mut ProfileTables,
     whole: bool,
 ) {
     use stela_engine::machine::engine::step_timing::Level;
     const SHOWN: usize = 24;
-    let hot = parallel::hot_samples(machine);
-    dynamic.add(&hot.dynamic);
-    dynamic.untracked += hot.dynamic_other;
-    total.merge(&hot);
+    tables.drain_hot(machine);
+    let hot = core::mem::take(&mut tables.hot_beat);
+    let side = core::mem::take(&mut tables.hot_side);
+    dynamic.add(&side.dynamic);
+    dynamic.untracked += side.dynamic_other;
+    total.asids.merge(&side.asids);
+    tables.hot.add(&hot);
+    tables.hot_window.add(&hot);
     if whole {
-        hot_total_report(total);
+        hot_total_report(&tables.hot, total);
         // Address spaces are reused by later processes: the total by
         // address space covers the beats since the last total report.
         total.asids = Default::default();
@@ -710,7 +717,7 @@ fn hot_blocks_report<H: Host>(
         }
         output::arguments(format_args!("{line}\n"));
     }
-    hot_asids_report("PES HOT", &hot.asids, 10, 3, 8);
+    hot_asids_report("PES HOT", &side.asids, 10, 3, 8);
 }
 
 /// `{prefix} ASIDS samples=N other=M asid:user/kernel/guarded ...`: the
@@ -763,12 +770,17 @@ const HOT_TOTAL_BEATS: u64 = 16;
 /// beat, by guest block, from every PE's cycles samples
 /// (`step_timing::pc_samples`), each block with its code page's key, which
 /// `cargo xtask symbolize` maps to functions; every [`HOT_TOTAL_BEATS`]
-/// beats, `PES PC TOTAL ...` over every beat since the first. No lines
-/// where the host took no such samples.
+/// beats, `PES PC TOTAL ...` over every beat since the first, and `PES PC
+/// SHARE level` the top blocks' exact shares of the level's cycles
+/// (`profile_window::PcShares`). Every [`PAGES_BEATS`] beats, the open
+/// window's `PES PC PAGES` so far ([`ProfileTables`]). No lines where the
+/// host took no such samples.
 fn pc_blocks_report<H: Host>(
     machine: &mut Machine<H, parallel::Board>,
     total: &mut step_timing::PcSamples,
+    tables: &mut ProfileTables,
     whole: bool,
+    pages: bool,
 ) {
     /// The blocks a beat's line and a total's show per level.
     const SHOWN: usize = 64;
@@ -777,6 +789,11 @@ fn pc_blocks_report<H: Host>(
     total.merge(&beat);
     // The total keeps the blocks with the most cycles, not the first.
     total.trim();
+    tables.pc.add(&beat);
+    tables.pc_window.merge(&beat);
+    tables.pc_window.trim();
+    tables.pc_window_shares.add(&beat);
+    tables.pages.add(&beat);
     for line in beat.lines("PES PC", SHOWN) {
         output::arguments(format_args!("{line}\n"));
     }
@@ -784,6 +801,161 @@ fn pc_blocks_report<H: Host>(
         for line in total.lines("PES PC TOTAL", TOTAL_SHOWN) {
             output::arguments(format_args!("{line}\n"));
         }
+        for line in tables.pc.lines("PES PC SHARE", None) {
+            output::arguments(format_args!("{line}\n"));
+        }
+    }
+    if pages {
+        for line in tables
+            .pages
+            .lines("PES PC PAGES", tables.window, PAGES_PER_LINE)
+        {
+            output::arguments(format_args!("{line}\n"));
+        }
+    }
+}
+
+/// Beats between the open window's `PES PC PAGES` lines, which a mark
+/// gives too: a boot never marked still says every page.
+const PAGES_BEATS: u64 = 32;
+/// Pages a `PES PC PAGES` level line lists at most.
+const PAGES_PER_LINE: usize = 512;
+/// The blocks per level a window's `PES PC WINDOW` lines list.
+const WINDOW_SHOWN: usize = 512;
+/// The blocks per level a window's `PES HOT WINDOW` lines list.
+const HOT_WINDOW_SHOWN: usize = 64;
+/// How often the board's transfer samples are drained: often enough that
+/// its table ([`step_timing::HOT_BLOCKS`] blocks) does not fill between.
+pub(super) const HOT_DRAIN_MILLIS: u64 = 250;
+/// Blocks per level the whole boot's exact share summaries hold
+/// (`profile_window::HeavyHitters`), and a window's.
+const SHARE_BLOCKS: usize = 1 << 16;
+const WINDOW_SHARE_BLOCKS: usize = 1 << 15;
+
+/// `--profile`'s whole tables and the open window's
+/// (`stela_boot_core::profile_window`).
+pub(super) struct ProfileTables {
+    /// The board's transfer samples drained since the last beat, whole,
+    /// and the drained tables' address spaces and dynamic transfers.
+    hot_beat: profile_window::HotCounts,
+    hot_side: step_timing::HotBlocks,
+    /// The counter at the last drain.
+    drained: u64,
+    /// The transfer samples since the first beat and in the window.
+    hot: profile_window::HotShares,
+    hot_window: profile_window::HotShares,
+    /// The cycle samples' blocks since the first beat, the window's
+    /// blocks and shares, and its pages.
+    pc: profile_window::PcShares,
+    pc_window: step_timing::PcSamples,
+    pc_window_shares: profile_window::PcShares,
+    pages: profile_window::PcPages,
+    /// The open window, 0 before the first mark, and when it began.
+    window: u32,
+    window_at: u64,
+    /// The mark whose beat is being reported, and the counter at it.
+    pub(super) closing: Option<(u32, u64)>,
+    pub(super) images: super::profile_window::GuestImages,
+}
+
+use stela_boot_core::profile_window;
+
+impl ProfileTables {
+    fn new(now: u64) -> Self {
+        Self {
+            hot_beat: Default::default(),
+            hot_side: Default::default(),
+            drained: now,
+            hot: profile_window::HotShares::new(SHARE_BLOCKS),
+            hot_window: profile_window::HotShares::new(WINDOW_SHARE_BLOCKS),
+            pc: profile_window::PcShares::new(SHARE_BLOCKS),
+            pc_window: Default::default(),
+            pc_window_shares: profile_window::PcShares::new(WINDOW_SHARE_BLOCKS),
+            pages: Default::default(),
+            window: 0,
+            window_at: now,
+            closing: None,
+            images: Default::default(),
+        }
+    }
+
+    /// Take the board's transfer samples into the beat's, whole.
+    fn drain_hot<H: Host>(&mut self, machine: &mut Machine<H, parallel::Board>) {
+        let hot = parallel::hot_samples(machine);
+        self.hot_beat.absorb(&hot);
+        self.hot_side.asids.merge(&hot.asids);
+        self.hot_side.add_dynamic(&hot.dynamic);
+        self.hot_side.dynamic_other += hot.dynamic_other;
+    }
+
+    /// Between slices under `--profile`: drain the transfer samples when
+    /// due, and look for the guest's images.
+    pub(super) fn sample<H: Host>(
+        &mut self,
+        machine: &mut Machine<H, parallel::Board>,
+        now: u64,
+        tsc_hz: u64,
+    ) {
+        if now.wrapping_sub(self.drained) >= tsc_hz / 1000 * HOT_DRAIN_MILLIS {
+            self.drained = now;
+            self.drain_hot(machine);
+        }
+        self.images.step(machine);
+    }
+
+    /// The window a mark ended: `PROFILE WINDOW`, then its pages, blocks
+    /// and shares, and a new window begins.
+    fn window_report(&mut self, mark: u32, at: u64, tsc_hz: u64) {
+        use stela_engine::machine::engine::step_timing::Level;
+        let window = self.window;
+        let millis = u128::from(at.wrapping_sub(self.window_at)) * 1000 / u128::from(tsc_hz.max(1));
+        output::arguments(format_args!(
+            "PROFILE WINDOW {window} ends at mark {mark} after {}.{:03} s: its PES PMU WINDOW, \
+             PES PC PAGES, PES PC WINDOW, PES PC SHARE and PES HOT SHARE lines say w={window}\n",
+            millis / 1000,
+            millis % 1000,
+        ));
+        for line in self.pages.lines("PES PC PAGES", window, PAGES_PER_LINE) {
+            output::arguments(format_args!("{line}\n"));
+        }
+        for (at, line) in self
+            .pc_window
+            .lines("PES PC WINDOW", WINDOW_SHOWN)
+            .into_iter()
+            .enumerate()
+        {
+            // The header names the window, as the pages' does.
+            let window = if at == 0 {
+                format!(" w={window}")
+            } else {
+                String::new()
+            };
+            output::arguments(format_args!("{line}{window}\n"));
+        }
+        for line in self.pc_window_shares.lines("PES PC SHARE", Some(window)) {
+            output::arguments(format_args!("{line}\n"));
+        }
+        for (level, name) in [
+            (Level::Kernel, "kernel"),
+            (Level::Guarded, "guarded"),
+            (Level::User, "user"),
+        ] {
+            let Some(line) = self.hot_window.line("PES HOT SHARE", level, Some(window)) else {
+                continue;
+            };
+            output::arguments(format_args!("{line}\n"));
+            let mut line = format!("PES HOT WINDOW {name} w={window}");
+            for block in self.hot_window.top(level, HOT_WINDOW_SHOWN) {
+                push_hot_block(&mut line, level, &block);
+            }
+            output::arguments(format_args!("{line}\n"));
+        }
+        self.pages = Default::default();
+        self.pc_window = Default::default();
+        self.pc_window_shares = profile_window::PcShares::new(WINDOW_SHARE_BLOCKS);
+        self.hot_window = profile_window::HotShares::new(WINDOW_SHARE_BLOCKS);
+        self.window = mark;
+        self.window_at = at;
     }
 }
 
@@ -802,12 +974,14 @@ fn push_hot_block(line: &mut String, level: step_timing::Level, block: &step_tim
     }
 }
 
-/// `PES HOT SHARE level samples=N blocks=B top24= top100= top1000= top8192=`
-/// in per mille of the level's samples since the first beat, then
-/// `PES HOT TOTAL level` with its most sampled blocks: how concentrated
-/// native time is, which the per-beat lines cannot show. Samples that found
-/// the table full count in `samples` and in no top share.
-fn hot_total_report(total: &step_timing::HotBlocks) {
+/// `PES HOT SHARE level samples=N other=O blocks=B exact= evicted= floor=
+/// top24= top100= top1000= top10000=` in per mille of the level's samples
+/// since the first beat (`profile_window::HotShares`: exact while
+/// `exact=yes`, else lower bounds, no key unheld above `floor`), then `PES
+/// HOT TOTAL level` with its most sampled blocks: how concentrated native
+/// time is, which the per-beat lines cannot show. `other` counts the
+/// samples a drained table had no room for.
+fn hot_total_report(shares: &profile_window::HotShares, total: &step_timing::HotBlocks) {
     use stela_engine::machine::engine::step_timing::Level;
     const SHOWN: usize = 128;
     for (level, name) in [
@@ -815,24 +989,13 @@ fn hot_total_report(total: &step_timing::HotBlocks) {
         (Level::Guarded, "guarded"),
         (Level::User, "user"),
     ] {
-        let samples = total.samples[level as usize];
-        if samples == 0 {
+        let Some(line) = shares.line("PES HOT SHARE", level, None) else {
             continue;
-        }
-        let blocks = total.top(level, usize::MAX);
-        let mut line = format!(
-            "PES HOT SHARE {name} samples={samples} other={} blocks={}",
-            total.other,
-            blocks.len()
-        );
-        for shown in [24, 100, 1000, step_timing::HOT_BLOCKS] {
-            let counted: u64 = blocks.iter().take(shown).map(|block| block.count).sum();
-            line.push_str(&format!(" top{shown}={}", counted * 1000 / samples));
-        }
+        };
         output::arguments(format_args!("{line}\n"));
         let mut line = format!("PES HOT TOTAL {name}");
-        for block in blocks.iter().take(SHOWN) {
-            push_hot_block(&mut line, level, block);
+        for block in shares.top(level, SHOWN) {
+            push_hot_block(&mut line, level, &block);
         }
         output::arguments(format_args!("{line}\n"));
     }
@@ -1185,6 +1348,23 @@ pub(super) fn run<H: Host>(
             host_work(machine, "beat step", |machine| {
                 heartbeat.step(machine, tsc_hz)
             });
+            continue;
+        }
+        // A `--profile` window mark ends a beat now, so every per-beat
+        // line splits at it (`profile_window`), and its window's tables
+        // follow the beat's.
+        // A beat lasts a tenth of a second at least: a mark just after one
+        // waits that long.
+        if machine.step_timing().is_some()
+            && due >= tsc_hz / 10
+            && let Some(mark) = super::profile_window::take_mark()
+        {
+            heartbeat.tables.closing = Some((mark, now));
+            let _periodic = output::periodic();
+            host_work(machine, "beat", |machine| {
+                heartbeat.beat(machine, &mut service, now, tsc_hz)
+            });
+            output::arguments(format_args!("{}", cursor.report(now, tsc_hz)));
             continue;
         }
         // The beat's reports, whose size their pace bounds, pass the log's
@@ -1637,7 +1817,8 @@ pub(super) struct Heartbeat {
     /// The RET, BLR and BR sites sampled since the first beat
     /// (`hot_blocks_report`).
     pub(super) dynamic: step_timing::DynamicSites,
-    /// The hot blocks sampled since the first beat (`hot_total_report`).
+    /// The address spaces of the hot blocks sampled since the last total
+    /// (`hot_total_report`); their blocks are `tables.hot`'s.
     pub(super) hot_total: step_timing::HotBlocks,
     /// The host's samples of native code by block since the first beat
     /// (`pc_blocks_report`).
@@ -1651,6 +1832,9 @@ pub(super) struct Heartbeat {
     pub(super) exit_paths: step_timing::ExitPaths,
     /// Every PE's AMX counts at the last `PES AMX` line (`amx_profile`).
     pub(super) amx: stela_engine::machine::engine::AmxCounts,
+    /// `--profile`'s whole tables, the open window's and its mark
+    /// ([`ProfileTables`]).
+    pub(super) tables: ProfileTables,
 }
 
 /// The heartbeat's reports after its first part ([`Heartbeat::beat`]), in
@@ -1725,6 +1909,7 @@ impl Heartbeat {
             system_total: BTreeMap::new(),
             exit_paths: step_timing::ExitPaths::default(),
             amx: Default::default(),
+            tables: ProfileTables::new(now),
         }
     }
 
@@ -1748,6 +1933,9 @@ impl Heartbeat {
                 })
                 .count += 1;
             self.hot_sampled = now;
+            if machine.step_timing().is_some() {
+                self.tables.sample(machine, now, tsc_hz);
+            }
         }
         if now.wrapping_sub(self.sampled) >= tsc_hz && self.samples.len() < BEAT_SECONDS as usize {
             let (pc, frame) = (machine.cpu.pc, machine.cpu.state.x[29]);
@@ -1791,6 +1979,10 @@ impl Heartbeat {
             self.timing = Some(now);
             // Hardware counters by phase, per PE: `host::pmu::report`.
             host::pmu::report(&mut self.pmu);
+            // A mark ends the window here: its counters' ratios.
+            if self.tables.closing.is_some() {
+                host::pmu::window_report(&mut self.pmu, self.tables.window);
+            }
         }
         self.sliced_ticks = 0;
         #[cfg(feature = "native-profile")]
@@ -2084,13 +2276,21 @@ impl Heartbeat {
                         machine,
                         &mut self.dynamic,
                         &mut self.hot_total,
+                        &mut self.tables,
                         self.beats.is_multiple_of(HOT_TOTAL_BEATS),
                     );
+                    let closing = self.tables.closing.take();
                     pc_blocks_report(
                         machine,
                         &mut self.pc_total,
+                        &mut self.tables,
                         self.beats.is_multiple_of(HOT_TOTAL_BEATS),
+                        // A mark's window report says its pages.
+                        self.beats.is_multiple_of(PAGES_BEATS) && closing.is_none(),
                     );
+                    if let Some((mark, at)) = closing {
+                        self.tables.window_report(mark, at, tsc_hz);
+                    }
                 }
                 if let Some((mut line, predicted, pac_fills)) = self.stamped.take() {
                     if profiling {

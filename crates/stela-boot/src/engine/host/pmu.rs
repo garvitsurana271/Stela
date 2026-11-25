@@ -41,7 +41,16 @@
 //! speculation). Other AMD families count cycles,
 //! instructions and mispredicts. Intel counts the architectural events
 //! CPUID leaf 0Ah reports (cycles, instructions, mispredicted branches, LLC
-//! misses); the rest are unsupported there, said once.
+//! misses) and, on the Core models from Skylake on, the front end's empty
+//! slots, the instruction cache's stalls and the code reads that missed it
+//! (`FRONT_END_SLOTS_INTEL` and after), with the slots themselves from Ice
+//! Lake on; a hybrid part's Atom cores count their own encodings of these,
+//! kept apart in the window line. Other Intel models count the
+//! architectural events only, said once.
+//!
+//! [`window_report`] says the counts of a marked window (`PROFILE MARK`,
+//! `profile_window`) as ratios: IPC, the front end's and back end's shares
+//! of the slots, instruction cache misses per thousand instructions.
 use super::super::interrupts::Frame;
 use crate::output;
 use alloc::{boxed::Box, format, string::String, vec::Vec};
@@ -269,10 +278,28 @@ struct Event {
     name: &'static str,
     code: u16,
     umask: u8,
+    /// Its encoding on an Intel hybrid part's Atom cores, where that
+    /// differs; `None` there leaves the counter off on them.
+    atom: Option<(u16, u8)>,
 }
 
 const fn event(name: &'static str, code: u16, umask: u8) -> Event {
-    Event { name, code, umask }
+    Event {
+        name,
+        code,
+        umask,
+        atom: Some((code, umask)),
+    }
+}
+
+/// An Intel event with another encoding on Atom cores, or none there.
+const fn intel(name: &'static str, code: u16, umask: u8, atom: Option<(u16, u8)>) -> Event {
+    Event {
+        name,
+        code,
+        umask,
+        atom,
+    }
 }
 
 const CYCLES_AMD: Event = event("cyc", 0x076, 0);
@@ -295,6 +322,58 @@ const CYCLES_INTEL: Event = event("cyc", 0x3c, 0);
 const INSTRUCTIONS_INTEL: Event = event("ins", 0xc0, 0);
 const MISPREDICTS_INTEL: Event = event("brmisp", 0xc5, 0);
 const LLC_MISSES_INTEL: Event = event("llcmiss", 0x2e, 0x41);
+/// The front end on the Core microarchitectures from Skylake on (Intel's
+/// perfmon event files for SKL, ICL, TGL, ADL/RPL/MTL Golden Cove and
+/// Redwood Cove, SPR): `IDQ_UOPS_NOT_DELIVERED.CORE` (9Ch/01h, slots the
+/// front end left empty while the back end could take them; Gracemont's
+/// `TOPDOWN_FE_BOUND.ALL` 71h/00h), `ICACHE_DATA.STALLS` (80h/04h, cycles
+/// fetch waited for the instruction cache; Skylake's
+/// `ICACHE_16B.IFDATA_STALL`, the same encoding), and `L2_RQSTS.ALL_CODE_RD`
+/// (24h/E4h, code reads that missed the L1i and went to L2, prefetches
+/// included; Gracemont's `ICACHE.MISSES` 80h/02h). The topdown slots there
+/// are the core's 4 (Skylake) or 6 issue slots a cycle, Gracemont's 5.
+const FRONT_END_SLOTS_INTEL: Event = intel("feslot", 0x9c, 0x01, Some((0x71, 0x00)));
+const ICACHE_STALLS_INTEL: Event = intel("icstall", 0x80, 0x04, None);
+const ICACHE_MISSES_INTEL: Event = intel("icmiss", 0x24, 0xe4, Some((0x80, 0x02)));
+/// `TOPDOWN.SLOTS_P` (A4h/01h, Ice Lake on): the slots themselves on a
+/// general counter; none on Skylake or Atom cores, where the width times
+/// cycles stands for them.
+const SLOTS_INTEL: Event = intel("slots", 0xa4, 0x01, None);
+/// Family 6 models of the Skylake-derived Core cores (client and server).
+const SKYLAKE_MODELS: [u8; 7] = [0x4e, 0x5e, 0x8e, 0x9e, 0xa5, 0xa6, 0x55];
+/// Family 6 models from Ice Lake on whose Core cores count `TOPDOWN.SLOTS_P`:
+/// Ice Lake, Tiger Lake, Rocket Lake, Sapphire and Emerald Rapids, and the
+/// hybrid Alder, Raptor and Meteor Lake.
+const SLOTS_MODELS: [u8; 13] = [
+    0x7d, 0x7e, 0x6a, 0x6c, 0x8c, 0x8d, 0xa7, 0x8f, 0xcf, 0x97, 0x9a, 0xb7, 0xba,
+];
+/// Raptor Lake's other model and Meteor Lake, also with `TOPDOWN.SLOTS_P`.
+const SLOTS_MODELS_MORE: [u8; 3] = [0xbf, 0xaa, 0xac];
+/// The issue slots a cycle of an Intel Core core with `TOPDOWN.SLOTS_P`
+/// (Sunny Cove on: 5 on Ice Lake and Tiger Lake, 6 on Golden Cove; the
+/// slots event counts them itself, so this is only for the line's word),
+/// of Skylake, and of Gracemont.
+const SKYLAKE_WIDTH: u64 = 4;
+const ATOM_WIDTH: u64 = 5;
+
+/// `(family, model)` as CPUID leaf 1 gives them, the extended fields folded.
+fn family_model() -> (u32, u8) {
+    let eax = __cpuid(1).eax;
+    let base = (eax >> 8) & 0xf;
+    let model = ((eax >> 4) & 0xf) as u8;
+    match base {
+        0x6 | 0xf => (family(), model | (((eax >> 16) & 0xf) as u8) << 4),
+        _ => (base, model),
+    }
+}
+
+/// Whether this core is an Intel hybrid part's Atom core (CPUID leaf 1Ah
+/// core type 20h).
+fn atom_core() -> bool {
+    __cpuid(0).eax >= 0x1a
+        && __cpuid_count(7, 0).edx & (1 << 15) != 0
+        && __cpuid_count(0x1a, 0).eax >> 24 == 0x20
+}
 
 /// How this core's counters are reached, and what they count.
 struct Layout {
@@ -308,6 +387,14 @@ struct Layout {
     fixed: Vec<Event>,
     rotating: Vec<Event>,
     described: String,
+    /// Issue (dispatch) slots a cycle: what a slot event's share is of
+    /// where no `slots` event counts them (0: one does); an Intel hybrid
+    /// part's Atom cores' apart.
+    width: u64,
+    atom_width: u64,
+    /// An Intel hybrid part with the front-end table: its Atom cores count
+    /// their own encodings, and their counts are kept apart.
+    hybrid: bool,
 }
 
 const AMD_VENDOR: [u32; 3] = [0x6874_7541, 0x6974_6e65, 0x444d_4163];
@@ -352,6 +439,10 @@ fn layout() -> Option<Layout> {
             amd: true,
             fixed: alloc::vec![CYCLES_AMD, INSTRUCTIONS_AMD],
             rotating,
+            // Zen 3 and 4 dispatch 6 ops a cycle, Zen 5 8 (PMCx1A0's slots).
+            width: if family == 0x1a { 8 } else { 6 },
+            atom_width: 0,
+            hybrid: false,
             described: format!(
                 "AMD family {family:#x} counters={counters} core_ext={core_ext} perfmon_v2={v2}{}",
                 if zen {
@@ -377,12 +468,35 @@ fn layout() -> Option<Layout> {
                 fixed.push(event);
             }
         }
+        // The front-end events first, so a core with 4 counters runs them
+        // in its first sets; the architectural ones after.
+        let (family, model) = family_model();
+        let slots =
+            family == 6 && (SLOTS_MODELS.contains(&model) || SLOTS_MODELS_MORE.contains(&model));
+        let core = family == 6 && (slots || SKYLAKE_MODELS.contains(&model));
+        let hybrid = core && __cpuid_count(7, 0).edx & (1 << 15) != 0;
         let mut rotating = Vec::new();
+        if core {
+            rotating.push(FRONT_END_SLOTS_INTEL);
+            if slots {
+                rotating.push(SLOTS_INTEL);
+            }
+            rotating.extend([ICACHE_STALLS_INTEL, ICACHE_MISSES_INTEL]);
+        }
         for (bit, event) in [(6, MISPREDICTS_INTEL), (4, LLC_MISSES_INTEL)] {
             if available(bit) {
                 rotating.push(event);
             }
         }
+        let table = match (core, slots) {
+            (true, true) => {
+                "; front end: feslot=9Ch/01h slots=A4h/01h icstall=80h/04h icmiss=24h/E4h (L2 code reads)"
+            }
+            (true, false) => {
+                "; front end: feslot=9Ch/01h icstall=80h/04h icmiss=24h/E4h (L2 code reads), 4 slots a cycle"
+            }
+            _ => "; no front-end event table for this model: architectural events only",
+        };
         Some(Layout {
             counters,
             select: 0x186,
@@ -392,8 +506,16 @@ fn layout() -> Option<Layout> {
             fixed,
             rotating,
             described: format!(
-                "Intel perfmon v{version} counters={counters}; instruction cache, ITLB, DTLB and L2 events unsupported"
+                "Intel family {family} model {model:#x} perfmon v{version} counters={counters}{table}{}",
+                if hybrid {
+                    "; hybrid: Atom cores count feslot=71h/00h icmiss=80h/02h (no slots, icstall), 5 slots a cycle, apart"
+                } else {
+                    ""
+                }
             ),
+            width: if slots { 0 } else { SKYLAKE_WIDTH },
+            atom_width: ATOM_WIDTH,
+            hybrid,
         })
     } else {
         None
@@ -436,6 +558,20 @@ impl Layout {
     fn overflow_clear(&self) -> Option<u32> {
         self.global
             .map(|_| if self.amd { 0xc000_0302 } else { 0x390 })
+    }
+
+    /// Event select of `event` on this core, an Atom core of a hybrid part
+    /// when `atom`: none where it has no encoding there.
+    fn select_on(&self, event: Event, atom: bool) -> Option<u64> {
+        match (atom && self.hybrid, event.atom) {
+            (false, _) => Some(self.select(event)),
+            (true, Some((code, umask))) => Some(self.select(Event {
+                code,
+                umask,
+                ..event
+            })),
+            (true, None) => None,
+        }
     }
 
     fn select(&self, event: Event) -> u64 {
@@ -490,6 +626,8 @@ struct Own {
 
 struct Core {
     pe: usize,
+    /// An Intel hybrid part's Atom core: its own encodings, its counts apart.
+    atom: bool,
     own: UnsafeCell<Own>,
     buckets: [[Bucket; BUCKETS]; MAX_SETS],
     /// Window mode: every closed window's counts and ticks, per set.
@@ -533,7 +671,7 @@ fn core() -> Option<&'static Core> {
 
 /// Program this core's counters for `set`. Says once per event what the
 /// core refused.
-fn program(layout: &Layout, set: usize) -> usize {
+fn program(layout: &Layout, set: usize, atom: bool) -> usize {
     let events = layout.events(set);
     // The sampled counters interrupt on overflow (`sampling`).
     const INTERRUPT: u64 = 1 << 20;
@@ -545,7 +683,8 @@ fn program(layout: &Layout, set: usize) -> usize {
         };
         let value = events
             .get(counter)
-            .map_or(0, |event| layout.select(*event) | interrupt);
+            .and_then(|event| layout.select_on(*event, atom))
+            .map_or(0, |select| select | interrupt);
         if !write(index, value) && value != 0 {
             let bit = 1 << (set * MAX_COUNTERS + counter);
             if REFUSED.fetch_or(bit, Relaxed) & bit == 0 {
@@ -638,7 +777,8 @@ pub(crate) fn start(pe: usize) {
         return;
     }
     super::sampling::enable(layout.fixed.len());
-    let read = program(layout, SET.load(Relaxed) as usize % layout.sets());
+    let atom = atom_core();
+    let read = program(layout, SET.load(Relaxed) as usize % layout.sets(), atom);
     // What reading the set costs: RDPMC may trap under a hypervisor.
     let before = crate::apic::rdtsc();
     for _ in 0..4 {
@@ -700,6 +840,7 @@ pub(crate) fn start(pe: usize) {
     };
     let record = Box::into_raw(Box::new(Core {
         pe,
+        atom,
         own: UnsafeCell::new(own),
         buckets: Default::default(),
         whole: Default::default(),
@@ -750,7 +891,7 @@ fn read_timed(core: &Core, own: &mut Own) -> [u64; MAX_COUNTERS] {
 /// Program `set`, timing the counter MSR writes against the core's budget.
 fn reprogram(core: &Core, own: &mut Own, layout: &Layout, set: usize) {
     let before = crate::apic::rdtsc();
-    own.read = program(layout, set);
+    own.read = program(layout, set, core.atom);
     own.set = set;
     own.charge(core, crate::apic::rdtsc().wrapping_sub(before));
 }
@@ -903,6 +1044,12 @@ pub(crate) struct Seen {
     spent: Vec<u64>,
     /// The `PES WHERE` lines' ([`super::sampling::report`]).
     sampled: super::sampling::Seen,
+    /// The open window's scaled counts ([`window_report`]), by core kind
+    /// (0, an Intel hybrid part's Atom cores 1), set and bucket, and the
+    /// beats each set ran in it.
+    window: [[[[u64; MAX_COUNTERS]; BUCKETS + 1]; MAX_SETS]; 2],
+    window_ran: [[[bool; BUCKETS + 1]; MAX_SETS]; 2],
+    window_beats: [u32; MAX_SETS],
 }
 
 impl Seen {
@@ -911,8 +1058,131 @@ impl Seen {
             totals: Vec::new(),
             spent: Vec::new(),
             sampled: super::sampling::Seen::new(),
+            window: [[[[0; MAX_COUNTERS]; BUCKETS + 1]; MAX_SETS]; 2],
+            window_ran: [[[false; BUCKETS + 1]; MAX_SETS]; 2],
+            window_beats: [0; MAX_SETS],
         }
     }
+}
+
+/// `PES PMU WINDOW w=W beats=B1/B2/..`, then per core kind (`all`, or an
+/// Intel hybrid part's `core` and `atom`) and set that ran in the window,
+/// `setS:` and for the native code (`nat`) and the whole PE (`pe`, every
+/// phase) its ratios: `ipc`, each slot event's share of the issue slots
+/// (`feslot%`, `beslot%`: of the `slots` event where one counts, else of
+/// the width times the cycles), `badspec%` (dispatched less retired ops,
+/// AMD) and `retops%`, each stall event's share of the cycles
+/// (`icstall%`), and every other event per thousand instructions
+/// (`icmiss_pki`, `brmisp_pki`, ...): what the counters say of window `w`,
+/// the beats since the last mark, with the sets rotating through it.
+pub(crate) fn window_report(seen: &mut Seen, window: u32) {
+    let Some(layout) = shared_layout() else {
+        return;
+    };
+    let sets = layout.sets();
+    let beats: Vec<String> = seen.window_beats[..sets]
+        .iter()
+        .map(|beats| format!("{beats}"))
+        .collect();
+    let mut line = format!("PES PMU WINDOW w={window} beats={}", beats.join("/"));
+    let kinds: &[(usize, &str)] = match layout.hybrid {
+        true => &[(0, "core"), (1, "atom")],
+        false => &[(0, "all")],
+    };
+    for &(kind, kind_name) in kinds {
+        line.push_str(&format!(" {kind_name}:"));
+        let width = match kind {
+            1 => layout.atom_width,
+            _ => layout.width,
+        };
+        for set in 0..sets {
+            if seen.window_beats[set] == 0 {
+                continue;
+            }
+            let events = layout.events(set);
+            line.push_str(&format!(" set{}:", set + 1));
+            let phases: Vec<usize> = (0..Phase::COUNT).collect();
+            // The whole PE: its window bucket, or every phase's.
+            let whole = |counter: usize| match seen.window_ran[kind][set][BUCKETS] {
+                true => seen.window[kind][set][BUCKETS][counter],
+                false => phases
+                    .iter()
+                    .map(|&bucket| seen.window[kind][set][bucket][counter])
+                    .sum(),
+            };
+            for (name, values) in [
+                (
+                    "nat",
+                    core::array::from_fn::<u64, MAX_COUNTERS, _>(|counter| {
+                        seen.window[kind][set][Phase::Native as usize][counter]
+                    }),
+                ),
+                ("pe", core::array::from_fn(whole)),
+            ] {
+                line.push_str(&format!(" {name}="));
+                line.push_str(&ratios(&events, &values, width));
+            }
+        }
+    }
+    line.push('\n');
+    output::arguments(format_args!("{line}"));
+    seen.window = [[[[0; MAX_COUNTERS]; BUCKETS + 1]; MAX_SETS]; 2];
+    seen.window_ran = [[[false; BUCKETS + 1]; MAX_SETS]; 2];
+    seen.window_beats = [0; MAX_SETS];
+}
+
+/// A window line's ratios of one bucket's counts ([`window_report`]),
+/// comma-separated: `ipc=..,feslot%=..,...`, `-` without cycles.
+fn ratios(events: &[Event], values: &[u64; MAX_COUNTERS], width: u64) -> String {
+    let find = |name: &str| {
+        events
+            .iter()
+            .position(|event| event.name == name)
+            .map(|counter| values[counter])
+    };
+    let (Some(cycles), Some(instructions)) = (find("cyc"), find("ins")) else {
+        return String::from("-");
+    };
+    if cycles == 0 {
+        return String::from("-");
+    }
+    let slots = find("slots")
+        .filter(|&slots| slots != 0)
+        .unwrap_or(cycles.saturating_mul(width));
+    let fixed = |value: u64, of: u64, scale: u64| {
+        let tenths = (u128::from(value) * u128::from(scale) * 10)
+            .checked_div(u128::from(of))
+            .unwrap_or(0);
+        format!("{}.{}", tenths / 10, tenths % 10)
+    };
+    let mut words = alloc::vec![format!(
+        "ipc={}.{:02}",
+        instructions / cycles,
+        (u128::from(instructions % cycles) * 100 / u128::from(cycles))
+    )];
+    for (counter, event) in events.iter().enumerate() {
+        let value = values[counter];
+        match event.name {
+            "cyc" | "ins" | "slots" | "disp" => {}
+            "retops" => {
+                words.push(format!("retops%={}", fixed(value, slots, 100)));
+                if let Some(dispatched) = find("disp") {
+                    words.push(format!(
+                        "badspec%={}",
+                        fixed(dispatched.saturating_sub(value), slots, 100)
+                    ));
+                }
+            }
+            name if name.ends_with("slot") => {
+                words.push(format!("{name}%={}", fixed(value, slots, 100)));
+            }
+            name if name.ends_with("stall") => {
+                words.push(format!("{name}%={}", fixed(value, cycles, 100)));
+            }
+            name => words.push(format!("{name}_pki={}", fixed(value, instructions, 1000))),
+        }
+    }
+    words.join(",")
 }
 
 fn totals(core: &Core) -> [[[u64; MAX_COUNTERS + 2]; BUCKETS + 1]; MAX_SETS] {
@@ -1085,8 +1355,10 @@ pub(crate) fn report(seen: &mut Seen) {
                 scaled[counter] =
                     (u128::from(count) * u128::from(ticks) / u128::from(sampled)) as u64;
                 machine[bucket][counter] += scaled[counter];
+                seen.window[usize::from(core.atom)][set][bucket][counter] += scaled[counter];
             }
             ran[bucket] = true;
+            seen.window_ran[usize::from(core.atom)][set][bucket] = true;
             if bucket == BUCKETS {
                 whole = Some(scaled);
             }
@@ -1094,6 +1366,7 @@ pub(crate) fn report(seen: &mut Seen) {
         }
         seen.totals[core.pe] = now;
     }
+    seen.window_beats[set] += 1;
     line.push_str(" all:");
     for &bucket in &order {
         if ran[bucket] {

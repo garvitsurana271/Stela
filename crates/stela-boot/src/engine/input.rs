@@ -150,6 +150,8 @@ pub struct HostInput {
     /// `--host-cursor on`: mouse motion made the guest's absolute pointer's
     /// position ([`Self::host_cursor`]).
     pointer: host_cursor::Pointer,
+    /// `--profile`'s window mark on the host keyboards (`profile_window`).
+    marks: stela_boot_core::profile_window::MarkKeys,
 }
 
 impl HostInput {
@@ -184,6 +186,7 @@ impl HostInput {
             trackpad_seen: trackpad::Counters::default(),
             trackpad_reported: 0,
             pointer: host_cursor::Pointer::default(),
+            marks: stela_boot_core::profile_window::MarkKeys::new(),
         }
     }
 
@@ -272,7 +275,8 @@ impl HostInput {
 
     /// Deliver what [`Self::read`] read from the host's devices, and note
     /// the guest's lock-key LEDs for the next read to send.
-    pub fn deliver_all(&mut self, devices: &mut AppleDevices, inputs: Vec<Input>) {
+    pub fn deliver_all(&mut self, devices: &mut AppleDevices, mut inputs: Vec<Input>) {
+        super::profile_window::filter(&mut self.marks, &mut inputs);
         if let Some(surface) = self.new_surface.take() {
             devices.set_trackpad_surface(surface);
         }

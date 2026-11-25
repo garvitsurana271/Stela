@@ -710,6 +710,13 @@ pub fn storage_attachments(
     if fragment.attachment_reads != 0 {
         require(capabilities.framebuffer_reads, "framebuffer reads")?;
     }
+    // A multisampled attachment is accessed through multisampled storage
+    // views, which a device whose reads reach single-sample attachments
+    // alone does not have.
+    require(
+        targets.raster_sample_count <= 1 || !capabilities.single_sample_storage,
+        "framebuffer reads of multisampled attachments",
+    )?;
     require(
         tests_first(fragment, targets) || capabilities.fragment_tests,
         "attachments accessed as storage by a function that writes depth, stencil or coverage",
@@ -747,13 +754,17 @@ pub fn storage_attachments(
 /// code within the codes' range, as Apple GPUs do, where the blend unit
 /// would keep values past them. A device without framebuffer reads, or a
 /// function that cannot let the pipeline test fragments first, leaves
-/// them to the blend unit, a known hardware precision difference.
+/// them to the blend unit, a known hardware precision difference; so does
+/// a multisampled pipeline on a device whose reads reach single-sample
+/// attachments alone.
 fn blended_extended_range(
     capabilities: &Capabilities,
     fragment: &Interface,
     targets: &RenderTargets,
 ) -> u32 {
-    if !capabilities.framebuffer_reads || !tests_first(fragment, targets) {
+    if !capabilities.framebuffer_reads_at(targets.raster_sample_count)
+        || !tests_first(fragment, targets)
+    {
         return 0;
     }
     targets
@@ -1257,6 +1268,11 @@ pub fn tile_target(
 ) -> Result<TileTarget> {
     require(capabilities.framebuffer_reads, "tile functions")?;
     let samples = samples.max(1);
+    // A multisampled pass's imageblock is multisampled storage.
+    require(
+        capabilities.framebuffer_reads_at(samples),
+        "tile functions of multisampled passes",
+    )?;
     require(
         capabilities.supports_texture_sample_count(samples),
         "tile pipeline sample count",

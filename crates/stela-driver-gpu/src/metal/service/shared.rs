@@ -1704,6 +1704,15 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             .and_then(|mut turn| turn.device().capabilities().family_shortfall())
     }
 
+    /// Why the boot leaves the device unused, in no Apple GPU family
+    /// ([`crate::metal::capabilities::Capabilities::no_apple_family`]);
+    /// `None` for a device in Apple3, or while a call holds the service,
+    /// which no call does as the boot opens it.
+    pub fn no_apple_family(&self) -> Option<alloc::string::String> {
+        self.try_turn()
+            .and_then(|mut turn| turn.device().capabilities().no_apple_family())
+    }
+
     /// Where retired command buffers' time went since the last call, unless
     /// a call holds the service now; it is then counted for the next.
     pub fn gpu_times(&self) -> Option<crate::metal::device::gpu_times::GpuTimes> {

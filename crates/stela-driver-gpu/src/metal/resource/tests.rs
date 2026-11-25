@@ -767,3 +767,47 @@ fn texture_buffers_are_bounded_texel_views() {
         Err(Error::Unsupported("texture buffers of this pixel format"))
     );
 }
+
+/// A render target is storage, for framebuffer reads and kernels' writes,
+/// and so are its views; a multisampled one only on a device with
+/// multisampled storage images, which ANV is not, where Vulkan refuses a
+/// multisampled storage image.
+#[test]
+fn multisampled_textures_are_storage_only_with_multisampled_storage() {
+    use crate::metal::vulkan::ImageUsage;
+    let anv = crate::metal::capabilities::tests::anv_gen12();
+    let nvk = capabilities();
+    let target = |texture_type, sample_count| TextureDescriptor {
+        sample_count,
+        usage: TextureUsage::RENDER_TARGET,
+        ..descriptor(texture_type, PixelFormat::Bgra8Unorm)
+    };
+    let storage = |capabilities: &Capabilities, descriptor: TextureDescriptor| {
+        texture(capabilities, &descriptor)
+            .unwrap()
+            .image
+            .usage
+            .contains(ImageUsage::STORAGE)
+    };
+    assert!(storage(&anv, target(TextureType::D2, 1)));
+    assert!(!storage(&anv, target(TextureType::D2Multisample, 4)));
+    assert!(storage(&nvk, target(TextureType::D2, 1)));
+    assert!(storage(&nvk, target(TextureType::D2Multisample, 4)));
+    let view = |capabilities: &Capabilities, parent: TextureDescriptor| {
+        let view = TextureViewDescriptor {
+            pixel_format: parent.pixel_format,
+            texture_type: parent.texture_type,
+            levels: 0..1,
+            slices: 0..1,
+            swizzle: SwizzleChannels::IDENTITY,
+            min_lod: 0.0,
+        };
+        texture_view(capabilities, &parent, &view)
+            .unwrap()
+            .storage
+            .is_some()
+    };
+    assert!(view(&anv, target(TextureType::D2, 1)));
+    assert!(!view(&anv, target(TextureType::D2Multisample, 4)));
+    assert!(view(&nvk, target(TextureType::D2Multisample, 4)));
+}

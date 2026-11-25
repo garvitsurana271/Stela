@@ -87,6 +87,9 @@ option_set! {
         const STENCIL_EXPORT = 1 << 38;
         /// Lines rasterize as Apple GPUs' (`Capabilities::line_modes`).
         const LINE_MODES = 1 << 39;
+        /// Framebuffer reads reach single-sample attachments alone
+        /// (`Capabilities::single_sample_storage`).
+        const SINGLE_SAMPLE_STORAGE = 1 << 40;
     }
 }
 
@@ -375,6 +378,7 @@ impl Block {
             statistic_counters: has(Flags::STATISTIC_COUNTERS),
             memoryless_render_targets: has(Flags::MEMORYLESS_RENDER_TARGETS),
             framebuffer_reads: has(Flags::FRAMEBUFFER_READS),
+            single_sample_storage: has(Flags::SINGLE_SAMPLE_STORAGE),
             fragment_tests: has(Flags::FRAGMENT_TESTS),
             stencil_export: has(Flags::STENCIL_EXPORT),
             stencil_follows_depth: has(Flags::STENCIL_FOLLOWS_DEPTH),
@@ -632,6 +636,7 @@ impl Capabilities {
                 self.memoryless_render_targets,
             )
             .with(Flags::FRAMEBUFFER_READS, self.framebuffer_reads)
+            .with(Flags::SINGLE_SAMPLE_STORAGE, self.single_sample_storage)
             .with(Flags::FRAGMENT_TESTS, self.fragment_tests)
             .with(Flags::STENCIL_EXPORT, self.stencil_export)
             .with(Flags::STENCIL_FOLLOWS_DEPTH, self.stencil_follows_depth)

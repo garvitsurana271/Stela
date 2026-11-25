@@ -1412,7 +1412,8 @@ pub(super) fn served_index(index: usize) -> bool {
 static FILES_KEPT: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the bound GPU at `index` keeps a file of a Metal service that
-/// did not open: its driver's reset during the first submission held it.
+/// did not open: its driver's reset during the first submission held it,
+/// or the service opened in no Apple GPU family and was left unused.
 pub(super) fn file_kept(index: usize) -> bool {
     index >= 64 || FILES_KEPT.load(Ordering::Relaxed) & (1 << index) != 0
 }
@@ -1586,6 +1587,20 @@ fn open_gpu(gpu: &Installed, index: usize, bound: &Bound) -> Result<Arc<Shared>,
                     "GPU {}: {shortfall}; macOS runs on Apple GPUs of both families\n",
                     bound.name
                 ));
+            }
+            // On a Metal device in no Apple GPU family Core Animation draws
+            // no desktop, a black screen under the cursor, and the window
+            // server ends at its first framebuffer read: the device is left
+            // unused, as AMD's GFX8 is (`amd_metal::NO_APPLE_FAMILY`), and
+            // macOS draws with the CPU. The service is kept unreleased with
+            // its driver's file open ([`file_kept`]), as after a reset.
+            if let Some(refusal) = service.no_apple_family() {
+                output::arguments(format_args!("GPU {}: {refusal}\n", bound.name));
+                core::mem::forget(service);
+                if index < 64 {
+                    FILES_KEPT.fetch_or(1 << index, Ordering::Relaxed);
+                }
+                return Err(refusal);
             }
             // Without a second stack, every compilation stays in its turn.
             service.set_wait_bound(gpu.tsc_hz / 1000 * WAIT_BOUND_MILLIS);

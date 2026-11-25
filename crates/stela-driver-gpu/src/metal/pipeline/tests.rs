@@ -728,3 +728,47 @@ fn varyings_link_by_identifier_and_type() {
         assert!(link_varyings(&vertex, Some(&fragment)).is_err());
     }
 }
+
+/// ANV has no multisampled storage images: its framebuffer reads reach
+/// single-sample attachments, and a multisampled pipeline that would
+/// access an attachment as storage, or tile pipeline, is refused, where
+/// NVK's runs.
+#[test]
+fn framebuffer_reads_of_multisampled_attachments_take_multisampled_storage() {
+    let anv = crate::metal::capabilities::tests::anv_gen12();
+    let nvk = capabilities();
+    let mut fragment = interface(Stage::Fragment);
+    fragment.attachment_reads = 1;
+    let mut targets = RenderTargets::default();
+    targets.color_attachments[0] = color(PixelFormat::Bgra8Unorm);
+    let attachments = storage_attachments(&anv, &fragment, &targets).unwrap();
+    assert!(attachments[0].is_some());
+
+    targets.raster_sample_count = 4;
+    assert_eq!(
+        storage_attachments(&anv, &fragment, &targets).unwrap_err(),
+        Error::Unsupported("framebuffer reads of multisampled attachments")
+    );
+    assert!(storage_attachments(&nvk, &fragment, &targets).unwrap()[0].is_some());
+
+    // A multisampled extended-range blend falls back to the blend unit.
+    let fragment = interface(Stage::Fragment);
+    targets.color_attachments[0] = ColorAttachmentDescriptor {
+        blending_enabled: true,
+        ..color(PixelFormat::Bgra10Xr)
+    };
+    let attachments = storage_attachments(&anv, &fragment, &targets).unwrap();
+    assert!(attachments.iter().all(Option::is_none));
+    assert!(storage_attachments(&nvk, &fragment, &targets).unwrap()[0].is_some());
+    targets.raster_sample_count = 1;
+    assert!(storage_attachments(&anv, &fragment, &targets).unwrap()[0].is_some());
+
+    let mut formats = [None; MAX_COLOR_ATTACHMENTS];
+    formats[0] = Some(PixelFormat::Bgra8Unorm);
+    assert!(tile_target(&anv, &formats, 1, false).is_ok());
+    assert_eq!(
+        tile_target(&anv, &formats, 4, false).unwrap_err(),
+        Error::Unsupported("tile functions of multisampled passes")
+    );
+    assert!(tile_target(&nvk, &formats, 4, false).is_ok());
+}

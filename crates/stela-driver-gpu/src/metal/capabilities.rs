@@ -28,6 +28,8 @@ use super::{
 use alloc::{boxed::Box, string::String, vec::Vec};
 
 pub mod block;
+#[cfg(test)]
+pub(crate) mod tests;
 
 option_set! {
     /// Shader constructs the AIR → NIR → vendor compiler path lowers with
@@ -342,6 +344,14 @@ pub struct Capabilities {
     /// read and write the attachment as storage in a fragment shader
     /// interlock section.
     pub framebuffer_reads: bool,
+    /// Storage images are single-sample alone: the driver has no
+    /// multisampled ones (`shaderStorageImageMultisample`, which ANV reports
+    /// on no Intel GPU). Multisampled textures then have no storage views,
+    /// and framebuffer reads, which read and write an attachment's samples
+    /// through them, reach single-sample attachments alone: a pipeline that
+    /// would access a multisampled attachment as storage, and a multisampled
+    /// tile pipeline, are refused ([`Capabilities::framebuffer_reads_at`]).
+    pub single_sample_storage: bool,
     /// Fragment functions can run the fragment tests themselves, on copies
     /// of the pass's depth and stencil attachments in their interlock
     /// section: those that write the stencil reference on a device without
@@ -381,6 +391,20 @@ const METAL3_NEEDS: [&str; 5] = [
     "MetalFX upscaling",
 ];
 const APPLE7_NEEDS: [&str; 2] = ["simdgroup matrices", "barycentric coordinates"];
+/// The gap of a device whose framebuffer reads reach single-sample
+/// attachments alone ([`Capabilities::single_sample_storage`]).
+const MULTISAMPLED_FRAMEBUFFER_READS: &str = "multisampled framebuffer reads";
+/// What Apple3 needs, by its gaps' names: Mac2, with the Common families
+/// it contains, and framebuffer reads in draw order, which take raster
+/// order groups.
+const APPLE3_NEEDS: [&str; 6] = [
+    "GPU family Common1",
+    "GPU family Common2",
+    "GPU family Common3",
+    "GPU family Mac2",
+    "raster order groups",
+    "framebuffer reads",
+];
 
 impl Capabilities {
     pub fn derive(
@@ -451,6 +475,43 @@ impl Capabilities {
             };
         }
         Some(line)
+    }
+
+    /// Why the boot leaves a device in no Apple GPU family unused, in one
+    /// line naming what of Apple3 it lacks; `None` for a device in Apple3,
+    /// which every other Apple family here contains. Core Animation maps
+    /// the window server's two-plane framebuffers to a Metal format only on
+    /// an Apple3 device: on any other, the window server's Metal device
+    /// draws no desktop, a black screen under the cursor, and the first
+    /// pipeline reading the framebuffer is refused, which ends the window
+    /// server. Without the device macOS draws with the CPU.
+    pub fn no_apple_family(&self) -> Option<String> {
+        if self.supports_family(GpuFamily::Apple3) {
+            return None;
+        }
+        let missing: Vec<&str> = APPLE3_NEEDS
+            .iter()
+            .copied()
+            .filter(|need| self.gaps.iter().any(|gap| gap.capability == *need))
+            .collect();
+        let missing = if missing.is_empty() {
+            String::from("GPU family Apple3")
+        } else {
+            missing.join(", ")
+        };
+        Some(alloc::format!(
+            "{}: Metal device in no Apple GPU family (no {missing}); macOS draws its window \
+             server's framebuffers with Metal only on an Apple3 device, so this GPU's Metal \
+             device is not used and macOS draws without it",
+            self.name
+        ))
+    }
+
+    /// Whether framebuffer reads reach attachments of `samples` samples
+    /// per pixel: every count on a device with multisampled storage
+    /// images, one alone without them.
+    pub fn framebuffer_reads_at(&self, samples: u64) -> bool {
+        self.framebuffer_reads && (samples <= 1 || !self.single_sample_storage)
     }
 
     pub fn supports_family(&self, family: GpuFamily) -> bool {
@@ -834,12 +895,20 @@ impl Derivation<'_> {
             features.fragment_shader_pixel_interlock,
             ShaderFeatures::RASTER_ORDER_GROUPS,
         ));
+        // A single-sample attachment is read and written through a 2D
+        // storage view, a multisampled one through a multisampled view,
+        // which only multisampled storage images give: without them the
+        // reads reach single-sample attachments alone.
         let framebuffer_reads = raster_order_groups
             && self.check(api(
                 "framebuffer reads",
-                features.dynamic_rendering_local_read && features.shader_storage_image_multisample,
+                features.dynamic_rendering_local_read,
                 ApiFeatures::EMPTY,
             ));
+        let single_sample_storage = !features.shader_storage_image_multisample;
+        if framebuffer_reads && single_sample_storage {
+            self.gap(MULTISAMPLED_FRAMEBUFFER_READS, Cause::Driver);
+        }
         // A stencil output without stencil export, or storage attachments
         // whose pipeline cannot test fragments first: the function tests
         // fragments on storage copies of the attachments, which image copies
@@ -1134,6 +1203,7 @@ impl Derivation<'_> {
             statistic_counters: statistics,
             memoryless_render_targets: true,
             framebuffer_reads,
+            single_sample_storage,
             fragment_tests,
             stencil_export: limits.stencil_export,
             stencil_follows_depth,
@@ -1200,13 +1270,13 @@ impl Derivation<'_> {
             .collect()
     }
 
-    /// Whether fragment functions may write attachments as storage in their
-    /// interlock section: framebuffer reads' requirements, unrecorded.
+    /// Whether fragment functions may write single-sample attachments as
+    /// storage in their interlock section: framebuffer reads' requirements,
+    /// unrecorded. Multisampled ones take multisampled storage images too.
     fn storage_attachments(&self) -> bool {
         let features = &self.device.features;
         features.fragment_shader_pixel_interlock
             && features.dynamic_rendering_local_read
-            && features.shader_storage_image_multisample
             && self.shaders.contains(ShaderFeatures::RASTER_ORDER_GROUPS)
     }
 
@@ -1335,8 +1405,10 @@ impl Derivation<'_> {
             .map(|raw| self.device.formats.get(raw))
             .filter(|raw| raw.optimal.contains(F::COLOR_ATTACHMENT | F::STORAGE_IMAGE));
         let raw_render = raw_support.is_some();
-        let raw_multisample =
-            raw_support.is_some_and(|raw| raw.sample_counts.contains(SampleCounts::C4));
+        // Multisampled raw texels are written through multisampled storage
+        // views.
+        let raw_multisample = features.shader_storage_image_multisample
+            && raw_support.is_some_and(|raw| raw.sample_counts.contains(SampleCounts::C4));
         let depth_stencil = !color
             && !description.view_only
             && raster
@@ -1706,6 +1778,8 @@ impl Derivation<'_> {
         ]
         .into_iter()
         .all(|packed| format(packed, render | FormatCapabilities::FILTER));
+        // Framebuffer reads of single-sample attachments suffice: Core
+        // Animation's are of the window server's framebuffers, which are.
         let apple3 = mac2 && capabilities.framebuffer_reads;
         let apple1 = apple3
             && self.check_all(
@@ -1733,6 +1807,12 @@ impl Derivation<'_> {
                         ShaderFeatures::IMAGEBLOCKS,
                     ),
                     driver("raster order groups", capabilities.raster_order_groups),
+                    // Tile functions access the imageblock of a
+                    // multisampled pass as multisampled storage.
+                    driver(
+                        MULTISAMPLED_FRAMEBUFFER_READS,
+                        !capabilities.single_sample_storage,
+                    ),
                 ],
             );
         // Apple5's RG11B10 and RGB9E5 vertex formats are single words, which

@@ -556,12 +556,29 @@ fn effective_usage(
     // A fragment function may read what it renders to, and on Apple GPUs a
     // kernel keeps its writes to a texture made without shader writes, as
     // Core Animation's compute passes write their render targets.
-    Ok(usage
+    let usage = usage
         .with(
             TextureUsage::SHADER_READ,
             usage.contains(TextureUsage::RENDER_TARGET) && format.contains(C::READ),
         )
-        .with(TextureUsage::SHADER_WRITE, format.contains(C::WRITE)))
+        .with(TextureUsage::SHADER_WRITE, format.contains(C::WRITE));
+    // No shader writes a multisampled texture, which the shading language
+    // reads alone; a driver without multisampled storage images makes no
+    // such image storage.
+    Ok(if storage_samples(capabilities, descriptor) {
+        usage
+    } else {
+        usage.difference(TextureUsage::SHADER_WRITE | TextureUsage::SHADER_ATOMIC)
+    })
+}
+
+/// Whether `descriptor`'s texture may be a storage image: a single-sample
+/// one, or a multisampled one on a device with multisampled storage
+/// images.
+fn storage_samples(capabilities: &Capabilities, descriptor: &TextureDescriptor) -> bool {
+    !descriptor.texture_type.is_multisample()
+        || descriptor.sample_count <= 1
+        || !capabilities.single_sample_storage
 }
 
 /// The format of a color attachment's raw texel view, which a fragment
@@ -619,7 +636,9 @@ pub fn has_texel_storage(texture_type: TextureType) -> bool {
 /// Lets a color texture be viewed by its raw texels as storage: a render
 /// target, which framebuffer reads access, and a texture whose image stores
 /// another encoding than its format's bytes, which the texel kernels convert
-/// buffer copies through. Its typed shader views are unchanged.
+/// buffer copies through. Its typed shader views are unchanged. A
+/// multisampled render target has storage views only where framebuffer
+/// reads reach multisampled attachments.
 fn attachment_storage(
     capabilities: &Capabilities,
     descriptor: &TextureDescriptor,
@@ -627,7 +646,13 @@ fn attachment_storage(
     image: &mut ImageInfo,
 ) {
     let format = descriptor.pixel_format;
-    let attachment = capabilities.framebuffer_reads && usage.contains(TextureUsage::RENDER_TARGET);
+    let samples = if descriptor.texture_type.is_multisample() {
+        descriptor.sample_count
+    } else {
+        1
+    };
+    let attachment =
+        capabilities.framebuffer_reads_at(samples) && usage.contains(TextureUsage::RENDER_TARGET);
     let converted =
         !format.describe().encoding().is_exact() && has_texel_storage(descriptor.texture_type);
     let Some(raw) = raw_texel_format(format).filter(|_| attachment || converted) else {
@@ -923,10 +948,13 @@ pub fn texture_view(
             view_format.contains(C::READ) && parent_format.contains(C::READ),
         );
     }
-    // Its parent is writable wherever its format is (`effective_usage`).
+    // Its parent is writable wherever its format is and its samples may be
+    // storage (`effective_usage`).
     usage = usage.with(
         ImageUsage::STORAGE,
-        view_format.contains(C::WRITE) && parent_format.contains(C::WRITE),
+        view_format.contains(C::WRITE)
+            && parent_format.contains(C::WRITE)
+            && storage_samples(capabilities, parent),
     );
     let range = SubresourceRange {
         aspects: shader_aspects(description),

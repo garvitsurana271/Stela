@@ -714,6 +714,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 {
                     continue;
                 }
+                // A multisampled attachment has no storage views where the
+                // reads reach single-sample attachments alone, and no
+                // pipeline of the pass reads it.
+                if texture.texture_type.is_multisample()
+                    && !self.capabilities.framebuffer_reads_at(texture.sample_count)
+                {
+                    continue;
+                }
                 let view = AttachmentView {
                     texture: (),
                     view_type: color.view.view_type,

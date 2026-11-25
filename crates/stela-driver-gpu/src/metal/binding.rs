@@ -1193,21 +1193,30 @@ impl Writer<'_> {
 }
 
 /// Descriptor counts of each heap array, within the device's
-/// update-after-bind limits. Texel buffers count against the image limits,
-/// so they take a quarter of each.
+/// update-after-bind limits and [`Self::MAX_IMAGES`]. Texel buffers count
+/// against the image limits, so they take a quarter of each.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HeapLayout {
     pub counts: [u32; 5],
 }
 
 impl HeapLayout {
+    /// The most sampled or storage descriptors the heap takes, texel buffers
+    /// included: eight times Apple's tier 2 count of 500 000. The heap is one
+    /// pool, and Intel's Vulkan driver on Gen9 to Gen12.0 GPUs reports 201
+    /// million images, which its pool keeps 48 host bytes each for: 9.1 GiB
+    /// in one allocation, which no PC holds.
+    pub const MAX_IMAGES: u32 = 1 << 22;
+
     pub fn new(limits: &Limits) -> Self {
         let sampled = limits
             .max_descriptor_set_update_after_bind_sampled_images
-            .min(limits.max_per_stage_update_after_bind_sampled_images);
+            .min(limits.max_per_stage_update_after_bind_sampled_images)
+            .min(Self::MAX_IMAGES);
         let storage = limits
             .max_descriptor_set_update_after_bind_storage_images
-            .min(limits.max_per_stage_update_after_bind_storage_images);
+            .min(limits.max_per_stage_update_after_bind_storage_images)
+            .min(Self::MAX_IMAGES);
         let samplers = limits
             .max_descriptor_set_update_after_bind_samplers
             .min(limits.max_per_stage_update_after_bind_samplers)
@@ -2589,5 +2598,38 @@ mod tests {
         assert_eq!(heap.allocate(HeapArray::Samplers), Ok(1));
         assert_eq!(heap.in_use(HeapArray::Samplers), 1);
         assert_eq!(heap.in_use(HeapArray::SampledImages), 0);
+    }
+
+    /// ANV on a Kaby Lake GPU (issue 8's ThinkPad T480s) reports 3 GiB of
+    /// 16-byte image descriptors and 64K samplers; uncapped, its one pool
+    /// asked for 203 489 280 descriptors, 9.1 GiB of 48-byte host records,
+    /// and Metal failed to open with `OutOfMemory`.
+    #[test]
+    fn anv_kaby_lake_heap_fits_in_host_memory() {
+        let images = 3 << 26;
+        let mut limits = nvk(&CHIPS[0], 8 << 30).limits;
+        limits.max_per_stage_update_after_bind_sampled_images = images;
+        limits.max_per_stage_update_after_bind_storage_images = images;
+        limits.max_descriptor_set_update_after_bind_sampled_images = images;
+        limits.max_descriptor_set_update_after_bind_storage_images = images;
+        limits.max_per_stage_update_after_bind_samplers = 3 << 27;
+        limits.max_descriptor_set_update_after_bind_samplers = 3 << 27;
+        limits.max_sampler_allocation_count = 64 * 1024;
+        let layout = HeapLayout::new(&limits);
+        assert_eq!(
+            layout.counts,
+            [3_145_728, 1_572_864, 65_536, 1_048_576, 524_288]
+        );
+        assert!(layout.count(HeapArray::SampledImages) >= 500_000);
+        assert!(layout.count(HeapArray::StorageImages) >= 500_000);
+        // `sizeof(struct anv_descriptor)` host bytes per descriptor.
+        let host: u64 = layout
+            .counts
+            .iter()
+            .map(|&count| u64::from(count) * 48)
+            .sum();
+        assert_eq!(host, 305_135_616);
+        let mut heap = DescriptorHeap::new(layout);
+        assert_eq!(heap.allocate(HeapArray::SampledImages), Ok(1));
     }
 }

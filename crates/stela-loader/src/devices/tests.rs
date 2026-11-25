@@ -1707,3 +1707,141 @@ fn the_boot_says_whether_sleep_is_refused() {
     assert!(sleep_line(Ok(false)).starts_with("SLEEP not refused: "));
     assert!(sleep_line(Ok(false)).ends_with("power gate\n"));
 }
+
+/// A J473AP-shaped tree of the V2 Wi-Fi probe's nodes, before preparation.
+fn wifi_original() -> DeviceTree {
+    let pcie = |name: &str, phandle_value: u32, mapper: u32| {
+        let mut function = phandle(
+            node(name, Some(b"wlan-pcie,bcm4387\0wlan-pcie,bcm\0"), vec![]),
+            phandle_value,
+        );
+        function
+            .set_property(IOMMU_PARENT, mapper.to_le_bytes().to_vec())
+            .unwrap();
+        function
+    };
+    let mut bridge = node(
+        "pci-bridge0",
+        Some(b"apcie-bridge\0"),
+        vec![pcie("wlan", 0x37, 0x43), pcie("bluetooth-pcie", 0x38, 0x44)],
+    );
+    bridge
+        .set_property("apcie-port", 0u32.to_le_bytes().to_vec())
+        .unwrap();
+    let apcie = phandle(node("apcie", Some(b"apcie,t8112\0"), vec![bridge]), 0x35);
+    let dart = phandle(
+        node(
+            "dart-apcie0",
+            Some(b"dart,t8110\0"),
+            vec![
+                phandle(
+                    node("mapper-apcie0-wlan", Some(b"iommu-mapper\0"), vec![]),
+                    0x43,
+                ),
+                phandle(
+                    node("mapper-apcie0-bt", Some(b"iommu-mapper\0"), vec![]),
+                    0x44,
+                ),
+            ],
+        ),
+        0x42,
+    );
+    let mut wlan = typed(phandle(node("wlan", None, vec![]), 0x33), b"wlan\0");
+    wlan.set_property("amfm-managed-port-control", Vec::new())
+        .unwrap();
+    wlan.set_property("module-instance", b"miyake\0".to_vec())
+        .unwrap();
+    DeviceTree {
+        root: node(
+            "device-tree",
+            None,
+            vec![
+                node("arm-io", None, vec![apcie, dart, wlan]),
+                function_client("amfm", 0x24, 0x35),
+            ],
+        ),
+    }
+}
+
+#[test]
+fn the_wifi_probe_admits_its_nodes_from_the_original_tree_only() {
+    let original = wifi_original();
+    let mut prepared = original.clone();
+    let mut hidden = hide_unmodeled(&mut prepared);
+    // Preparation hides the whole chain: nothing it holds is modeled.
+    for (path, key, _) in WIFI_PROBE_NODES {
+        let node = prepared.node(path).unwrap();
+        assert!(
+            node.property(COMPATIBLE).is_none() || node.property(IGNORE).is_some(),
+            "{path} {key}"
+        );
+    }
+    assert!(hidden.iter().any(|entry| entry == "/arm-io/apcie"));
+    let changes = admit_wifi_probe(&mut prepared, &original, &mut hidden).unwrap();
+    for (path, key, identity) in WIFI_PROBE_NODES {
+        let node = prepared.node(path).unwrap();
+        assert_eq!(node.property(key).unwrap().value, identity, "{path}");
+        assert!(node.property(IGNORE).is_none(), "{path}");
+        assert!(
+            !hidden
+                .iter()
+                .any(|entry| entry.split(' ').next() == Some(path)),
+            "{path} {hidden:?}"
+        );
+    }
+    assert!(changes.contains(&String::from("/arm-io/apcie +compatible")));
+    assert!(changes.contains(&String::from("/amfm -AAPL,ignore")));
+    // Port 0's Bluetooth function and its mapper stay hidden.
+    for path in [
+        "/arm-io/apcie/pci-bridge0/bluetooth-pcie",
+        "/arm-io/dart-apcie0/mapper-apcie0-bt",
+    ] {
+        assert!(prepared.property(path, COMPATIBLE).is_none(), "{path}");
+        assert!(hidden.iter().any(|entry| entry == path), "{path}");
+    }
+    // Every other property is the prepared tree's.
+    assert_eq!(
+        prepared
+            .property("/arm-io/wlan", "module-instance")
+            .unwrap()
+            .value,
+        b"miyake\0"
+    );
+}
+
+#[test]
+fn an_unexpected_tree_leaves_the_boot_s_tree_and_ledger_as_they_were() {
+    let original = wifi_original();
+    let mut prepared = original.clone();
+    let hidden = hide_unmodeled(&mut prepared);
+    let check = |original: &DeviceTree, prepared: &DeviceTree, expected: &str| {
+        let mut tree = prepared.clone();
+        let mut ledger = hidden.clone();
+        let error = admit_wifi_probe(&mut tree, original, &mut ledger).unwrap_err();
+        assert!(error.contains(expected), "{error}");
+        assert_eq!(tree.serialize(), prepared.serialize());
+        assert_eq!(ledger, hidden);
+    };
+    // Another board's controller.
+    let mut other = original.clone();
+    other
+        .set_property("/arm-io/apcie", COMPATIBLE, b"apcie,t6020\0".to_vec())
+        .unwrap();
+    check(&other, &prepared, "is not apcie,t8112");
+    // No AMFM to power the chip.
+    let mut no_amfm = original.clone();
+    no_amfm
+        .root
+        .children
+        .retain(|child| child.name() != Some("amfm"));
+    check(&no_amfm, &prepared, "has no /amfm");
+    // A fill-in recipe the preparation left unresolved.
+    let mut recipe = prepared.clone();
+    let wlan = recipe.node_mut("/arm-io/wlan").unwrap();
+    wlan.set_property("wifi-calibration-msf", b"syscfg/WCAL\0".to_vec())
+        .unwrap();
+    wlan.property_mut("wifi-calibration-msf")
+        .unwrap()
+        .placeholder = true;
+    check(&original, &recipe, "unresolved placeholder");
+}

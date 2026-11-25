@@ -146,6 +146,12 @@ impl LiveTree {
         &self.bytes
     }
 
+    /// The guest RAM the loaded DeviceTree region reserves: the most a
+    /// projection the boot publishes may hold.
+    pub fn reservation_bytes(&self) -> u64 {
+        self.reservation_bytes
+    }
+
     /// Check the post-patch boot_args snapshot, not the manifest's
     /// command line. The source factory separately checks all DT providers.
     /// Even an explicit zero requires a separately checked override path.

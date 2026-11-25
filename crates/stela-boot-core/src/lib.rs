@@ -151,6 +151,7 @@ pub mod vfct;
 pub mod vtd;
 pub mod wifi_hardware;
 pub mod wifi_page;
+pub mod wifi_probe;
 pub mod wifi_prompt;
 pub mod wifi_saved;
 pub mod work_status;

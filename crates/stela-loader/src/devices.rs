@@ -525,6 +525,98 @@ pub fn hide_agx(tree: &mut DeviceTree) -> Vec<String> {
     hidden
 }
 
+/// The nodes `--v2-wifi-probe` makes visible again, with the identity each
+/// must have in the original tree: J473AP's PCIe root complex, its port 0
+/// bridge, the BCM4387's Wi-Fi function, the DART and stream mapper that
+/// function names (`iommu-parent`), and the two name-matched nodes the
+/// Wi-Fi driver waits for: the platform `/arm-io/wlan` (`device_type`
+/// `wlan`), whose `amfm-managed-port-control` makes `AppleOLYHAL` wait for
+/// `/amfm` (`device_type` `amfm`), which powers the chip (`function-reg_on`,
+/// the SMC's `smc-pmu`) and drives the port (`function-pcie_port_control`,
+/// the root complex). Port 0's Bluetooth function, its mapper and ports 1
+/// and 2 stay hidden.
+pub const WIFI_PROBE_NODES: [(&str, &str, &[u8]); 7] = [
+    ("/arm-io/apcie", COMPATIBLE, b"apcie,t8112\0"),
+    ("/arm-io/apcie/pci-bridge0", COMPATIBLE, b"apcie-bridge\0"),
+    (
+        "/arm-io/apcie/pci-bridge0/wlan",
+        COMPATIBLE,
+        b"wlan-pcie,bcm4387\0wlan-pcie,bcm\0",
+    ),
+    ("/arm-io/dart-apcie0", COMPATIBLE, b"dart,t8110\0"),
+    (
+        "/arm-io/dart-apcie0/mapper-apcie0-wlan",
+        COMPATIBLE,
+        b"iommu-mapper\0",
+    ),
+    ("/arm-io/wlan", DEVICE_TYPE, b"wlan\0"),
+    ("/amfm", DEVICE_TYPE, b"amfm\0"),
+];
+
+/// Make the V2 Wi-Fi probe's nodes ([`WIFI_PROBE_NODES`]) visible in the
+/// boot's own tree, from the `original` tree the bundle was prepared from:
+/// each gets back the `compatible` and `device_type` preparation removed,
+/// and loses an `AAPL,ignore` the original lacks. Their entries leave the
+/// admission ledger `hidden`. The bundle and its prepared tree stay as
+/// they are, so no bundle revision changes.
+///
+/// Every node must be in both trees with the identity listed, and none may
+/// keep an unresolved fill-in placeholder (the preparation resolved the
+/// `/arm-io/wlan` SysCfg recipes, `wifi-calibration-msf` and the rest, as
+/// iBoot does). Otherwise nothing changes and the reason is returned: the
+/// probe then stays absent. Returns one line per change.
+pub fn admit_wifi_probe(
+    tree: &mut DeviceTree,
+    original: &DeviceTree,
+    hidden: &mut Vec<String>,
+) -> Result<Vec<String>, String> {
+    let mut next = tree.clone();
+    let mut changes = Vec::new();
+    for (path, key, identity) in WIFI_PROBE_NODES {
+        let source = original
+            .node(path)
+            .ok_or_else(|| format!("the original tree has no {path}"))?;
+        if source.property(key).map(|p| p.value.as_slice()) != Some(identity) {
+            return Err(format!(
+                "{path} in the original tree is not {}",
+                String::from_utf8_lossy(identity).trim_end_matches('\0')
+            ));
+        }
+        let node = next
+            .node_mut(path)
+            .ok_or_else(|| format!("the boot's tree has no {path}"))?;
+        if let Some(property) = node.properties.iter().find(|p| p.placeholder) {
+            return Err(format!(
+                "{path} {} is an unresolved placeholder",
+                property.name()
+            ));
+        }
+        for name in [COMPATIBLE, DEVICE_TYPE] {
+            if node.property(name).is_none()
+                && let Some(value) = source.property(name)
+            {
+                node.set_property(name, value.value.clone())
+                    .map_err(|error| format!("{path} {name}: {error}"))?;
+                changes.push(format!("{path} +{name}"));
+            }
+        }
+        if source.property(IGNORE).is_none() && node.remove_property(IGNORE).is_some() {
+            changes.push(format!("{path} -{IGNORE}"));
+        }
+    }
+    let admitted = |entry: &String| {
+        let path = entry
+            .split_once(' ')
+            .map_or(entry.as_str(), |(path, _)| path);
+        WIFI_PROBE_NODES.iter().any(|(node, ..)| *node == path)
+    };
+    let left = hidden.iter().filter(|entry| admitted(entry)).count();
+    hidden.retain(|entry| !admitted(entry));
+    *tree = next;
+    changes.push(format!("{left} admission ledger entries left"));
+    Ok(changes)
+}
+
 /// Removes `compatible` from `node` and everything under it.
 fn retire(node: &mut Node, path: &str, hidden: &mut Vec<String>) {
     if node.property(COMPATIBLE).is_some() {

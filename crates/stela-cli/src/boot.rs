@@ -337,6 +337,7 @@ fn mount(
                 .map(|target| stela_formats::builds::find(&target.product_build))
                 .transpose()
                 .map_err(anyhow::Error::msg)?,
+            wifi_probe: None,
         },
         &mut |arguments| log.push(arguments.to_string().trim_end().to_owned()),
     )?;

@@ -114,6 +114,9 @@ pub struct Inputs<'f> {
     /// The boot bundle's macOS build, whose firmware protocols the
     /// coprocessor models speak; `None` without a bundle.
     pub build: Option<&'static stela_formats::builds::Build>,
+    /// The V2 Wi-Fi probe's placement (`--v2-wifi-probe`), whose logging
+    /// stubs the board then carries; `None` on every other boot.
+    pub wifi_probe: Option<stela_soc_data::board::wifi_probe::Placement>,
 }
 
 /// Place `board`'s devices, writing `DEVICES` summaries to `log`, and return
@@ -160,6 +163,7 @@ pub fn devices_with_memory<C: ConsoleSink + 'static>(
         scanout,
         firmware,
         build,
+        wifi_probe,
     } = inputs;
     let build = build.ok_or(refuse!(
         "the board's coprocessors need the boot bundle's supported macOS build"
@@ -269,6 +273,13 @@ pub fn devices_with_memory<C: ConsoleSink + 'static>(
     // bridge) and owns only the bytes they leave.
     if let Some(gfx) = board.gfx.as_ref() {
         devices.add_gfx(gfx, build)?;
+    }
+    // The probe takes only bytes no model above owns, and must be the
+    // controller's lifecycle owner before the PMGR binds.
+    if let Some(placement) = wifi_probe {
+        for line in devices.add_wifi_probe(placement) {
+            log(format_args!("WIFI-PROBE {line}\n"));
+        }
     }
     // Finalize only after every native constructor, including SGX's final
     // overlapping-window placement, has registered its banks.

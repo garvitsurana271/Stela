@@ -429,6 +429,16 @@ pub const TIER2_CHECK: &str = "--tier2-check";
 /// writes, so the options revision stays 13.
 pub const PACK_PRELOAD: &str = "--pack-preload";
 
+/// Places the V2 Wi-Fi probe (`--v2-wifi-probe`, off unless given): phase
+/// 0 of native Wi-Fi, logging stubs only. The boot's own tree shows macOS
+/// J473AP's PCIe root complex, its port 0 and the BCM4387 Wi-Fi function,
+/// whose models answer every access and log it as `WIFI-PROBE` lines; no
+/// firmware runs, no frame moves and no interrupt is raised
+/// ([`crate::wifi_probe`], `stela_soc::wifi_probe`). A tree it does not
+/// fit leaves the probe absent and the boot as without it. A hand-written
+/// opt-in setup never writes, so the options revision stays 13.
+pub const V2_WIFI_PROBE: &str = "--v2-wifi-probe";
+
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
 /// startup choice of its own, that setup never writes (so the options
@@ -780,6 +790,8 @@ pub struct System {
     /// Preload the translation pack in the background ([`PACK_PRELOAD`]):
     /// `None` unless given, which does not preload ([`Self::pack_preload`]).
     pub pack_preload: Option<bool>,
+    /// Place the V2 Wi-Fi probe's logging stubs ([`V2_WIFI_PROBE`]).
+    pub v2_wifi_probe: bool,
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
@@ -930,6 +942,7 @@ impl Default for System {
             tier2: None,
             tier2_check: false,
             pack_preload: None,
+            v2_wifi_probe: false,
             laptop: None,
             asus_mode: None,
             gpu_aspm: None,
@@ -1552,6 +1565,7 @@ impl fmt::Display for System {
             PACK_PRELOAD,
             self.pack_preload.map(|on| if on { "on" } else { "off" }),
         )?;
+        line.flag(V2_WIFI_PROBE, self.v2_wifi_probe)?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;
         line.value(GPU_ASPM, self.gpu_aspm.map(GpuAspm::name))?;

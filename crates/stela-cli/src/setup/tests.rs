@@ -1641,6 +1641,7 @@ fn no_system_option_reads_as_install_mode(line: &str) {
         "--native-bootstrap-check",
         "--restore-study",
         options::CORE_TRIAL,
+        options::V2_WIFI_PROBE,
         "--survey",
         options::VERIFY_ON_READ,
         options::UPDATE_RESTORE,

@@ -1093,6 +1093,30 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             ))
         ));
     }
+    // The V2 Wi-Fi probe, only when asked: in the boot's own tree as well,
+    // from the bundle's original tree, before the board is read from it.
+    // A tree it does not fit leaves it absent, never stops the boot.
+    let wifi_probe = match (&mut assigned, loaded_source.as_ref(), loaded_tree.as_ref()) {
+        (Some(assigned), Some(source), Some(live)) => stela_boot_core::wifi_probe::admit(
+            options.v2_wifi_probe,
+            &mut assigned.tree,
+            source.original(),
+            &mut hidden_devices,
+            live.reservation_bytes(),
+        ),
+        _ => options.v2_wifi_probe.then(|| {
+            Err(alloc::string::String::from(
+                "this boot has no assigned bundle tree",
+            ))
+        }),
+    }
+    .and_then(|result| {
+        output::arguments(format_args!(
+            "{}",
+            stela_boot_core::wifi_probe::line(&result)
+        ));
+        result.ok().map(|admitted| admitted.placement)
+    });
     hardware_step("canonical-ram");
     // SAFETY: all raw guest input copies have ended, AP executors are waiting
     // for their guest contexts, and no guest/device DMA producer has entered.
@@ -1188,6 +1212,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             guest_trackpad: options
                 .guest_trackpad()
                 .and_then(|kind| Some(host_input.as_mut()?.trackpad(kind))),
+            wifi_probe,
         },
         board.as_ref(),
         &core_locks,
@@ -1745,6 +1770,8 @@ struct Placement<'a> {
     guest_mac: Option<stela_drivers::net::Mac>,
     guest_bluetooth: Option<stela_soc::machine::UsbBluetooth>,
     guest_trackpad: Option<stela_soc::usb::trackpad::Config>,
+    /// The V2 Wi-Fi probe's placement, when `--v2-wifi-probe` admitted it.
+    wifi_probe: Option<stela_soc_data::board::wifi_probe::Placement>,
 }
 
 /// The placed devices, the USB port a restore drives, and whether guest
@@ -1886,6 +1913,7 @@ fn place_devices(
                 system_control: options.lid_sleep,
                 trackpad: placement.guest_trackpad,
             },
+            wifi_probe: placement.wifi_probe,
             scanout,
             firmware: &firmware,
             build: loaded_source.map(|source| {

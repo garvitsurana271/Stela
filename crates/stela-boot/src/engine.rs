@@ -1522,6 +1522,12 @@ fn finish<H: Host>(
     for line in drained.sep {
         output::arguments(format_args!("SEP OBSERVE {line}\n"));
     }
+    for line in drained.wifi_probe {
+        output::arguments(format_args!("WIFI-PROBE {line}\n"));
+    }
+    if let Some(summary) = machine.devices.with(|devices| devices.wifi_probe_summary()) {
+        output::arguments(format_args!("WIFI-PROBE {summary}\n"));
+    }
     if full {
         machine_report(machine);
     }

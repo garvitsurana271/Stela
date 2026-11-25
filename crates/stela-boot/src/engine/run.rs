@@ -1447,6 +1447,10 @@ pub(super) fn report_drained<H: Host>(
         display::print_log(&entry);
     }
 
+    for line in drained.wifi_probe {
+        output::arguments(format_args!("WIFI-PROBE {line}\n"));
+    }
+
     for log in drained.power {
         use stela_soc::machine::PowerLog;
         match log {

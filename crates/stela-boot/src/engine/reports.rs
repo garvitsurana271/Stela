@@ -699,6 +699,8 @@ pub(super) struct Drained {
     /// The watchdog mechanism's arms and disarms, and how many more were
     /// not kept.
     pub(super) watchdog: (Vec<stela_soc::wdt::MechanismEvent>, u32),
+    /// The V2 Wi-Fi probe's lines; none without `--v2-wifi-probe`.
+    pub(super) wifi_probe: Vec<String>,
 }
 
 impl Drained {
@@ -733,6 +735,7 @@ impl Drained {
             display: core::iter::from_fn(|| devices.take_display_log()).collect(),
             power: core::iter::from_fn(|| devices.take_power_log()).collect(),
             watchdog: devices.take_watchdog_mechanism_log(),
+            wifi_probe: devices.take_wifi_probe_lines(),
         }
     }
 }

@@ -76,6 +76,7 @@ impl ParseState<'_> {
                 }
             }
             TIER2_CHECK => options.tier2_check = true,
+            V2_WIFI_PROBE => flag(&mut options.v2_wifi_probe, Error::DuplicateV2WifiProbe)?,
             PACK_PRELOAD => {
                 let on = match value().ok_or(Error::PackPreload)? {
                     "on" => true,

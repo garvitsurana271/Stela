@@ -13,6 +13,7 @@ pub mod t6000_pmgr;
 mod timekeeping;
 mod transfer_times;
 mod usb;
+mod wifi_probe;
 pub use transfer_times::{
     PageWrites, PartTime, TRANSFER_PARTS, WRITE_PAGES, WRITE_PARTS, WriteTimes,
 };
@@ -304,6 +305,9 @@ pub struct AppleDevices {
     /// The displays' composes left since the last
     /// [`Devices::take_unlocked`] ([`dcp::compose`]).
     composes: Vec<dcp::compose::Compose>,
+    /// The V2 Wi-Fi probe's logging stubs, when `--v2-wifi-probe` placed
+    /// them ([`crate::wifi_probe`]).
+    wifi_probe: Option<DeviceId>,
 }
 
 /// The host polls its USB sessions once a high-speed microframe, in which
@@ -797,6 +801,7 @@ impl AppleDevices {
             pins_asleep: None,
             defer_dma: false,
             composes: Vec::new(),
+            wifi_probe: None,
         }
     }
 

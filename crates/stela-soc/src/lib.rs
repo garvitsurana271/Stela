@@ -78,3 +78,4 @@ pub mod typec;
 pub mod uart;
 pub mod wake;
 pub mod wdt;
+pub mod wifi_probe;

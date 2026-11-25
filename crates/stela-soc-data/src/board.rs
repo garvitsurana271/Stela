@@ -134,6 +134,7 @@ use stela_contracts::caches::Cache;
 #[cfg(test)]
 use stela_contracts::{Chip, caches::Caches};
 mod models;
+pub mod wifi_probe;
 #[cfg(test)]
 use models::ROLE_MODELS;
 pub use models::{ChildModel, GPU_ADMITTED, model_boot_properties, model_children, models};

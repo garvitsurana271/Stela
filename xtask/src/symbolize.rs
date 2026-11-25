@@ -31,6 +31,16 @@ pub struct Symbolize {
     /// first).
     #[arg(long)]
     beats: bool,
+    /// Every page the samples fell in (the `PES PC PAGES` lines a
+    /// `--profile` boot says per window and every 32 beats), not the
+    /// listed blocks: all of the named samples by image and level. With
+    /// `--window`, that window's.
+    #[arg(long)]
+    pages: bool,
+    /// One marked window (`PROFILE MARK`): its `PES PC WINDOW` blocks, or
+    /// with `--pages` its pages. Window 0 is the boot up to the first mark.
+    #[arg(long)]
+    window: Option<u32>,
     /// The functions the table shows.
     #[arg(long, default_value_t = 50)]
     top: usize,
@@ -40,7 +50,14 @@ impl Symbolize {
     pub fn run(&self) -> Result<()> {
         let bytes =
             std::fs::read(&self.log).with_context(|| format!("reading {}", self.log.display()))?;
-        let profile = log::Profile::parse(&String::from_utf8_lossy(&bytes), self.beats)?;
+        let profile = log::Profile::parse_with(
+            &String::from_utf8_lossy(&bytes),
+            log::Select {
+                beats: self.beats,
+                pages: self.pages,
+                window: self.window,
+            },
+        )?;
         let code = code::Code::load(&self.cache, &profile.pages())?;
         print!("{}", report(&profile, &code, self.top));
         Ok(())
@@ -73,6 +90,10 @@ fn report(profile: &log::Profile, code: &code::Code, top: usize) -> String {
     let source = match profile.source {
         log::Source::Total { taken, of } => format!("the last PES PC TOTAL ({taken} of {of})"),
         log::Source::Beats { of } => format!("{of} beats of PES PC"),
+        log::Source::Window { window } => format!("window {window}'s PES PC WINDOW"),
+        log::Source::Pages { windows } => {
+            format!("the PES PC PAGES of {windows} window(s), every page")
+        }
     };
     let listed: u64 = profile.entries.iter().map(|entry| entry.cycles).sum();
     let _ = writeln!(
@@ -106,6 +127,9 @@ fn report(profile: &log::Profile, code: &code::Code, top: usize) -> String {
                 "for one workload, cut the log to its beats and read them with --beats"
             }
             log::Source::Beats { .. } => "the beats' tables were full",
+            log::Source::Window { .. } | log::Source::Pages { .. } => {
+                "read the window's pages with --pages"
+            }
         };
         let _ = writeln!(
             out,
@@ -166,6 +190,9 @@ fn report(profile: &log::Profile, code: &code::Code, top: usize) -> String {
             row.blocks += 1;
         }
     }
+    // Pages are listed at offset 0: their functions are not the samples'.
+    let pages_only = matches!(profile.source, log::Source::Pages { .. });
+    let rows = if pages_only { BTreeMap::new() } else { rows };
     let mut ranked: Vec<_> = rows.into_iter().collect();
     // Stable: equal rows keep the key's order.
     ranked.sort_by(|a, b| {

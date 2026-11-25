@@ -2,9 +2,39 @@
 //! beat's group and, every 16 beats, a `PES PC TOTAL` group over every beat
 //! since the first. A group is a header line, then a line per level with
 //! samples that lists its blocks with the most cycles.
+//!
+//! A `--profile` window mark (`PROFILE MARK`) adds, for the window it ends,
+//! a `PES PC WINDOW` group of the window's blocks and a `PES PC PAGES`
+//! group of every page its samples fell in, each page as a block at offset
+//! 0 (`stela_boot_core::profile_window::PcPages`), a level's pages over as
+//! many level lines as it takes; a header's `w=` names the window. The
+//! open window's pages are said every 32 beats too, so the last pages
+//! group of each window is its whole. `PES PC SHARE` lines are no group's.
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, HashSet};
 use stela_engine::machine::engine::step_timing::{Level, pc_samples::level_name};
+
+/// Which group a `PES PC` line belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Kind {
+    #[default]
+    Beat,
+    Total,
+    Window,
+    Pages,
+}
+
+/// What [`Profile::parse_with`] reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Select {
+    /// Every beat group, not the last total.
+    pub beats: bool,
+    /// The pages groups: the last of each window, or of `window` alone.
+    pub pages: bool,
+    /// One window: its last `PES PC WINDOW` group, or with `pages` its
+    /// pages.
+    pub window: Option<u32>,
+}
 
 /// The levels in the order the lines print them.
 pub(super) const LEVELS: [Level; 3] = [Level::User, Level::Kernel, Level::Guarded];
@@ -25,7 +55,9 @@ pub(super) struct Entry {
 /// One group's header and level lines.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Group {
-    total: bool,
+    kind: Kind,
+    /// A window's or pages group's `w=`.
+    window: Option<u32>,
     samples: u64,
     cycles: u64,
     gone: [u64; 2],
@@ -42,6 +74,11 @@ pub(super) enum Source {
     Total { taken: usize, of: usize },
     /// Every beat group, `of` of them.
     Beats { of: usize },
+    /// Window `window`'s last `PES PC WINDOW` group.
+    Window { window: u32 },
+    /// The last `PES PC PAGES` group of each of `windows` windows: every
+    /// page's samples, not blocks.
+    Pages { windows: usize },
 }
 
 /// The samples a log's lines hold: the counts and the listed blocks, each
@@ -65,28 +102,79 @@ type Key = (usize, Option<u64>, u16, String);
 impl Profile {
     /// The last total group of `text`, or with `beats` (or without a
     /// total) the sum of its beat groups.
+    #[cfg(test)]
     pub(super) fn parse(text: &str, beats: bool) -> Result<Self> {
+        Self::parse_with(
+            text,
+            Select {
+                beats,
+                ..Select::default()
+            },
+        )
+    }
+
+    /// The groups `select` names: the last total, the beats, one window's
+    /// blocks, or the pages groups.
+    pub(super) fn parse_with(text: &str, select: Select) -> Result<Self> {
         let (groups, warnings) = groups(text);
-        let totals: Vec<&Group> = groups.iter().filter(|group| group.total).collect();
-        let beat_groups: Vec<&Group> = groups.iter().filter(|group| !group.total).collect();
-        let (source, chosen) = match totals.last() {
-            Some(&last) if !beats => (
-                Source::Total {
-                    taken: totals.len(),
-                    of: totals.len(),
-                },
-                vec![last],
-            ),
-            _ if !beat_groups.is_empty() => (
-                Source::Beats {
-                    of: beat_groups.len(),
-                },
-                beat_groups,
-            ),
-            _ => bail!(
-                "the log has no `PES PC` lines: boot with `--profile` on a host whose \
-                 counters sample (its log has `PES WHERE` lines)"
-            ),
+        let of = |kind: Kind| -> Vec<&Group> {
+            groups.iter().filter(|group| group.kind == kind).collect()
+        };
+        let totals = of(Kind::Total);
+        let beat_groups = of(Kind::Beat);
+        let (source, chosen) = match (select.pages, select.window) {
+            (true, window) => {
+                // The last pages group of each window: each is its window
+                // so far.
+                let mut last: BTreeMap<u32, &Group> = BTreeMap::new();
+                for group in of(Kind::Pages) {
+                    let at = group.window.unwrap_or(0);
+                    if window.is_none_or(|window| window == at) {
+                        last.insert(at, group);
+                    }
+                }
+                if last.is_empty() {
+                    bail!(
+                        "the log has no `PES PC PAGES` lines{}: boot a build whose \
+                         `--profile` says them",
+                        window.map_or(String::new(), |window| format!(" of window {window}"))
+                    );
+                }
+                (
+                    Source::Pages {
+                        windows: last.len(),
+                    },
+                    last.into_values().collect(),
+                )
+            }
+            (false, Some(window)) => {
+                let Some(group) = of(Kind::Window)
+                    .into_iter()
+                    .rfind(|group| group.window == Some(window))
+                else {
+                    bail!("the log has no `PES PC WINDOW` lines of window {window}");
+                };
+                (Source::Window { window }, vec![group])
+            }
+            (false, None) => match totals.last() {
+                Some(&last) if !select.beats => (
+                    Source::Total {
+                        taken: totals.len(),
+                        of: totals.len(),
+                    },
+                    vec![last],
+                ),
+                _ if !beat_groups.is_empty() => (
+                    Source::Beats {
+                        of: beat_groups.len(),
+                    },
+                    beat_groups,
+                ),
+                _ => bail!(
+                    "the log has no `PES PC` lines: boot with `--profile` on a host whose \
+                     counters sample (its log has `PES WHERE` lines)"
+                ),
+            },
         };
         let mut profile = Profile {
             source,
@@ -163,11 +251,18 @@ fn groups(text: &str) -> (Vec<Group>, Vec<String>) {
             continue;
         };
         let rest = &line[at + PREFIX.len()..];
-        let (total, rest) = match rest.strip_prefix("TOTAL ") {
-            Some(rest) => (true, rest),
-            None => (false, rest),
-        };
-        if let Err(error) = group_line(&mut groups, total, rest) {
+        if rest.starts_with("SHARE ") {
+            continue;
+        }
+        let (kind, rest) = [
+            ("TOTAL ", Kind::Total),
+            ("WINDOW ", Kind::Window),
+            ("PAGES ", Kind::Pages),
+        ]
+        .into_iter()
+        .find_map(|(prefix, kind)| rest.strip_prefix(prefix).map(|rest| (kind, rest)))
+        .unwrap_or((Kind::Beat, rest));
+        if let Err(error) = group_line(&mut groups, kind, rest) {
             warnings.push(format!("line {}: skipped, {error:#}", number + 1));
         }
     }
@@ -176,12 +271,12 @@ fn groups(text: &str) -> (Vec<Group>, Vec<String>) {
 
 /// Add one line's words, `rest` after its prefix, to `groups`: a header
 /// starts a group, a level line fills the last.
-fn group_line(groups: &mut Vec<Group>, total: bool, rest: &str) -> Result<()> {
+fn group_line(groups: &mut Vec<Group>, kind: Kind, rest: &str) -> Result<()> {
     let mut words = rest.split_ascii_whitespace();
     let first = words.next().context("an empty line")?;
     if first.starts_with("samples=") {
         let mut group = Group {
-            total,
+            kind,
             ..Group::default()
         };
         for word in std::iter::once(first).chain(words) {
@@ -191,6 +286,13 @@ fn group_line(groups: &mut Vec<Group>, total: bool, rest: &str) -> Result<()> {
                 "cycles" => group.cycles = number(value)?,
                 "gone" => group.gone = pair(value)?,
                 "other" => group.other = pair(value)?,
+                "w" => {
+                    group.window = Some(
+                        value
+                            .parse()
+                            .with_context(|| format!("a window `{value}`"))?,
+                    )
+                }
                 _ => {}
             }
         }
@@ -203,7 +305,7 @@ fn group_line(groups: &mut Vec<Group>, total: bool, rest: &str) -> Result<()> {
         .with_context(|| format!("an unknown level `{first}`"))?;
     let group = groups
         .last_mut()
-        .filter(|group| group.total == total)
+        .filter(|group| group.kind == kind)
         .context("a level line before its group's header")?;
     // The whole line first: a broken one leaves its group as it was.
     let mut counts = [0; 2];
@@ -411,6 +513,56 @@ mod tests {
         // The total reads as before too.
         let total = Profile::parse(&log, false).unwrap();
         assert_eq!(total.entries, Profile::parse(LOG, false).unwrap().entries);
+    }
+
+    /// A marked boot: window 0's pages twice (the periodic lines, then the
+    /// mark's), its blocks, window 1's pages; share lines among them.
+    const MARKED: &str = "\
+[   10.000] PES PC samples=1 cycles=16000000 gone=0/0 other=0/0
+[   10.000] PES PC user samples=1 cycles=16000000 blocks=1 0x100:1:16000000@?+100
+[   20.000] PES PC PAGES samples=1 cycles=7 gone=0/0 other=0/0 w=0 pages=1
+[   20.000] PES PC PAGES user samples=1 cycles=7 pages=1 part=1/1 0x180000000:1:7@00000000000000aa+0
+[   25.000] PES PC SHARE user w=0 samples=3 cycles=9 blocks=2 exact=yes evicted=0 floor=0 top24=1000
+[   25.000] PES PC PAGES samples=3 cycles=9 gone=1/1 other=0/0 w=0 pages=2
+[   25.000] PES PC PAGES user samples=3 cycles=9 pages=2 part=1/2 0x180000000:2:8@00000000000000aa+0
+[   25.000] PES PC PAGES user samples=3 cycles=9 pages=2 part=2/2 0x180004000:1:1@00000000000000bb+0
+[   25.000] PES PC WINDOW samples=3 cycles=9 gone=1/1 other=0/0 w=0
+[   25.000] PES PC WINDOW user samples=3 cycles=9 blocks=2 0x180000040:2:8@00000000000000aa+40 0x180004000:1:1@00000000000000bb+0
+[   40.000] PES PC PAGES samples=2 cycles=20 gone=0/0 other=0/0 w=1 pages=1
+[   40.000] PES PC PAGES kernel samples=2 cycles=20 pages=1 part=1/1 v+0x4000:2:20@00000000000000cc+0
+";
+
+    #[test]
+    fn pages_read_the_last_group_of_each_window() {
+        let select = |pages: bool, window: Option<u32>| Select {
+            beats: false,
+            pages,
+            window,
+        };
+        let all = Profile::parse_with(MARKED, select(true, None)).unwrap();
+        assert_eq!(all.source, Source::Pages { windows: 2 });
+        assert_eq!((all.samples, all.cycles), (5, 29));
+        assert_eq!(all.gone, [1, 1]);
+        assert_eq!(all.levels, [[3, 9], [2, 20], [0, 0]]);
+        assert_eq!(all.entries.len(), 3);
+        assert_eq!(
+            all.entries[0],
+            entry(Level::Kernel, "v+0x4000", Some(0xcc), 0, 2, 20)
+        );
+        assert!(all.warnings.is_empty(), "{:?}", all.warnings);
+        let first = Profile::parse_with(MARKED, select(true, Some(0))).unwrap();
+        assert_eq!(first.source, Source::Pages { windows: 1 });
+        assert_eq!(first.cycles, 9);
+        assert!(Profile::parse_with(MARKED, select(true, Some(5))).is_err());
+        // One window's blocks.
+        let blocks = Profile::parse_with(MARKED, select(false, Some(0))).unwrap();
+        assert_eq!(blocks.source, Source::Window { window: 0 });
+        assert_eq!(blocks.entries[0].offset, 0x40);
+        assert!(Profile::parse_with(MARKED, select(false, Some(1))).is_err());
+        // The default still reads the beats, the other groups apart.
+        let beats = Profile::parse(MARKED, false).unwrap();
+        assert_eq!(beats.source, Source::Beats { of: 1 });
+        assert_eq!(beats.cycles, 16_000_000);
     }
 
     /// The lines the engine prints parse back into the blocks it held.

@@ -46,6 +46,7 @@ mod pci_power;
 pub(crate) mod pipelines;
 pub(crate) mod power;
 use stela_boot_core::boot_progress as progress;
+mod profile_window;
 mod remapping;
 mod remote;
 mod restore;
@@ -1349,8 +1350,10 @@ fn run_machine<H: Host>(
     }
     if options.profile {
         output::arguments(format_args!(
-            "PROFILE on: each heartbeat reports the engine's time by phase and exit kind\n"
+            "PROFILE on: each heartbeat reports the engine's time by phase and exit kind; \
+             Control+Option+Shift+M on the host keyboard marks a window (PROFILE MARK)\n"
         ));
+        profile_window::enable();
         #[cfg(feature = "nvk")]
         gpu::gate::profile_passes();
     }

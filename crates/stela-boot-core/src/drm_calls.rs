@@ -16,6 +16,7 @@ pub const VERSION: u32 = 0xc040_6400;
 
 const ENOENT: i64 = -2;
 const ENODEV: i64 = -19;
+const EINVAL: i64 = -22;
 
 /// The name of `driver`'s command `command`, its ioctl number less
 /// [`COMMAND_BASE`], from the driver's own uAPI header.
@@ -187,6 +188,9 @@ const I915_GETPARAM: u32 = 0xc010_6446;
 const I915_PARAM_IRQ_ACTIVE: u32 = 1;
 /// `I915_PARAM_PXP_STATUS`.
 const I915_PARAM_PXP_STATUS: u32 = 58;
+/// `DRM_IOCTL_I915_GEM_USERPTR`: `DRM_IOWR(0x73, struct
+/// drm_i915_gem_userptr)`, 24 bytes, its size at byte 8.
+const I915_GEM_USERPTR: u32 = 0xc018_6473;
 
 /// Whether `driver`'s answer `result` to ioctl `request`, whose argument
 /// began with `input` as the caller passed it, is the driver's ordinary
@@ -210,6 +214,10 @@ const I915_PARAM_PXP_STATUS: u32 = 58;
 ///   `HAS_CONTEXT_ISOLATION` (`intel/dev/i915/intel_device_info.c`, a getparam
 ///   inside a getparam's argument), which is 1 on every GPU i915 is handed; i915
 ///   retired that parameter and answers `-ENODEV`, which Mesa ignores.
+/// - i915, `GEM_USERPTR` of 0 bytes, `-EINVAL`: Mesa's i915 device info
+///   asks whether the userptr interface exists with an empty object
+///   (`has_userptr_uapi`, `intel/dev/i915/intel_device_info.c`), and
+///   `-EINVAL` for its size is the yes (`i915_gem_userptr_ioctl`).
 pub fn probe_answer(driver: &str, request: u32, input: &[u8], result: i64) -> bool {
     let word = |at: usize| {
         input
@@ -222,6 +230,7 @@ pub fn probe_answer(driver: &str, request: u32, input: &[u8], result: i64) -> bo
         ("i915", I915_GETPARAM, ENODEV) => {
             matches!(word(0), Some(I915_PARAM_PXP_STATUS | I915_PARAM_IRQ_ACTIVE))
         }
+        ("i915", I915_GEM_USERPTR, EINVAL) => input.get(8..16) == Some(&[0; 8]),
         _ => false,
     }
 }
@@ -277,6 +286,31 @@ mod tests {
         assert_eq!(XE_DEVICE_QUERY, iowr(COMMAND_BASE, 40));
         assert_eq!(XE_VM_GET_PROPERTY, iowr(COMMAND_BASE + 0x0f, 56));
         assert_eq!(I915_GETPARAM, iowr(COMMAND_BASE + 0x06, 16));
+        assert_eq!(I915_GEM_USERPTR, iowr(COMMAND_BASE + 0x33, 24));
+    }
+
+    #[test]
+    fn i915s_answer_to_mesas_userptr_probe_is_not_a_refusal() {
+        // Issue 8's T480s logged `I915_GEM_USERPTR ... refused: EINVAL`
+        // once a boot: Mesa's empty object, which only asks the interface.
+        let userptr = |size: u64| {
+            let mut argument = [0u8; 24];
+            argument[0..8].copy_from_slice(&0x1000u64.to_le_bytes());
+            argument[8..16].copy_from_slice(&size.to_le_bytes());
+            argument
+        };
+        assert!(probe_answer("i915", I915_GEM_USERPTR, &userptr(0), EINVAL));
+        // A real object's EINVAL, another errno or driver, or no kept
+        // input is a refusal.
+        assert!(!probe_answer(
+            "i915",
+            I915_GEM_USERPTR,
+            &userptr(4096),
+            EINVAL
+        ));
+        assert!(!probe_answer("i915", I915_GEM_USERPTR, &userptr(0), -14));
+        assert!(!probe_answer("xe", I915_GEM_USERPTR, &userptr(0), EINVAL));
+        assert!(!probe_answer("i915", I915_GEM_USERPTR, &[], EINVAL));
     }
 
     #[test]

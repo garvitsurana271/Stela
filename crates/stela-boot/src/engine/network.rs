@@ -972,10 +972,49 @@ pub(super) fn set_receive_core(apic: u64) {
 /// the devices' lock: the rest wait in the adapter's ring.
 const RECEIVE_BURST: usize = 256;
 
+/// How long a Wi-Fi chip chosen for the guest network may take to name its
+/// station address: Intel's reads it from its NVM once its firmware is
+/// alive (2 s at most), which polling its link drives.
+const STATION_WAIT_MILLIS: u64 = 10_000;
+
+/// Whether `link` has a usable unicast station address for the guest's USB
+/// Ethernet adapter, a Wi-Fi chip's link being driven up to
+/// [`STATION_WAIT_MILLIS`] for one. On a laptop with no cable and a Wi-Fi
+/// network configured, 0.6.1 gave macOS an Intel AX200's all-zero address,
+/// read before its firmware ran, and stopped at "Setting up the Mac's
+/// hardware" ("the USB Ethernet address must be a unicast address").
+fn station_address(link: &mut RootLink) -> bool {
+    if link.mac().is_valid() {
+        return true;
+    }
+    let start = output::now();
+    if link.device.wireless() {
+        while output::millis_since(start) < STATION_WAIT_MILLIS {
+            let _ = link.carrier_now();
+            if link.mac().is_valid() {
+                output::arguments(format_args!(
+                    "GUEST NETWORK adapter {} named its station address after {} ms\n",
+                    link.device.location(),
+                    output::millis_since(start)
+                ));
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+    }
+    output::arguments(format_args!(
+        "GUEST NETWORK adapter {} has no usable station address after {} ms: not given to macOS\n",
+        link.device.location(),
+        output::millis_since(start)
+    ));
+    false
+}
+
 impl GuestNetwork {
     /// The first adapter left in `links` with carrier now; else, with a
-    /// Wi-Fi network configured, the first Wi-Fi adapter; else the first one
-    /// left (`network_link::guest_adapter`). The mount's own client, when it
+    /// Wi-Fi network configured or saved, the first Wi-Fi adapter; else the
+    /// first one left (`network_link::usable_guest_adapter`), among those
+    /// with a usable station address ([`station_address`]). The mount's own client, when it
     /// runs, has taken its adapter first ([`HostNetwork::open`]), so the
     /// guest never takes the only adapter with a cable from an install.
     /// `ssid` is the configured Wi-Fi network's name, hidden in what a Wi-Fi
@@ -992,19 +1031,45 @@ impl GuestNetwork {
             .iter()
             .map(|device| device.wireless())
             .collect();
-        let index = network_link::guest_adapter(&carriers, &wireless, ssid.is_some());
-        let device = links.devices.remove(index);
+        // A saved network counts as configured too: with no cable, macOS's
+        // network goes to the Wi-Fi chip that joins it, where 0.6.1 gave it
+        // the first adapter, an Ethernet port with no link.
+        let wifi_configured = ssid.is_some()
+            || NETWORKS
+                .0
+                .try_borrow()
+                .is_ok_and(|networks| !networks.is_empty());
+        // The guest's USB Ethernet adapter takes the host adapter's station
+        // address, so an adapter without a usable one is put back and the
+        // next is chosen; with none left, macOS starts without a network.
+        let mut usable = alloc::vec![true; links.devices.len()];
+        let link = loop {
+            let Some(index) =
+                network_link::usable_guest_adapter(&carriers, &wireless, &usable, wifi_configured)
+            else {
+                return Err(refuse!(
+                    "the guest network needs a host network adapter with a station address; \
+                     none left has one"
+                ));
+            };
+            let mut link = RootLink::new(links.devices.remove(index), links.root, ssid);
+            if station_address(&mut link) {
+                break link;
+            }
+            links.devices.insert(index, link.into_device());
+            usable[index] = false;
+        };
         output::arguments(format_args!(
             "GUEST NETWORK adapter {} mac={}\n",
-            device.location(),
-            stela_contracts::masked::Mac(&device.mac().0)
+            link.device.location(),
+            stela_contracts::masked::Mac(&link.mac().0)
         ));
         super::ident::set(
             super::ident::Kind::Network,
-            format_args!("{}", device.location()),
+            format_args!("{}", link.device.location()),
         );
         Ok(Self {
-            link: RootLink::new(device, links.root, ssid),
+            link,
             up: None,
             counters: Default::default(),
             refused: false,

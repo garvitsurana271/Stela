@@ -432,6 +432,11 @@ impl HostNetwork {
                         "NETWORK adapter={location} addresses={:?} dns={:?}\n",
                         config.addresses, config.dns
                     ));
+                    // Taken on IPv6 alone: what DHCPv4 did meanwhile, and
+                    // which resolvers lookups ask without a network's.
+                    for note in stack.admission_notes() {
+                        output::arguments(format_args!("NETWORK adapter {location} {note}\n"));
+                    }
                     let addresses: Vec<String> = config
                         .addresses
                         .iter()

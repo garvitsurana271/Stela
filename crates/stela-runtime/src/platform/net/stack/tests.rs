@@ -1,4 +1,5 @@
 mod clock;
+mod dns;
 mod http_flow;
 #[cfg(all(not(target_os = "uefi"), feature = "native-reference-peer"))]
 mod tls;
@@ -144,6 +145,7 @@ impl Lan {
             rdnss: Default::default(),
             manage_ipv6: false,
             dhcp: dhcp::DhcpLog::new(SERVER),
+            answers: Default::default(),
         };
         let config = InterfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(SERVER)));
         let mut iface = Interface::new(config, &mut server, Instant::ZERO);
@@ -657,7 +659,16 @@ fn a_lookup_no_server_answers_asks_every_server_in_turn() {
     })
     .unwrap();
     let started = s.now().unwrap();
-    assert_eq!(s.resolve_now("cdn.example"), Err(NetError::Timeout("DNS")));
+    // No router, so no public resolver is reachable: the error says that
+    // no reply came, not that a server answered with an error.
+    match s.resolve_now("cdn.example") {
+        Err(NetError::Dns(why)) => assert!(
+            why.starts_with("cdn.example: no reply from 10.0.2.3, 10.0.2.4, 10.0.2.5 in ")
+                && why.ends_with(" s to the A query"),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
     let took = s.now().unwrap() - started;
     assert!(took <= 3 * DNS_SERVER_US + 1_000_000, "{took}");
     let lan = &mut s.phy.link.0;
@@ -938,6 +949,8 @@ fn a_lookup_waits_for_a_lost_lease_and_then_uses_the_cached_address() {
         query: None,
         asked: 0,
         ipv4_only: false,
+        fallback: None,
+        since: 0,
         deadline: 0,
     };
     assert_eq!(stack.resolve(&mut lookup), Ok(None));

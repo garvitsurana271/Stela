@@ -5,23 +5,24 @@
 //! Their drivers reach registers and DMA pages through the loader's
 //! identity root, as the storage services do, so each poll runs in that
 //! root (`storage::RestoreRoot`). The guest sees an input change at
-//! its peripheral's next interrupt poll after the slice it arrived in. A
-//! device that gave no input for a few seconds is polled every
-//! [`IDLE_MILLIS`], so its first input waits that long. A device whose
-//! polls cost more than a [`COST_SHARE`]th of that is polled as much less
-//! often, but at most [`SLOW_MILLIS`] apart when idle and [`ACTIVE_MILLIS`]
-//! when active, which bound its first input's wait while the host drivers'
-//! lock is free. A posted GPU call is pumped between devices
+//! its peripheral's next interrupt poll after the slice it arrived in.
+//! When each device is polled is `stela_boot_core::input_pace`'s: at every
+//! turn while it gives input, at most every `IDLE_MILLIS` after a few
+//! seconds without, and further apart when its empty looks are costly
+//! (`COST_SHARE`). A posted GPU call is pumped between devices
 //! (`gpu::pump_posted`).
 //!
-//! No call waits for the host drivers' lock for longer than
-//! [`STARVED_WAIT_MICROS`]: the turn may be a step of a PE that runs guest
-//! code, and another processor can hold the lock for longer than one exit
-//! may take. A poll, an LED change or a stopped device's removal that finds
-//! the lock busy stays due for the next turn. A device holds its input
-//! meanwhile as far as its hardware does: a USB device one report in its
-//! queued transfer and what it keeps itself behind the endpoint's NAKs, a
-//! PS/2 device its own buffer behind the controller's.
+//! A poll that finds the host drivers' lock taken tries again at the next
+//! turn, and once it is `LATE_WAIT_MICROS` late spins for it as a waiter
+//! the GPUs' pump lets in after its Linux step, for the turn's
+//! `input_pace::wait_micros` at most: the turn may be a step of a PE that
+//! runs guest code, and another processor can hold the lock for longer than
+//! one exit may take. An LED change or a stopped device's removal that
+//! finds the lock busy stays due for the next turn. A device holds its
+//! input meanwhile as far as its hardware does: a USB device one report in
+//! its queued transfer and what it keeps itself behind the endpoint's NAKs,
+//! a PS/2 device its own buffer behind the controller's, an I2C device its
+//! report behind its asserted interrupt pin.
 //!
 //! Each device's first polling and LED failure is reported once. A device
 //! that stops is reported and dropped, so re-plugged keyboards do not pile
@@ -38,6 +39,7 @@
 use super::storage::{Inputs, RestoreRoot};
 use crate::output;
 use alloc::vec::Vec;
+use stela_boot_core::input_pace::{self, Plan, Spread};
 use stela_boot_core::options::GuestTrackpad;
 use stela_drivers::input::{HeldInputs, Input, InputDevice, multitouch::Surface};
 use stela_soc::machine::AppleDevices;
@@ -70,13 +72,8 @@ struct Reported {
     last_failure: Option<alloc::string::String>,
     /// The keyboard LEDs last wanted have not reached the device yet.
     leds_due: bool,
-    /// The counter when the device was last polled, and when a poll last
-    /// found input.
-    looked: u64,
-    active: u64,
-    /// Its polls' recent cost in counter ticks, without lock waits: an
-    /// eighth of each poll joins seven eighths of the last.
-    cost: u64,
+    /// When it is polled ([`input_pace::Device`]).
+    pace: input_pace::Device,
     /// Its polls since the last [`TIMES_SECONDS`] report.
     times: Times,
     /// For an i8042: its bytes read and dropped at the last report, and
@@ -105,43 +102,14 @@ struct Times {
     skipped: u64,
     /// The inputs its polls gave the guest.
     delivered: u64,
+    /// How late each poll ran after it was due, its lock wait included, in
+    /// microseconds, and the gaps between its deliveries within a motion.
+    late: Spread,
+    gap: Spread,
 }
 
 /// How often the input devices' poll times are reported.
 const TIMES_SECONDS: u64 = 10;
-
-/// How often an idle device is polled. A poll can be a port or register
-/// access a hypervisor takes to its device model, which waits there for
-/// the model's lock, and the boot PE serves the host between slices of
-/// guest code, holding back its guest, the devices' deadlines and the GPUs'
-/// work. A device holds what arrives meanwhile: a USB device in its
-/// transfer, a PS/2 device in its own buffer while the controller's is
-/// full. USB low-speed keyboards and mice are polled as rarely.
-const IDLE_MILLIS: u64 = 8;
-/// How long a busy host-drivers lock may leave a due device unpolled before
-/// a poll waits for the lock, for [`STARVED_WAIT_MICROS`] at most. A disk
-/// command can hold it for tens of milliseconds; below this a due device is
-/// polled at the next turn the lock is free.
-const STARVED_MILLIS: u64 = 32;
-/// How long a turn waits for the host drivers' lock for a device unpolled
-/// past [`STARVED_MILLIS`], once for all its devices: about a service
-/// step's length. The wait shows a holder that works in steps (the GPUs'
-/// pump) that the lock is wanted, so it lets go at its next step; a holder
-/// that keeps it longer leaves the poll due for the next turn.
-const STARVED_WAIT_MICROS: u64 = 1000;
-/// How long a device is polled at every service turn after it last gave
-/// input, so a pointer's motion keeps its full rate.
-const ACTIVE_SECONDS: u64 = 5;
-/// A device's polls may take at most one part in this of the boot PE: a
-/// poll costing more is spaced this many times its cost apart. A port read
-/// that costs a microsecond on hardware can wait milliseconds for a
-/// hypervisor's device-model lock; the boot PE's time is the guest's.
-const COST_SHARE: u64 = 32;
-/// The longest an idle device waits for its next poll however costly its
-/// polls are, which its first input can wait.
-const SLOW_MILLIS: u64 = 250;
-/// The longest an active device waits for its next poll.
-const ACTIVE_MILLIS: u64 = 32;
 
 pub struct HostInput {
     inputs: Inputs,
@@ -155,6 +123,8 @@ pub struct HostInput {
     wanted_leds: Option<u8>,
     /// The counter at the last poll-time report.
     reported_times: u64,
+    /// The polls' waits for the host drivers' lock across turns.
+    waits: input_pace::Waits,
     /// What each device holds down, released when it stops.
     held: HeldInputs,
     /// The next device's identity.
@@ -197,6 +167,7 @@ impl HostInput {
             leds: None,
             wanted_leds: None,
             reported_times: 0,
+            waits: input_pace::Waits::default(),
             held: HeldInputs::new(),
             touch_frames: false,
             trackpad_surface: false,
@@ -334,9 +305,11 @@ impl HostInput {
     /// Read the host's input devices, without the guest's devices, in the
     /// order probe found them. The guest's lock-key LEDs reach each host
     /// keyboard first, as Linux `hidinput_led_worker` sends an input
-    /// device's LED changes.
+    /// device's LED changes. `step` when the turn is a step of a PE that
+    /// runs guest code, which waits for the lock least.
     pub fn read(
         &mut self,
+        step: bool,
         #[cfg(feature = "diagnostics")] turn: &mut super::service::InputTurn,
     ) -> Vec<Input> {
         if let Some(leds) = self.wanted_leds
@@ -380,27 +353,20 @@ impl HostInput {
         let mut pending = Vec::new();
         let mut stopped = false;
         let now = super::host::fresh_counter();
-        let millis = super::host::COUNTER_HZ / 1000;
-        let starved = millis * STARVED_MILLIS;
-        // Whether this turn may still wait for the lock.
-        let mut may_wait = true;
+        let per_micro = super::host::COUNTER_HZ / 1_000_000;
+        // This turn's one wait for the lock.
+        let mut turn = input_pace::Turn::new(input_pace::wait_micros(step));
         for (device, reported) in self.inputs.devices.iter_mut().zip(&mut self.reported) {
             // A stopped device a busy lock kept from being dropped.
             if device.stopped() {
                 stopped = true;
                 continue;
             }
-            let active =
-                now.wrapping_sub(reported.active) < super::host::COUNTER_HZ * ACTIVE_SECONDS;
-            let interval = if active {
-                (reported.cost * COST_SHARE).min(millis * ACTIVE_MILLIS)
-            } else {
-                (reported.cost * COST_SHARE).clamp(millis * IDLE_MILLIS, millis * SLOW_MILLIS)
-            };
-            let since = now.wrapping_sub(reported.looked);
-            if since < interval {
+            let Plan::Poll { late, wait_micros } =
+                reported.pace.plan(now, per_micro, &mut turn, &self.waits)
+            else {
                 continue;
-            }
+            };
             let before = pending.len();
             let entering = super::host::fresh_counter();
             let entered;
@@ -408,13 +374,17 @@ impl HostInput {
                 // SAFETY: the loader root `storage::open` captured, which
                 // maps this device.
                 let root = unsafe {
-                    if since >= interval + starved && core::mem::take(&mut may_wait) {
-                        RestoreRoot::enter_within(self.inputs.root, STARVED_WAIT_MICROS)
+                    if wait_micros != 0 {
+                        RestoreRoot::enter_within(self.inputs.root, wait_micros)
                     } else {
                         RestoreRoot::try_enter(self.inputs.root)
                     }
                 };
                 let Some(_root) = root else {
+                    if wait_micros != 0 {
+                        self.waits
+                            .outlasted(super::host::fresh_counter(), per_micro);
+                    }
                     reported.times.skipped += 1;
                     continue;
                 };
@@ -432,11 +402,13 @@ impl HostInput {
             times.longest_wait = times.longest_wait.max(waited);
             times.polled += took;
             times.longest_poll = times.longest_poll.max(took);
-            reported.cost = reported.cost - reported.cost / 8 + took / 8;
-            reported.looked = now;
-            reported.times.delivered += pending.len().saturating_sub(before) as u64;
-            if pending.len() != before {
-                reported.active = now;
+            times.late.add((late + waited) / per_micro);
+            let delivered = pending.len() != before;
+            if let Some(gap) = reported.pace.polled(now, took, delivered, per_micro) {
+                times.gap.add(gap / per_micro);
+            }
+            times.delivered += pending.len().saturating_sub(before) as u64;
+            if delivered {
                 // A laptop's own keyboard or touchpad lights a panel the
                 // lid darkened, whatever its `_LID` reads (`--lid method`).
                 if built_in(device) && super::lid::built_in_input() == Some(false) {
@@ -473,11 +445,14 @@ impl HostInput {
     }
 
     /// `INPUT TIMES name:polls/waited_us/longest_wait_us/polled_us/
-    /// longest_poll_us/skipped/delivered[/read=K+M/dropped=D] …`: each
-    /// device's polls since the last report, the host-drivers lock waits
-    /// before them, their own time, the inputs they gave the guest, and for
-    /// an i8042 the bytes read from its keyboard and mouse ports and the
-    /// bytes dropped since the last report.
+    /// longest_poll_us/skipped/delivered/late=P50+P95+MAX/gap=P50+P95+MAX
+    /// [/read=K+M/dropped=D] …`: each device's polls since the last report,
+    /// the host-drivers lock waits before them, their own time, the turns a
+    /// busy lock skipped it, the inputs they gave the guest, how late its
+    /// polls ran after they were due and the gaps between its deliveries
+    /// within a motion (in microseconds; a percentile is its bucket's upper
+    /// bound, `-` for none), and for an i8042 the bytes read from its
+    /// keyboard and mouse ports and the bytes dropped since the last report.
     fn report_times(&mut self) {
         let micros = |ticks: u64| ticks / (super::host::COUNTER_HZ / 1_000_000);
         let mut line = alloc::string::String::from("INPUT TIMES");
@@ -486,7 +461,7 @@ impl HostInput {
             let _ = core::fmt::Write::write_fmt(
                 &mut line,
                 format_args!(
-                    " {}:{}/{}/{}/{}/{}/{}/{}",
+                    " {}:{}/{}/{}/{}/{}/{}/{}/late={}/gap={}",
                     device.name().replace(' ', "_"),
                     t.polls,
                     micros(t.waited),
@@ -495,6 +470,8 @@ impl HostInput {
                     micros(t.longest_poll),
                     t.skipped,
                     t.delivered,
+                    t.late,
+                    t.gap,
                 ),
             );
             if let Some(counters) = device.ps2_counters() {

@@ -333,6 +333,7 @@ impl Service {
                 input_turn.usb_done = host::rdtsc();
             }
             let inputs = input.read(
+                step,
                 #[cfg(feature = "diagnostics")]
                 &mut input_turn,
             );

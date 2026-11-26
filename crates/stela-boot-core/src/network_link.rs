@@ -89,6 +89,32 @@ pub fn guest_switch(
         .position(|&since| steady(since, now_ms, SPARE_STEADY_MS))
 }
 
+/// [`guest_adapter`] among the adapters whose station address is `usable`,
+/// in the same order; none when no adapter has one. The guest's USB
+/// Ethernet adapter takes its host adapter's address, so an Intel Wi-Fi
+/// chip whose firmware had not read its address yet gave macOS all zeros
+/// and 0.6.1 stopped the boot ("the USB Ethernet address must be a unicast
+/// address") on a laptop with no cable and a Wi-Fi network configured.
+pub fn usable_guest_adapter(
+    carriers: &[bool],
+    wireless: &[bool],
+    usable: &[bool],
+    wifi_configured: bool,
+) -> Option<usize> {
+    let kept: alloc::vec::Vec<usize> = (0..carriers.len())
+        .filter(|&index| usable.get(index).copied().unwrap_or(false))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let pick = |of: &[bool]| -> alloc::vec::Vec<bool> {
+        kept.iter()
+            .map(|&index| of.get(index).copied().unwrap_or(false))
+            .collect()
+    };
+    Some(kept[guest_adapter(&pick(carriers), &pick(wireless), wifi_configured)])
+}
+
 /// `text` with the network's name `ssid` written `<ssid>` wherever it
 /// occurs, byte for byte, as `String::from_utf8_lossy` writes it (the
 /// connection keeper's failures name the network so): occurrences that

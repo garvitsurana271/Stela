@@ -2,6 +2,7 @@
 //! autoconfiguration (or an authored fixture), with non-blocking
 //! [`Transfer`]s that resolve, connect and move bytes as they are driven,
 //! several at once, and blocking HTTP requests built on them.
+mod answers;
 mod automatic;
 mod client;
 pub use client::{HttpPost, HttpRequest, HttpTransfer, TlsUnavailable};
@@ -53,6 +54,20 @@ const DNS_WAIT_US: u64 = 15_000_000;
 /// past that, which a lookup makes when this turn ends. It keeps at most
 /// `DNS_MAX_SERVER_COUNT` servers, so a query takes at most that many turns.
 const DNS_SERVER_US: u64 = 11_000_000;
+/// The public resolvers a lookup asks when the network named no DNS server
+/// or its servers did not resolve the name, and no `--dns` was set: Cloudflare
+/// and Quad9, over IPv4 when it has a router, else over IPv6. Two I219
+/// installs failed on 0.6.1 after 8 to 13 minutes of silent retries, one
+/// whose Windows connection-sharing DNS proxy resolved nothing and one
+/// whose IPv6 router advertised no DNS server and whose DHCPv4 never came.
+const FALLBACK_IPV4: [IpAddress; 2] = [
+    IpAddress::Ipv4(core::net::Ipv4Addr::new(1, 1, 1, 1)),
+    IpAddress::Ipv4(core::net::Ipv4Addr::new(9, 9, 9, 9)),
+];
+const FALLBACK_IPV6: [IpAddress; 2] = [
+    IpAddress::Ipv6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+    IpAddress::Ipv6(Ipv6Addr::new(0x2620, 0xfe, 0, 0, 0, 0, 0, 0xfe)),
+];
 /// How long a name's address is used before it is looked up again.
 const RESOLVED_US: u64 = 300_000_000;
 /// The DHCP and DNS lines one stack keeps for its caller ([`Stack::take_notes`]).
@@ -86,6 +101,7 @@ struct Phy<L> {
     rdnss: rdnss::Rdnss,
     manage_ipv6: bool,
     dhcp: dhcp::DhcpLog,
+    answers: answers::Answers,
 }
 
 struct Rx<'a>(&'a [u8]);
@@ -151,8 +167,9 @@ impl<L: Link> Device for Phy<L> {
                 for probe in &mut self.probes {
                     probe.duplicate |= dad::conflicts(frame, probe.address, probe.nonce);
                 }
-                self.rdnss
-                    .observe(frame, self.local_ipv6, now.total_micros().max(0) as u64);
+                let micros = now.total_micros().max(0) as u64;
+                self.rdnss.observe(frame, self.local_ipv6, micros);
+                self.answers.observe(frame, micros);
                 self.dhcp.received(frame);
                 Some((
                     Rx(frame),
@@ -230,6 +247,8 @@ impl<L: Link, C: Clock> Stack<L, C> {
             query: None,
             asked: 0,
             ipv4_only: false,
+            fallback: None,
+            since: 0,
             deadline: 0,
         };
         loop {
@@ -259,6 +278,11 @@ struct Lookup {
     asked: usize,
     /// An IPv6 lookup failed, so only IPv4 is asked.
     ipv4_only: bool,
+    /// Once the network's DNS gave no address, why: the query is then the
+    /// public resolvers' ([`FALLBACK_IPV4`], [`FALLBACK_IPV6`]).
+    fallback: Option<String>,
+    /// When the current query started.
+    since: u64,
     /// When the address family or server being waited for is late, or the
     /// current server's turn at the query ends.
     deadline: u64,
@@ -274,6 +298,9 @@ pub struct Stack<L: Link, C: Clock> {
     /// Absent once a configuration is set by hand.
     dhcp: Option<SocketHandle>,
     dns: SocketHandle,
+    /// The resolver asking the public resolvers, apart from the network's:
+    /// smoltcp keeps at most `DNS_MAX_SERVER_COUNT` servers in one.
+    fallback_dns: SocketHandle,
     config: Option<Config>,
     next_port: u16,
     /// Names looked up, their first address and when it was found.
@@ -313,6 +340,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
             rdnss: Default::default(),
             manage_ipv6: true,
             dhcp: dhcp::DhcpLog::new(mac.0),
+            answers: Default::default(),
         };
         let initial = clock.now_us().map_err(NetError::Clock)?;
         let now = Instant::from_micros(
@@ -327,6 +355,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
         client.set_retry_config(retry);
         let dhcp = Some(sockets.add(client));
         let dns = sockets.add(dns::Socket::new(&[], Vec::new()));
+        let fallback_dns = sockets.add(dns::Socket::new(&[], Vec::new()));
         Ok(Self {
             phy,
             clock,
@@ -336,6 +365,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
             sockets,
             dhcp,
             dns,
+            fallback_dns,
             config: None,
             next_port: FIRST_EPHEMERAL + (seed % 8192) as u16,
             resolved: Vec::new(),
@@ -716,78 +746,222 @@ impl<L: Link, C: Clock> Stack<L, C> {
         }
     }
 
+    /// The record a lookup asks for: IPv6 first where it reaches the
+    /// internet natively; IPv4 before a 6to4 or Teredo address, as RFC
+    /// 6724's precedence ranks them, since such a relay is often gone; and
+    /// IPv6 from a unique local or transition address alone only when there
+    /// is no IPv4 at all. None without either family.
+    fn query_kind(&self, ipv4_only: bool) -> Option<DnsQueryType> {
+        if !ipv4_only && self.ipv6_native_ready() {
+            Some(DnsQueryType::Aaaa)
+        } else if self.config.is_some() {
+            Some(DnsQueryType::A)
+        } else if !ipv4_only && self.ipv6_ready() {
+            Some(DnsQueryType::Aaaa)
+        } else {
+            None
+        }
+    }
+
+    /// The public resolvers a lookup may fall back to: none once `--dns`
+    /// named the servers, over IPv4 where it has a router, else over IPv6
+    /// where a global address and a default route reach them.
+    fn fallback_servers(&self) -> &'static [IpAddress] {
+        if self.fixed_dns.is_some() {
+            &[]
+        } else if self
+            .config
+            .as_ref()
+            .is_some_and(|config| config.router.is_some())
+        {
+            &FALLBACK_IPV4
+        } else if self.ipv6_global_ready() {
+            &FALLBACK_IPV6
+        } else {
+            &[]
+        }
+    }
+
+    /// The servers `lookup`'s query goes to, and their resolver.
+    fn lookup_servers(&self, lookup: &Lookup) -> (Vec<IpAddress>, SocketHandle) {
+        match lookup.fallback {
+            Some(_) => (self.fallback_servers().to_vec(), self.fallback_dns),
+            None => (self.dns_servers.clone(), self.dns),
+        }
+    }
+
     fn lookup(&mut self, lookup: &mut Lookup, now: u64) -> Result<Option<IpAddress>, NetError> {
         let Some((query, kind)) = lookup.query else {
-            // IPv6 first where it reaches the internet; from a unique local
-            // address alone only when there is no IPv4 at all.
-            let kind = if !lookup.ipv4_only && self.ipv6_global_ready() {
-                DnsQueryType::Aaaa
-            } else if self.config.is_some() {
-                DnsQueryType::A
-            } else if !lookup.ipv4_only && self.ipv6_ready() {
-                DnsQueryType::Aaaa
-            } else if self.ipv4_pending(now) {
-                self.await_lease(lookup);
-                return Ok(None);
-            } else if now >= lookup.deadline {
-                return Err(NetError::Dns(alloc::format!(
-                    "{}: no reachable address family",
-                    lookup.name
-                )));
-            } else {
-                return Ok(None);
-            };
-            if self.dns_servers.is_empty() {
-                if now >= lookup.deadline {
-                    return Err(NetError::Dns(String::from(
-                        "no DNS server from DHCPv4 or IPv6 router advertisements",
+            let Some(kind) = self.query_kind(lookup.ipv4_only) else {
+                if self.ipv4_pending(now) {
+                    self.await_lease(lookup);
+                    return Ok(None);
+                } else if now >= lookup.deadline {
+                    return Err(NetError::Dns(alloc::format!(
+                        "{}: no reachable address family",
+                        lookup.name
                     )));
                 }
                 return Ok(None);
+            };
+            let (servers, socket) = self.lookup_servers(lookup);
+            if servers.is_empty() {
+                if let Some(network) = &lookup.fallback {
+                    return Err(NetError::Dns(alloc::format!(
+                        "{}: {network}; no route to a public resolver",
+                        lookup.name
+                    )));
+                }
+                if now < lookup.deadline {
+                    return Ok(None);
+                }
+                return self.fall_back(
+                    lookup,
+                    String::from("no DNS server from DHCPv4 or IPv6 router advertisements"),
+                    now,
+                );
             }
-            let query = self
-                .sockets
-                .get_mut::<dns::Socket>(self.dns)
+            let resolver = self.sockets.get_mut::<dns::Socket>(socket);
+            if lookup.fallback.is_some() {
+                resolver.update_servers(&servers);
+            }
+            let query = resolver
                 .start_query(self.iface.context(), &lookup.name, kind)
                 .map_err(|error| NetError::Dns(alloc::format!("{}: {error:?}", lookup.name)))?;
             lookup.query = Some((query, kind));
             lookup.asked = 1;
+            lookup.since = now;
             lookup.deadline = now.saturating_add(DNS_SERVER_US);
             return Ok(None);
         };
-        let servers = self
-            .dns_servers
-            .len()
-            .min(smoltcp::config::DNS_MAX_SERVER_COUNT);
-        let socket = self.sockets.get_mut::<dns::Socket>(self.dns);
-        let failure =
-            match socket.get_query_result(query) {
-                Ok(addresses) => {
-                    lookup.query = None;
-                    return addresses.iter().copied().next().map(Some).ok_or_else(|| {
+        let (servers, socket) = self.lookup_servers(lookup);
+        let count = servers.len().min(smoltcp::config::DNS_MAX_SERVER_COUNT);
+        let resolver = self.sockets.get_mut::<dns::Socket>(socket);
+        match resolver.get_query_result(query) {
+            Ok(addresses) => {
+                lookup.query = None;
+                let address =
+                    addresses.iter().copied().next().ok_or_else(|| {
                         NetError::Dns(alloc::format!("{}: no address", lookup.name))
-                    });
+                    })?;
+                if let Some(network) = &lookup.fallback {
+                    let by = self
+                        .phy
+                        .answers
+                        .last(&lookup.name, answers::kind(kind), lookup.since)
+                        .map_or(String::from("a public resolver"), |answer| {
+                            alloc::format!("the public resolver {}", answer.source)
+                        });
+                    let line = alloc::format!(
+                        "DNS {} resolved by {by} after the network's DNS failed: {network}",
+                        lookup.name
+                    );
+                    self.note(line);
                 }
-                Err(dns::GetQueryResultError::Pending) if now < lookup.deadline => return Ok(None),
-                // The next server's turn: smoltcp moves to it at the first
-                // poll past the last one's 10 s, which this wake makes.
-                Err(dns::GetQueryResultError::Pending) if lookup.asked < servers => {
-                    lookup.asked += 1;
-                    lookup.deadline = now.saturating_add(DNS_SERVER_US);
-                    return Ok(None);
-                }
-                Err(dns::GetQueryResultError::Pending) => {
-                    socket.cancel_query(query);
-                    NetError::Timeout("DNS")
-                }
-                Err(error) => NetError::Dns(alloc::format!("{}: {error:?}", lookup.name)),
-            };
+                return Ok(Some(address));
+            }
+            Err(dns::GetQueryResultError::Pending) if now < lookup.deadline => return Ok(None),
+            // The next server's turn: smoltcp moves to it at the first
+            // poll past the last one's 10 s, which this wake makes.
+            Err(dns::GetQueryResultError::Pending) if lookup.asked < count => {
+                lookup.asked += 1;
+                lookup.deadline = now.saturating_add(DNS_SERVER_US);
+                return Ok(None);
+            }
+            Err(dns::GetQueryResultError::Pending) => resolver.cancel_query(query),
+            Err(dns::GetQueryResultError::Failed) => {}
+        }
         lookup.query = None;
+        let failure = self.dns_failure(lookup, kind, &servers[..count], now);
         if kind == DnsQueryType::Aaaa && self.config.is_some() {
             lookup.ipv4_only = true;
-            return Ok(None);
+            return self.lookup(lookup, now);
         }
-        Err(failure)
+        self.fall_back(lookup, failure, now)
+    }
+
+    /// After the network's DNS gave `lookup` no address (`failure`), its
+    /// query to the public resolvers, noted; or, once they were asked or may
+    /// not be, the lookup's error.
+    fn fall_back(
+        &mut self,
+        lookup: &mut Lookup,
+        failure: String,
+        now: u64,
+    ) -> Result<Option<IpAddress>, NetError> {
+        if let Some(network) = &lookup.fallback {
+            return Err(NetError::Dns(alloc::format!(
+                "{}: {network}; public resolvers: {failure}",
+                lookup.name
+            )));
+        }
+        let servers = self.fallback_servers();
+        if servers.is_empty() {
+            return Err(NetError::Dns(match self.fixed_dns {
+                // The text a photo of an install that found no server shows.
+                None if self.dns_servers.is_empty() => failure,
+                _ => alloc::format!("{}: {failure}", lookup.name),
+            }));
+        }
+        let list: Vec<String> = servers
+            .iter()
+            .map(alloc::string::ToString::to_string)
+            .collect();
+        let line = alloc::format!(
+            "DNS {}: {failure}; asking the public resolvers {} instead (no --dns is set)",
+            lookup.name,
+            list.join(", ")
+        );
+        self.note(line);
+        lookup.fallback = Some(failure);
+        lookup.asked = 0;
+        self.lookup(lookup, now)
+    }
+
+    /// Why `lookup`'s `kind` query to `servers` gave no address, from the
+    /// replies seen since it started: none, so the servers are silent or
+    /// unreachable; one that was an error or held no address, by its code;
+    /// or one from an address that was not asked, which the resolver drops.
+    /// A photo then tells a dead DNS proxy from one that refused the name.
+    fn dns_failure(
+        &self,
+        lookup: &Lookup,
+        kind: DnsQueryType,
+        servers: &[IpAddress],
+        now: u64,
+    ) -> String {
+        let asked: Vec<String> = servers
+            .iter()
+            .map(alloc::string::ToString::to_string)
+            .collect();
+        let asked = asked.join(", ");
+        let record = if kind == DnsQueryType::Aaaa {
+            "AAAA"
+        } else {
+            "A"
+        };
+        let seconds = now.saturating_sub(lookup.since) / 1_000_000;
+        match self
+            .phy
+            .answers
+            .last(&lookup.name, answers::kind(kind), lookup.since)
+        {
+            Some(answer) if servers.contains(&answer.source) => alloc::format!(
+                "{} answered {} with {} answer records and no {record} address",
+                answer.source,
+                answers::rcode(answer.rcode),
+                answer.records
+            ),
+            Some(answer) => alloc::format!(
+                "no reply from {asked} in {seconds} s to the {record} query; one came from {}, \
+                 which was not asked, and was dropped",
+                answer.source
+            ),
+            None if now.saturating_sub(lookup.since) < 1_000_000 => alloc::format!(
+                "the {record} query to {asked} could not be sent (no source address for it)"
+            ),
+            None => alloc::format!("no reply from {asked} in {seconds} s to the {record} query"),
+        }
     }
 
     /// Opens a transfer to `host` (`name` or `name:port`, port 80 by
@@ -821,6 +995,8 @@ impl<L: Link, C: Clock> Stack<L, C> {
                 query: None,
                 asked: 0,
                 ipv4_only: false,
+                fallback: None,
+                since: 0,
                 deadline: 0,
             }),
             request,
@@ -984,9 +1160,14 @@ impl<L: Link, C: Clock> Stack<L, C> {
     pub fn describe(&mut self, transfer: &Transfer) -> String {
         match &transfer.endpoint {
             Endpoint::Resolving(lookup) => alloc::format!(
-                "dns asked={} of {} servers",
+                "dns asked={} of {} {}servers",
                 lookup.asked,
-                self.dns_servers.len()
+                self.lookup_servers(lookup).0.len(),
+                if lookup.fallback.is_some() {
+                    "public fallback "
+                } else {
+                    ""
+                }
             ),
             Endpoint::Connected(socket) => {
                 let last = match (transfer.last_at, self.now()) {
@@ -1030,10 +1211,14 @@ impl<L: Link, C: Clock> Stack<L, C> {
             }
             Endpoint::Resolving(Lookup {
                 query: Some((query, _)),
+                fallback,
                 ..
             }) => self
                 .sockets
-                .get_mut::<dns::Socket>(self.dns)
+                .get_mut::<dns::Socket>(match fallback {
+                    Some(_) => self.fallback_dns,
+                    None => self.dns,
+                })
                 .cancel_query(query),
             Endpoint::Resolving(_) => {}
         }

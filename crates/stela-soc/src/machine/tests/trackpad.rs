@@ -144,6 +144,27 @@ fn report(t: &mut Trackpad) -> Option<Vec<u8>> {
     }
 }
 
+/// A guest network whose host adapter has no usable station address yet
+/// (an Intel Wi-Fi chip before its firmware read it, all zeros) places no
+/// USB Ethernet adapter and the board is still placed, where 0.6.1 stopped
+/// the boot; a usable address places one.
+#[test]
+fn a_network_address_that_is_not_unicast_places_no_usb_ethernet() {
+    for unusable in [Mac([0; 6]), Mac([1, 0, 0x5e, 0, 0, 1])] {
+        let mut d = cabled(UsbCables {
+            network: Some(unusable),
+            ..UsbCables::default()
+        });
+        assert!(d.usb_network().is_err());
+        assert!(d.network_deliver(&[0; 60]).is_err());
+    }
+    let mut d = cabled(UsbCables {
+        network: Some(Mac([2, 0, 0, 0, 0, 1])),
+        ..UsbCables::default()
+    });
+    assert!(d.usb_network().is_ok());
+}
+
 #[test]
 fn touch_routes_to_trackpad() {
     let mut d = cabled(UsbCables {

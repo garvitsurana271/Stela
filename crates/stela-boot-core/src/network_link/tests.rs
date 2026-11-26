@@ -302,3 +302,51 @@ fn a_wired_link_counts_once_it_held() {
     // A clock read before the start counts as no time held.
     assert!(!steady(Some(5_000), 1_000, 1));
 }
+
+/// An adapter without a usable station address is passed over, keeping the
+/// order the guest's choice follows; none at all when no adapter has one.
+#[test]
+fn the_guest_adapter_is_one_with_a_usable_station_address() {
+    // A laptop's I219 with no cable and an AX200 whose firmware has not
+    // named its address: the I219, where 0.6.1 took the AX200 and stopped.
+    let (carriers, wireless) = ([false, false], [false, true]);
+    assert_eq!(guest_adapter(&carriers, &wireless, true), 1);
+    assert_eq!(
+        usable_guest_adapter(&carriers, &wireless, &[true, false], true),
+        Some(0)
+    );
+    // With its address the Wi-Fi chip is taken, as before.
+    assert_eq!(
+        usable_guest_adapter(&carriers, &wireless, &[true, true], true),
+        Some(1)
+    );
+    assert_eq!(
+        usable_guest_adapter(&carriers, &wireless, &[true, true], false),
+        Some(0)
+    );
+    // A carrier still comes first among the usable, and the indices are
+    // the adapters' own.
+    assert_eq!(
+        usable_guest_adapter(
+            &[true, false, true],
+            &[false; 3],
+            &[false, true, true],
+            false
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        usable_guest_adapter(
+            &[false, false, false],
+            &[false, true, true],
+            &[true, false, true],
+            true
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        usable_guest_adapter(&carriers, &wireless, &[false, false], true),
+        None
+    );
+    assert_eq!(usable_guest_adapter(&[], &[], &[], true), None);
+}

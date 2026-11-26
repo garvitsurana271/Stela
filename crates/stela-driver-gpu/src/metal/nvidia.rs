@@ -131,6 +131,7 @@ pub const DRIVER: super::native::Driver = {
         ) -> vk::Result;
         fn stela_nvk_forget_failures(queue: vk::Queue) -> u32;
         fn stela_nvk_count_failures(queue: vk::Queue, outstanding: *mut u32);
+        fn stela_nvk_place_in_system_memory();
     }
     Driver {
         get_instance_proc_addr: vk_icdGetInstanceProcAddr,
@@ -144,6 +145,9 @@ pub const DRIVER: super::native::Driver = {
             count: stela_nvk_count_failures,
         }),
         keep_lost: false,
+        // `NVK_DEBUG=gart` for the instances created after it
+        // (`compat/libc/libc.c`).
+        system_memory: Some(stela_nvk_place_in_system_memory),
     }
 };
 

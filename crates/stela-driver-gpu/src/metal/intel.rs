@@ -134,6 +134,7 @@ pub const DRIVER: super::native::Driver = {
         submit_thread: None,
         refusals: None,
         keep_lost: false,
+        system_memory: None,
     }
 };
 

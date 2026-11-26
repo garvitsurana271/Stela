@@ -94,6 +94,8 @@ pub struct Loader {
     /// driver's recovery from the hang, which may never end. Its open waits
     /// for a first submission before the device is served.
     pub keep_lost: bool,
+    /// [`Driver::system_memory`].
+    pub system_memory: Option<unsafe extern "C" fn()>,
     /// Waits a moment, as the platform's waits do: a call outside the
     /// service's turn may wait for the boot processor.
     pub relax: fn(),
@@ -117,6 +119,13 @@ pub struct Driver {
     pub refusals: Option<Refusals>,
     /// [`Loader::keep_lost`].
     pub keep_lost: bool,
+    /// Has the driver keep every allocation of the devices it creates from
+    /// then on in system memory, which the GPU reaches as it reaches its
+    /// command buffers, for a GPU that does not see what the CPU writes
+    /// through a mapping of its own memory
+    /// ([`crate::metal::mapped_memory`]). `None` for a driver without
+    /// such a placement.
+    pub system_memory: Option<unsafe extern "C" fn()>,
 }
 
 impl Driver {
@@ -128,6 +137,7 @@ impl Driver {
             submit_thread: self.submit_thread,
             refusals: self.refusals,
             keep_lost: self.keep_lost,
+            system_memory: self.system_memory,
             relax,
         }
     }

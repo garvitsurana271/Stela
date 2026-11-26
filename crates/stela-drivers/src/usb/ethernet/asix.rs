@@ -81,6 +81,9 @@ pub(super) struct Chip<C> {
     status: Option<u16>,
     pub(super) general_status: u8,
     pub(super) phy_id: u32,
+    /// The PHY-specific status register as the last carrier check read it,
+    /// for the link's state line.
+    pub(super) last_phy: Option<u16>,
 }
 
 impl<C: Control> Chip<C> {
@@ -175,6 +178,7 @@ impl<C: Control> Chip<C> {
             status: None,
             general_status: 0,
             phy_id: 0,
+            last_phy: None,
         };
         chip.mac_write(AX_PHYPWR_RSTCTL, 2, 0).await?;
         chip.mac_write(AX_PHYPWR_RSTCTL, 2, AX_PHYPWR_RSTCTL_IPRL)
@@ -262,6 +266,7 @@ impl<C: Control> Chip<C> {
             return Err(BlockError::Unsupported("ASIX chip is not initialized"));
         }
         let phy = self.phy_read(GMII_PHY_PHYSR).await?;
+        self.last_phy = Some(phy);
         if phy & GMII_PHY_PHYSR_LINK == 0 {
             return Ok(false);
         }
@@ -321,6 +326,14 @@ impl<C: Control> Chip<C> {
         self.mac_write(AX_MEDIUM_STATUS_MODE, 2, mode).await?;
         self.status = Some(selected);
         Ok(true)
+    }
+    /// Receive for and send from `mac`, as Linux's ax88179_set_mac_addr
+    /// writes it: the node ID the attach wrote with the chip's own address.
+    pub(super) async fn set_station(&mut self, mac: Mac) -> Result<(), BlockError> {
+        if !self.initialized {
+            return Err(BlockError::Unsupported("ASIX chip is not initialized"));
+        }
+        self.write(AX_ACCESS_MAC, AX_NODE_ID, 6, &mac.0).await
     }
     pub(super) async fn stop(&mut self) -> Result<(), BlockError> {
         self.status = None;
@@ -387,6 +400,25 @@ impl<C: Control> Device<C> {
         match self {
             Self::Modern(c) => c.carrier().await,
             Self::Legacy(c) => c.carrier().await,
+        }
+    }
+    /// Whether [`Self::set_station`] works: the AX88179/178A's node ID.
+    pub(super) fn sets_station(&self) -> bool {
+        matches!(self, Self::Modern(_))
+    }
+    pub(super) async fn set_station(&mut self, mac: Mac) -> Result<(), BlockError> {
+        match self {
+            Self::Modern(c) => c.set_station(mac).await,
+            Self::Legacy(_) => Err(BlockError::Unsupported(
+                "AX88772 station address change not implemented",
+            )),
+        }
+    }
+    /// The PHY status the last carrier check read, where the chip keeps it.
+    pub(super) fn last_phy(&self) -> Option<u16> {
+        match self {
+            Self::Modern(c) => c.last_phy,
+            Self::Legacy(_) => None,
         }
     }
     pub(super) async fn link_down(&mut self) -> Result<(), BlockError> {

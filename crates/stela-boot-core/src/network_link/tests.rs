@@ -257,3 +257,48 @@ fn the_guest_takes_the_configured_wifi_over_an_empty_ethernet_port() {
     // Wi-Fi alone: itself.
     assert_eq!(guest_adapter(&[false], &[true], true), 0);
 }
+
+/// macOS's network leaves a host adapter without carrier for a spare that
+/// has one, once the first has been down for a while and the spare's link
+/// has held: a cable in a USB adapter whose PHY was still negotiating when
+/// the guest chose the empty built-in port is followed.
+#[test]
+fn the_guest_moves_to_a_spare_whose_link_held_once_its_own_is_gone() {
+    // Its own link up: no move, whatever the spares say.
+    assert_eq!(guest_switch(10_000, None, &[Some(0)]), None);
+    // Down for less than the wait: no move yet.
+    assert_eq!(
+        guest_switch(10_000, Some(10_000 - SWITCH_AFTER_MS + 1), &[Some(0)]),
+        None
+    );
+    // Down for the wait, the spare up long enough: the spare.
+    assert_eq!(
+        guest_switch(10_000, Some(10_000 - SWITCH_AFTER_MS), &[Some(0)]),
+        Some(0)
+    );
+    // A spare that only just came up (a blinking port) is passed over for a
+    // later one whose link held.
+    assert_eq!(
+        guest_switch(10_000, Some(0), &[Some(9_900), None, Some(8_000)]),
+        Some(2)
+    );
+    // No spare with a held link: none.
+    assert_eq!(guest_switch(10_000, Some(0), &[None, Some(9_999)]), None);
+    assert_eq!(guest_switch(10_000, Some(0), &[]), None);
+}
+
+/// A wired link is recorded for the next boot's menu only once it held: the
+/// 107 ms and 410 ms links of a 0.6.0 IdeaPad log are not a wired network.
+#[test]
+fn a_wired_link_counts_once_it_held() {
+    assert!(!steady(None, 50_000, WIRED_STEADY_MS));
+    assert!(!steady(Some(1_000), 1_107, WIRED_STEADY_MS));
+    assert!(!steady(Some(1_000), 1_410, WIRED_STEADY_MS));
+    assert!(steady(
+        Some(1_000),
+        1_000 + WIRED_STEADY_MS,
+        WIRED_STEADY_MS
+    ));
+    // A clock read before the start counts as no time held.
+    assert!(!steady(Some(5_000), 1_000, 1));
+}

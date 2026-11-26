@@ -3630,7 +3630,9 @@ fn start_devices(
             // The guest's adapter is its own, one the mount's client left.
             // Without one the Mac boots with no network, which is reported
             // at once and then once a minute with what the host's adapters
-            // were. Adapters left over are stopped with `links`.
+            // were. The guest keeps the wired adapters left that can take
+            // its station address as spares; the rest are stopped with
+            // `links`.
             let mut adapters: Vec<String> = network_account
                 .iter()
                 .map(|line| network::adapter_account(line, "not started"))

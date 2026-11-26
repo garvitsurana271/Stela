@@ -467,8 +467,25 @@ impl Link for Adapter {
     fn diagnostic(&mut self) -> Option<String> {
         match self {
             Self::Realtek(device) => device.diagnostic(),
+            Self::UsbVendor(device) => device.diagnostic(),
             Self::Rtw89Wifi(device) => device.diagnostic(),
             _ => None,
+        }
+    }
+    /// The wired adapters whose drivers write their station address: the
+    /// RTL8168 family's and the AX88179/178A's.
+    fn adopts_station(&self) -> bool {
+        match self {
+            Self::Realtek(device) => device.adopts_station(),
+            Self::UsbVendor(device) => device.adopts_station(),
+            _ => false,
+        }
+    }
+    fn adopt_station(&mut self, mac: Mac) -> bool {
+        match self {
+            Self::Realtek(device) => device.adopt_station(mac),
+            Self::UsbVendor(device) => device.adopt_station(mac),
+            _ => false,
         }
     }
     /// A Wi-Fi radio's connection keeper's slowest step, for a host

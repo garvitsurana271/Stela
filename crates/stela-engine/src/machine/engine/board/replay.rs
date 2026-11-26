@@ -217,7 +217,7 @@ fn drive(guest: Guest, mut run: impl FnMut(usize, &mut u64, bool, bool)) {
                 runs.push(2 * members[at] + usize::from(slide));
             }
             for _ in 0..guest.new / TICKS as usize {
-                runs.push(2 * fresh | ONCE);
+                runs.push((2 * fresh) | ONCE);
                 fresh += 1;
             }
             // Shuffle: the guest's runs interleave.

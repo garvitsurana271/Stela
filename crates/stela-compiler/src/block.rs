@@ -5,6 +5,8 @@
 //! SVC and BRK exit at a synchronous-trap boundary. PAC instructions call a
 //! runtime helper when software PAuth is enabled.
 
+// fingerprint: not a translation input: ahead-of-time units are not yet stored
+pub mod aot;
 mod analysis;
 mod features;
 mod host_gprs;

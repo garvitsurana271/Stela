@@ -3,6 +3,8 @@ use crate::x86_64::asm::{Alu, Asm, Code, Cond, Gpr, Mem, Size};
 use alloc::vec;
 use alloc::vec::Vec;
 pub(crate) mod checked_memory;
+// fingerprint: not a translation input: ahead-of-time units are not yet stored
+pub(crate) mod aot;
 mod edges;
 mod recovery;
 pub(crate) use super::region::ResidentLoopPlan;

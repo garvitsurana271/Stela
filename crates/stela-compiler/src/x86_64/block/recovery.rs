@@ -32,6 +32,18 @@ pub(super) fn bind(
     // Their frame commits do not prove a complete Before state. Missing
     // internal intervals terminate as host faults without architectural writes.
     for marker in code.sites() {
+        // The source map is emitted in host-offset order. A deferred
+        // check already carries its source index; other sites belong to
+        // the last guest instruction that started at or before the site.
+        let mapped = marker.source.or_else(|| {
+            source_map
+                .partition_point(|(_, at)| *at <= marker.start)
+                .checked_sub(1)
+        });
+        // NZCV, where the site is in a flag window.
+        let flags = mapped
+            .and_then(|row| code.nzcv_window(row))
+            .map(RecoveryBinding::flags);
         let mut matched = false;
         for row in rows
             .iter()
@@ -47,23 +59,18 @@ pub(super) fn bind(
                 "regions keep no pinned locals or vector homes"
             );
             matched = true;
+            let mut bindings = row.bindings.clone();
+            bindings.extend(flags);
             output.push(FaultRecovery {
                 start: marker.start,
                 end: marker.end,
                 site: marker.site,
+                bindings,
                 ..row.clone()
             });
         }
         if !matched {
-            // The source map is emitted in host-offset order. A deferred
-            // check already carries its source index; other sites belong to
-            // the last guest instruction that started at or before the site.
-            let mapped = marker.source.unwrap_or_else(|| {
-                source_map
-                    .partition_point(|(_, at)| *at <= marker.start)
-                    .checked_sub(1)
-                    .expect("guest operand has source map")
-            });
+            let mapped = mapped.expect("guest operand has source map");
             let pc = source_map[mapped].0;
             // Each decoded instruction contributes exactly one source row,
             // and the terminal (if any) follows the ordinary prefix.
@@ -97,6 +104,8 @@ pub(super) fn bind(
                             .flatten()
                             .map(|(vector, host)| RecoveryBinding::vector(vector, host)),
                     )
+                    // And NZCV in a flag window.
+                    .chain(flags)
                     .collect(),
                 retirement: RetirementPoint::before(
                     pc,

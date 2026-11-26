@@ -613,12 +613,25 @@ fn emit_selected(
             .filter_map(|(at, to)| Some((at, (*to)?)))
             .collect::<Vec<_>>()
     });
+    // Accesses that address memory from an earlier access's masked address
+    // (`masked_base`), which the instructions emitted alone keep track of.
+    let reuse_bases = pinned
+        && checks.guest_range
+        && checks.every_access_masked
+        && !checks.translated
+        && !checks.strips();
+    // Where those keep none, a run's locals may take the slots across its
+    // accesses (`pinned::Span`).
+    let span_hosts = super::pinned::Hosts {
+        slots_free: !reuse_bases,
+        target,
+    };
     let joins = match self_loop {
         _ if region_joins.is_some() => region_joins.unwrap_or_default(),
         Some(self_loop)
             if self_loop.joins
                 && (!(pinned && !code.constant_time() && !checks.translated)
-                    || super::pinned::Span::plan_loop(instructions).is_some()) =>
+                    || super::pinned::Span::plan_loop(instructions, span_hosts).is_some()) =>
         {
             loop_joins(instructions)
         }
@@ -708,14 +721,15 @@ fn emit_selected(
     // the terminal, each stores the word and jumps on to its exit.
     // With a region, also those that settle L first ([`edges::settle`]).
     // And a run's locals over the whole region, which they store.
-    let mut flag_exits: Vec<(usize, Option<bool>, bool, super::pinned::Dirty)> = vec![];
-    // Accesses that address memory from an earlier access's masked address
-    // (`masked_base`), which the instructions emitted alone keep track of.
-    let reuse_bases = pinned
-        && checks.guest_range
-        && checks.every_access_masked
-        && !checks.translated
-        && !checks.strips();
+    // In a flag window, the setter whose NZCV the path recomputes and stores.
+    #[allow(clippy::type_complexity)]
+    let mut flag_exits: Vec<(
+        usize,
+        Option<bool>,
+        bool,
+        super::pinned::Dirty,
+        Option<crate::block::FlagSetter>,
+    )> = vec![];
     let mut bases = super::masked_base::Tracker::default();
     let mut emitted_alone = true;
     // The out-of-line paths of the PAC instructions completed inline.
@@ -749,6 +763,27 @@ fn emit_selected(
     // the body, so every fault, exit and frame-bound emitter finds it.
     let lazy_flags = pinned && !code.constant_time();
     let mut pending: Option<bool> = None;
+    // The row of the setter whose NZCV `pending` holds.
+    let mut pending_row: Option<usize> = None;
+    // Where a setter's NZCV may stay unstored up to the next definer, its
+    // faults recomputing it (`flag_window`): outside self-loops, whose two
+    // copies share their rows' recovery.
+    let windows = lazy_flags && self_loop.is_none() && !checks.translated && !optimize_regions;
+    let window_from = |setter: usize, from: usize| -> Option<(usize, crate::block::FlagSetter)> {
+        if !windows || from >= instructions.len() || landing[from] {
+            return None;
+        }
+        let (flags, reads) = super::flag_window::setter(&instructions[setter].operation)?;
+        let end = super::flag_window::end(instructions, setter, from, reads, landing, |at| {
+            joins.iter().any(|&(join, _)| join == at)
+                || region
+                    .as_ref()
+                    .is_some_and(|region| region.handles(instructions, at))
+        })?;
+        Some((end, flags))
+    };
+    // The flag window being emitted: the row it ends at and its setter.
+    let mut open_window: Option<(usize, crate::block::FlagSetter)> = None;
     // Where a region's rows that edges land at start, and what its edges
     // leave to bind ([`edges::Pending`]).
     let mut region_landings: Vec<Option<usize>> =
@@ -759,19 +794,24 @@ fn emit_selected(
         Some(region) => region.nzcv_dead(instructions, row),
         None => super::flag_word::dead_from(instructions, row),
     };
-    if region.is_some()
+    // The locals a run over the whole region may have written before each
+    // row, along any of its paths (`edges::Region::written_before`).
+    let mut region_written: Option<Vec<u32>> = None;
+    if let Some(region) = &region
         && runs
-        && let Some(plan) = super::pinned::Span::plan_loop(instructions)
+        && let Some(plan) = super::pinned::Span::plan_loop(instructions, span_hosts)
     {
         // One run covers the region: its locals stay in their hosts across
-        // every edge, and the exits store them. Each counts as written from
-        // the start, so a fault on any path recovers it from its host,
-        // which holds its value from the entry on.
+        // every edge, and the exits store them. The entry loads each, so a
+        // host holds its local's value from the entry on: a fault or an exit
+        // at a row recovers or stores those some path to it writes.
         if plan.takes_slots() {
             bases.reset();
         }
         let mut active = plan.enter_all(code);
-        active.emitted(code, instructions);
+        let written = region.written_before(instructions, super::pinned::run_writes);
+        active.set_written(code, written[0]);
+        region_written = Some(written);
         run = Some((active, usize::MAX));
         next_pinned_span = usize::MAX;
         loop_run = true;
@@ -783,7 +823,7 @@ fn emit_selected(
         if copy == 0
             && self_loop.is_some()
             && runs
-            && let Some(plan) = super::pinned::Span::plan_loop(instructions)
+            && let Some(plan) = super::pinned::Span::plan_loop(instructions, span_hosts)
         {
             // One run covers the body: its locals stay in their hosts across
             // the back edges, and the exits store them.
@@ -813,6 +853,9 @@ fn emit_selected(
         // A region keeps its own landings (`region_landings`).
         loop_exits.landings[copy] = vec![None; instructions.len() + 1];
         while cursor < instructions.len() {
+            if open_window.is_some_and(|(end, _)| cursor >= end) {
+                open_window = None;
+            }
             if let Some(borrow) = pending
                 && (landing[cursor]
                     || (region.is_none() && joins.iter().any(|&(at, _)| at == cursor))
@@ -820,8 +863,18 @@ fn emit_selected(
             {
                 pending = None;
                 if !dead_from(cursor) {
-                    super::flag_word::capture(code, borrow);
-                    after.rax = super::Rax::Nzcv;
+                    if let Some((end, setter)) =
+                        pending_row.and_then(|row| window_from(row, cursor))
+                    {
+                        // The next definer is at `end`: the rows before it
+                        // recompute NZCV where they fault.
+                        let row = block.source_map.len();
+                        code.add_nzcv_window(row..row + (end - cursor), setter);
+                        open_window = Some((end, setter));
+                    } else {
+                        super::flag_word::capture(code, borrow);
+                        after.rax = super::Rax::Nzcv;
+                    }
                 }
             }
             if vectors {
@@ -880,6 +933,9 @@ fn emit_selected(
             if let Some((active, end)) = run.as_mut() {
                 active.emitted(code, &instructions[run_emitted..cursor]);
                 run_emitted = cursor;
+                if let Some(written) = &region_written {
+                    active.set_written(code, written[cursor]);
+                }
                 if cursor >= *end
                     && let Some((active, _)) = run.take()
                 {
@@ -900,7 +956,7 @@ fn emit_selected(
                 && region.landing[cursor]
                 && let Some(last) = region.inner_loop(cursor)
                 && let body = &instructions[cursor..(last + 1).min(instructions.len())]
-                && let Some(plan) = super::pinned::Span::plan_loop(body)
+                && let Some(plan) = super::pinned::Span::plan_loop(body, span_hosts)
             {
                 if plan.takes_slots() {
                     bases.reset();
@@ -933,7 +989,7 @@ fn emit_selected(
             });
             let window = &instructions[cursor..group_end];
             if runs && run.is_none() && cursor >= next_pinned_span {
-                let (count, plan) = super::pinned::Span::plan(window);
+                let (count, plan) = super::pinned::Span::plan(window, span_hosts);
                 next_pinned_span = cursor + count.max(1);
                 if let Some(plan) = plan {
                     // Its locals overwrite the slots' kept addresses.
@@ -948,7 +1004,13 @@ fn emit_selected(
                     run_emitted = cursor;
                 }
             }
-            if fuse_simd && let Some(group) = super::simd::sha256::HashGroup::recognize(window) {
+            // A vector group inside a run ends with it: the run admits the
+            // rows it holds, not those after its end.
+            let fused = match &run {
+                Some((_, end)) if *end < group_end => &instructions[cursor..*end],
+                _ => window,
+            };
+            if fuse_simd && let Some(group) = super::simd::sha256::HashGroup::recognize(fused) {
                 let (offsets, count, result) = group.emit(code, target);
                 block.source_map.extend(
                     instructions[cursor..cursor + count]
@@ -968,7 +1030,7 @@ fn emit_selected(
                 )
             {
                 if fuse_vaes_rounds
-                    && super::simd::aes::packed_rounds::emit(code, &mut block.source_map, window)
+                    && super::simd::aes::packed_rounds::emit(code, &mut block.source_map, fused)
                         .is_some()
                 {
                     cursor += 4;
@@ -978,7 +1040,7 @@ fn emit_selected(
                     && let Some(result) = super::simd::aes::emit_round_pair(
                         code,
                         &mut block.source_map,
-                        window,
+                        fused,
                         target,
                     )
                 {
@@ -1387,8 +1449,14 @@ fn emit_selected(
                 } else {
                     // A region's exit after a landing settles L first.
                     let settles = region.as_ref().is_some_and(|region| region.dirty(cursor));
-                    if pending.is_some() || settles || dirty.iter().any(Option::is_some) {
-                        flag_exits.push((side_exits.len(), pending, settles, dirty));
+                    // In a flag window, the taken path recomputes the word.
+                    let recompute = open_window.map(|(_, setter)| setter);
+                    if pending.is_some()
+                        || settles
+                        || dirty.iter().any(Option::is_some)
+                        || recompute.is_some()
+                    {
+                        flag_exits.push((side_exits.len(), pending, settles, dirty, recompute));
                     }
                     side_exits.push((jump, target, block.source_map.len()));
                 }
@@ -1471,23 +1539,42 @@ fn emit_selected(
                     live_nzcv: native_branch_after(cursor),
                     defer_flags: lazy_flags
                         && !frame_bound
-                        && deferral_pays(instructions, cursor, landing, &joins),
+                        && (deferral_pays(instructions, cursor, landing, &joins)
+                            // Or a window takes the word past the readers.
+                            || window_from(
+                                cursor,
+                                after_readers(instructions, cursor, landing, &joins),
+                            )
+                            .is_some()),
                 },
                 held,
                 &mut pending,
             );
+            if pending.is_some() && sets_flags_alone(&instruction.operation) {
+                pending_row = Some(cursor);
+            }
             if frame_bound {
                 super::pinned::reload(code);
                 code.set_pinned(true);
             } else if after.rax == super::Rax::Nzcv
-                && dead_from(cursor + 1)
                 && let Some(start) = block.source_map.last().map(|&(_, start)| start)
                 && let Some(tail) = super::flag_word::captured_tail(code, start)
+                && let Some(opened) = if dead_from(cursor + 1) {
+                    Some(None)
+                } else {
+                    window_from(cursor, cursor + 1).map(Some)
+                }
             {
                 // The next flag setter defines NZCV again before anything reads
-                // it or the frame must hold it: this capture is dead.
+                // it or the frame must hold it: this capture is dead, or its
+                // window's faults recompute it.
                 super::flag_word::drop_capture(code, tail);
                 after.rax = super::Rax::Unknown;
+                if let Some((end, setter)) = opened {
+                    let row = block.source_map.len();
+                    code.add_nzcv_window(row..row + (end - cursor - 1), setter);
+                    open_window = Some((end, setter));
+                }
             }
             let applied = code.finish_base_request();
             bases.after(instruction, applied);
@@ -1512,6 +1599,13 @@ fn emit_selected(
             if let Some((active, _)) = run.as_mut() {
                 active.emitted(code, &instructions[run_emitted..]);
                 run_emitted = instructions.len();
+                // The terminal's row, where the region has one.
+                if let Some(&written) = region_written
+                    .as_ref()
+                    .and_then(|written| written.get(instructions.len()))
+                {
+                    active.set_written(code, written);
+                }
                 loop_exits.dirty = active.dirty();
             }
         } else if let Some((mut active, _)) = run.take() {
@@ -1686,12 +1780,15 @@ fn emit_selected(
         || !flag_exits.is_empty()
     {
         let over = code.asm().jmp();
-        for (index, borrow, settles, dirty) in flag_exits.drain(..) {
+        for (index, borrow, settles, dirty, recompute) in flag_exits.drain(..) {
             code.asm().bind(side_exits[index].0);
             if let Some(borrow) = borrow {
                 super::flag_word::capture(code, borrow);
             }
             super::pinned::write_back_locals(code, dirty);
+            if let Some(setter) = recompute {
+                super::flag_window::recompute(code, setter);
+            }
             if settles {
                 edges::settle(&mut code.asm(), 0);
             }
@@ -2137,6 +2234,25 @@ fn sets_flags_alone(operation: &Operation) -> bool {
 /// instruction, landing or join, is a side exit, or the word is dead there
 /// ([`super::flag_word::dead_from`]). Otherwise the fallthrough stores the
 /// word there anyway, and each side exit would store it a second time.
+/// The first instruction after the readers of the NZCV `instructions[at]`
+/// sets ([`reads_host_flags`]), a landing or a join.
+fn after_readers(
+    instructions: &[Instruction],
+    at: usize,
+    landing: &[bool],
+    joins: &[(usize, usize)],
+) -> usize {
+    let mut next = at + 1;
+    while next < instructions.len()
+        && !landing[next]
+        && !joins.iter().any(|&(join, _)| join == next)
+        && reads_host_flags(&instructions[next].operation)
+    {
+        next += 1;
+    }
+    next
+}
+
 fn deferral_pays(
     instructions: &[Instruction],
     at: usize,
@@ -3015,6 +3131,8 @@ fn branch_condition_with(
 
 #[cfg(test)]
 mod flag_cost_tests;
+#[cfg(test)]
+mod flag_window_tests;
 #[cfg(test)]
 mod host_cost;
 #[cfg(test)]

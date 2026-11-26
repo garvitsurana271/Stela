@@ -384,3 +384,131 @@ fn absent_recovery_does_not_authorize_guest_fault_projection() {
         RecoverySiteKind::NativeInternal
     );
 }
+
+/// A flag setter's NZCV, recomputed from the registers it read, matches the
+/// Arm arithmetic in both widths and both forms, and its binding survives
+/// packing.
+#[test]
+fn flag_setters_recompute_nzcv_and_pack() {
+    let state = |values: [u64; 3]| {
+        let mut state = GuestState::default();
+        state.x[..3].copy_from_slice(&values);
+        state
+    };
+    let nzcv = |n: bool, z: bool, c: bool, v: bool| {
+        u32::from(n) << 31 | u32::from(z) << 30 | u32::from(c) << 29 | u32::from(v) << 28
+    };
+    let register = |register| FlagOperand::Register {
+        register,
+        shift: 0,
+        amount: 0,
+    };
+    let cases = [
+        // SUBS of x0 and x1 (CMP), 64 bits.
+        (
+            FlagOperation::Subtract,
+            true,
+            false,
+            register(1),
+            [5, 7, 0],
+            nzcv(true, false, false, false),
+        ),
+        (
+            FlagOperation::Subtract,
+            true,
+            false,
+            register(1),
+            [7, 7, 0],
+            nzcv(false, true, true, false),
+        ),
+        (
+            FlagOperation::Subtract,
+            true,
+            false,
+            register(1),
+            [1 << 63, 1, 0],
+            nzcv(false, false, true, true),
+        ),
+        // SUBS w0, w0, #1 from its result: w0 was 0x8000_0000.
+        (
+            FlagOperation::Subtract,
+            false,
+            true,
+            FlagOperand::Immediate(1),
+            [0x7fff_ffff, 0, 0],
+            nzcv(false, false, true, true),
+        ),
+        // ADDS of x0 and x1 wrapping.
+        (
+            FlagOperation::Add,
+            true,
+            false,
+            register(1),
+            [u64::MAX, 1, 0],
+            nzcv(false, true, true, false),
+        ),
+        // ADDS w0, w0, #1 from its result 0: w0 was 0xffff_ffff.
+        (
+            FlagOperation::Add,
+            false,
+            true,
+            FlagOperand::Immediate(1),
+            [0, 0, 0],
+            nzcv(false, true, true, false),
+        ),
+        // TST x0, #1 and ANDS from the result.
+        (
+            FlagOperation::And,
+            true,
+            false,
+            FlagOperand::Immediate(1),
+            [2, 0, 0],
+            nzcv(false, true, false, false),
+        ),
+        (
+            FlagOperation::And,
+            true,
+            true,
+            FlagOperand::Immediate(0),
+            [1 << 63, 0, 0],
+            nzcv(true, false, false, false),
+        ),
+        // BICS x0 & !(x1 LSR 4), 32 bits.
+        (
+            FlagOperation::AndNot,
+            false,
+            false,
+            FlagOperand::Register {
+                register: 1,
+                shift: 1,
+                amount: 4,
+            },
+            [0x8000_0000, 0x10, 0],
+            nzcv(true, false, false, false),
+        ),
+    ];
+    for (operation, x64, from_result, right, values, expected) in cases {
+        let setter = FlagSetter::new(operation, x64, from_result, 0, right).unwrap();
+        assert_eq!(
+            setter.nzcv(&state(values)),
+            Some(expected),
+            "{operation:?} {values:x?}"
+        );
+        let rows = [row(vec![
+            RecoveryBinding::flags(setter),
+            RecoveryBinding::gpr(2, 9),
+        ])];
+        assert_eq!(PackedRecovery::new(&rows).rows(), rows);
+        assert!(RecoveryBinding::flags(setter).is_valid());
+    }
+    assert_eq!(
+        FlagSetter::new(
+            FlagOperation::And,
+            true,
+            false,
+            0,
+            FlagOperand::Immediate(u64::MAX)
+        ),
+        None
+    );
+}

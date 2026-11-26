@@ -3660,7 +3660,8 @@ fn dead_nzcv_captures_are_dropped_in_system_mode() {
         (&[ADDS_X0, ADDS_X1, ADD_X3], 1),
         (&[ADDS_X0, TST_X0, SUBS_X2, ADDS_X1], 1),
         (&[ADDS_X0, CSEL_X7, ADDS_X1], 1),
-        (&[ADDS_X0, LDR_X9, ADDS_X1], 2),
+        // The load's fault recomputes NZCV (`flag_window`).
+        (&[ADDS_X0, LDR_X9, ADDS_X1], 1),
         (&[ADDS_X0], 1),
     ] {
         let instructions: Vec<_> = words

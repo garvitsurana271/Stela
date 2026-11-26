@@ -223,12 +223,20 @@ fn packed_recovery_rows_give_back_the_rows_they_hold() {
             end: usize::from(at) * 300 + 1 + usize::from(at),
             bindings: (0..u8::try_from(at).unwrap() * 3)
                 .map(|guest| RecoveryBinding {
-                    guest,
-                    source: match guest % 2 {
+                    // NZCV's binding is its own guest number.
+                    guest: match guest % 3 {
+                        2 => stela_compiler::block::NZCV_BINDING,
+                        _ => guest,
+                    },
+                    source: match guest % 3 {
                         0 => RecoverySource::HostRegister(guest % 16),
-                        _ => RecoverySource::NativeSpill(
+                        1 => RecoverySource::NativeSpill(
                             SpillOffset::new(8 * u16::from(guest)).unwrap(),
                         ),
+                        // A setter's bits, all 64 of them.
+                        _ => RecoverySource::Flags(stela_compiler::block::FlagSetter::from_bits(
+                            0x8123_4567_89ab_cdef ^ u64::from(guest),
+                        )),
                     },
                 })
                 .collect(),

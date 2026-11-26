@@ -21,7 +21,7 @@ use stela_compiler::block::Features;
 use stela_compiler::{
     GuestAddress, NativeBlock,
     block::{
-        CompiledBlock, ExitKind, RecoveryBinding, RecoverySiteKind, RecoverySource,
+        CompiledBlock, ExitKind, FlagSetter, RecoveryBinding, RecoverySiteKind, RecoverySource,
         RetirementPhase, RetirementPoint, SpillOffset, UnqualifiedFaultRecovery,
     },
     x86_64::chain::DirectExit,
@@ -31,7 +31,7 @@ use stela_crypto::digest::Digest as _;
 
 /// The bytes of the fetch page a record covers: no block leaves it.
 pub const PAGE_BYTES: usize = 4096;
-pub const SCHEMA: u32 = 5;
+pub const SCHEMA: u32 = 6;
 const RECORD_MAGIC: [u8; 8] = *b"STLTPAGE";
 const HEADER_BYTES: usize = 88;
 const TRAILER_BYTES: usize = 32;
@@ -42,7 +42,8 @@ const RELOCATION_BYTES: usize = 4;
 const SOURCE_MAP_BYTES: usize = 6;
 const EXIT_BYTES: usize = 15;
 const RECOVERY_ROW_BYTES: usize = 24;
-const RECOVERY_BINDING_BYTES: usize = 4;
+/// A guest register, its source's kind and an 8-byte value ([`binding_word`]).
+const RECOVERY_BINDING_BYTES: usize = 10;
 /// A relocated field: a little-endian u64 in the native code.
 const FIELD_BYTES: usize = 8;
 /// The bits of a page's address its translations are bound to (the
@@ -104,20 +105,22 @@ pub struct Exit {
 
 /// A recovery binding's source as a kind and a value: the record's and
 /// [`Rows`]' encoding of it.
-fn binding_word(source: RecoverySource) -> (u8, u32) {
+fn binding_word(source: RecoverySource) -> (u8, u64) {
     match source {
-        RecoverySource::HostRegister(host) => (0, u32::from(host)),
-        RecoverySource::NativeSpill(offset) => (1, u32::from(offset.bytes())),
+        RecoverySource::HostRegister(host) => (0, u64::from(host)),
+        RecoverySource::NativeSpill(offset) => (1, u64::from(offset.bytes())),
+        RecoverySource::Flags(setter) => (2, setter.bits()),
     }
 }
 
 /// The source a kind and a value name, if they name one.
-fn binding_of(kind: u8, value: u32) -> Option<RecoverySource> {
+fn binding_of(kind: u8, value: u64) -> Option<RecoverySource> {
     match kind {
         0 => u8::try_from(value).ok().map(RecoverySource::HostRegister),
         1 => SpillOffset::new(u16::try_from(value).ok()?)
             .ok()
             .map(RecoverySource::NativeSpill),
+        2 => Some(RecoverySource::Flags(FlagSetter::from_bits(value))),
         _ => None,
     }
 }
@@ -184,7 +187,7 @@ impl Packed<'_> {
     fn binding(&mut self) -> RecoveryBinding {
         let guest = self.byte();
         let kind = self.byte();
-        let value = self.value() as u32;
+        let value = self.value();
         RecoveryBinding {
             guest,
             source: binding_of(kind, value).expect("written by Rows::push"),
@@ -226,7 +229,7 @@ impl Rows {
             let (kind, value) = binding_word(binding.source);
             out.push(binding.guest);
             out.push(kind);
-            put(out, u64::from(value));
+            put(out, value);
         }
     }
 
@@ -739,7 +742,7 @@ impl Record {
                     out.push(binding.guest);
                     let (kind, value) = binding_word(binding.source);
                     out.push(kind);
-                    out.extend((value as u16).to_le_bytes());
+                    out.extend(value.to_le_bytes());
                 }
             }
             out.extend(&entry.code);
@@ -922,8 +925,8 @@ impl<'a> Reader<'a> {
             for _ in 0..self.count(RECOVERY_BINDING_BYTES)? {
                 let guest = self.u8()?;
                 let kind = self.u8()?;
-                let value = self.u16()?;
-                let source = binding_of(kind, u32::from(value)).ok_or(FormatError::Entry)?;
+                let value = self.u64()?;
+                let source = binding_of(kind, value).ok_or(FormatError::Entry)?;
                 bindings.push(RecoveryBinding { guest, source });
             }
             // Build a structurally valid source-backed shape using an

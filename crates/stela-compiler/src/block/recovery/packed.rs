@@ -3,8 +3,8 @@
 //! they are packed for that: LEB128 deltas in table order, a few bytes per
 //! row against a [`FaultRecovery`] and its binding allocation.
 use super::{
-    FaultRecovery, RecoveryBinding, RecoverySite, RecoverySource, RetirementPhase, RetirementPoint,
-    SpillOffset,
+    FaultRecovery, FlagSetter, NZCV_BINDING, RecoveryBinding, RecoverySite, RecoverySource,
+    RetirementPhase, RetirementPoint, SpillOffset,
 };
 use crate::GuestAddress;
 use alloc::{borrow::Cow, boxed::Box, vec::Vec};
@@ -138,6 +138,8 @@ impl PackedRecovery {
                     match binding.source {
                         RecoverySource::HostRegister(register) => u64::from(register) << 1,
                         RecoverySource::NativeSpill(offset) => u64::from(offset.bytes()) << 1 | 1,
+                        // NZCV's binding alone has one: its bits as they are.
+                        RecoverySource::Flags(setter) => setter.bits(),
                     },
                 );
             }
@@ -235,7 +237,9 @@ impl PackedRecovery {
                 let source = reader.value();
                 RecoveryBinding {
                     guest,
-                    source: if source & 1 == 0 {
+                    source: if guest == NZCV_BINDING {
+                        RecoverySource::Flags(FlagSetter::from_bits(source))
+                    } else if source & 1 == 0 {
                         RecoverySource::HostRegister((source >> 1) as u8)
                     } else {
                         RecoverySource::NativeSpill(

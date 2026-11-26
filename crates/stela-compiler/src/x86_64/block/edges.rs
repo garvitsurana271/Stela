@@ -122,6 +122,43 @@ impl Region {
             .unwrap_or(instructions.len())
     }
 
+    /// For each row, the guest registers some path from the entry writes
+    /// before it, by `writes`, which gives each instruction's: the locals of
+    /// a run over the region whose hosts may differ from their frame slots
+    /// there, which its exits and faults there store and recover.
+    pub(in crate::x86_64) fn written_before(
+        &self,
+        instructions: &[Instruction],
+        writes: impl Fn(&Instruction) -> u32,
+    ) -> Vec<u32> {
+        let mut before = vec![0_u32; self.rows];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for row in 0..self.rows {
+                let (out, successors) = match instructions.get(row) {
+                    Some(instruction) => {
+                        let fallthrough = (!crate::block::region::unconditional(instruction)
+                            && row + 1 < self.rows)
+                            .then_some(row + 1);
+                        (
+                            before[row] | writes(instruction),
+                            [fallthrough, self.internal[row]],
+                        )
+                    }
+                    None => (before[row], [self.terminal, None]),
+                };
+                for next in successors.into_iter().flatten() {
+                    if before[next] | out != before[next] {
+                        before[next] |= out;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        before
+    }
+
     /// Whether NZCV is dead at `row` on every path of the region from it
     /// ([`super::super::flag_word::dead_from`]): each path reaches an
     /// instruction that defines NZCV, through instructions that leave it

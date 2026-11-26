@@ -16,6 +16,8 @@ pub use spills::{HostSpillSnapshot, InvalidSpillOffset, NATIVE_SPILL_WORDS, Spil
 pub enum RecoverySource {
     HostRegister(u8),
     NativeSpill(SpillOffset),
+    /// NZCV, which the setter recomputes ([`NZCV_BINDING`]).
+    Flags(FlagSetter),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryBinding {
@@ -24,6 +26,170 @@ pub struct RecoveryBinding {
 }
 /// The first [`RecoveryBinding::guest`] number of a guest V register.
 pub const VECTOR_BINDING: u8 = 32;
+
+/// [`RecoveryBinding::guest`] of NZCV, which a [`RecoverySource::Flags`]
+/// recomputes.
+pub const NZCV_BINDING: u8 = 64;
+
+/// A flag-setting instruction, which recomputes the NZCV it set from the
+/// guest registers it read: native code that leaves a setter's NZCV
+/// unstored up to the next instruction that defines all four flags binds it
+/// at the faults between, where those registers still hold what the setter
+/// read (`x86_64::block`'s flag windows).
+///
+/// Bits 1:0 the operation (ADDS, SUBS, ANDS, BICS), 2 a 64-bit operation,
+/// 3 whether the left register holds the setter's result rather than its
+/// left operand (an ADDS or SUBS whose destination is its left operand, or
+/// an ANDS or BICS that wrote a register), 9:4 the left register, 10 a
+/// register right operand. That register is in 16:11, its shift in 18:17
+/// and the amount in 24:19; an immediate takes bits 63:11. A register is
+/// 0-30 for X0-X30, 31 for SP and 32 for the zero register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlagSetter(u64);
+
+/// The operation of a [`FlagSetter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagOperation {
+    Add,
+    Subtract,
+    And,
+    AndNot,
+}
+
+/// The right operand of a [`FlagSetter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagOperand {
+    Immediate(u64),
+    /// A register, shifted (0 LSL, 1 LSR, 2 ASR, 3 ROR) by `amount`.
+    Register {
+        register: u8,
+        shift: u8,
+        amount: u8,
+    },
+}
+
+/// The register number a [`FlagSetter`] gives the zero register.
+pub const FLAG_ZERO_REGISTER: u8 = 32;
+const FLAG_IMMEDIATE_BITS: u32 = 53;
+
+impl FlagSetter {
+    /// The setter of `operation` on `left` and `right`, whose `left` holds
+    /// its result where `from_result`; `None` for an operand it cannot hold.
+    pub const fn new(
+        operation: FlagOperation,
+        x64: bool,
+        from_result: bool,
+        left: u8,
+        right: FlagOperand,
+    ) -> Option<Self> {
+        if left > FLAG_ZERO_REGISTER {
+            return None;
+        }
+        let mut bits = operation as u64 | (x64 as u64) << 2 | (from_result as u64) << 3;
+        bits |= (left as u64) << 4;
+        match right {
+            FlagOperand::Immediate(value) => {
+                if value >> FLAG_IMMEDIATE_BITS != 0 {
+                    return None;
+                }
+                bits |= value << 11;
+            }
+            FlagOperand::Register {
+                register,
+                shift,
+                amount,
+            } => {
+                if register > FLAG_ZERO_REGISTER || shift > 3 || amount >= 64 {
+                    return None;
+                }
+                bits |= 1 << 10
+                    | (register as u64) << 11
+                    | (shift as u64) << 17
+                    | (amount as u64) << 19;
+            }
+        }
+        Some(Self(bits))
+    }
+
+    /// The setter whose bits [`Self::bits`] gave.
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    /// The Arm NZCV (bits 31:28) the setter set, from `state`'s registers;
+    /// `None` for bits no setter has.
+    pub fn nzcv(self, state: &crate::GuestState) -> Option<u32> {
+        let bits = self.0;
+        let x64 = bits >> 2 & 1 == 1;
+        let from_result = bits >> 3 & 1 == 1;
+        let size = if x64 { 64 } else { 32 };
+        let mask = if x64 { u64::MAX } else { u64::from(u32::MAX) };
+        let value = |register: u64| match register {
+            0..=30 => Some(state.x[register as usize] & mask),
+            31 => Some(state.sp & mask),
+            32 => Some(0),
+            _ => None,
+        };
+        let left = value(bits >> 4 & 0x3f)?;
+        let right = if bits >> 10 & 1 == 1 {
+            let register = value(bits >> 11 & 0x3f)?;
+            let amount = (bits >> 19 & 0x3f) as u32;
+            if amount >= size {
+                return None;
+            }
+            match bits >> 17 & 3 {
+                0 => register << amount & mask,
+                1 => register >> amount,
+                2 if x64 => ((register as i64) >> amount) as u64,
+                2 => u64::from(((register as u32 as i32) >> amount) as u32),
+                _ if x64 => register.rotate_right(amount),
+                _ => u64::from((register as u32).rotate_right(amount)),
+            }
+        } else {
+            bits >> 11
+        };
+        let (result, carry, overflow) = match bits & 3 {
+            operation @ (0 | 1) => {
+                let subtract = operation == 1;
+                let left = match (from_result, subtract) {
+                    (false, _) => left,
+                    (true, true) => left.wrapping_add(right) & mask,
+                    (true, false) => left.wrapping_sub(right) & mask,
+                };
+                // Arm AddWithCarry, with NOT(right) and a carry in of one
+                // for a subtraction.
+                let addend = if subtract { !right & mask } else { right };
+                let wide = u128::from(left) + u128::from(addend) + u128::from(subtract);
+                let result = wide as u64 & mask;
+                let sign = 1_u64 << (size - 1);
+                (
+                    result,
+                    wide >> size & 1 == 1,
+                    !(left ^ addend) & (left ^ result) & sign != 0,
+                )
+            }
+            operation => {
+                let result = match (from_result, operation) {
+                    (true, _) => left,
+                    (false, 2) => left & right,
+                    (false, _) => left & !right & mask,
+                };
+                (result, false, false)
+            }
+        };
+        let negative = result >> (size - 1) & 1 == 1;
+        Some(
+            u32::from(negative) << 31
+                | u32::from(result == 0) << 30
+                | u32::from(carry) << 29
+                | u32::from(overflow) << 28,
+        )
+    }
+}
 
 impl RecoveryBinding {
     /// Guest V`vector`, whose only current value is host XMM`register`
@@ -41,6 +207,7 @@ impl RecoveryBinding {
             (0..=31, RecoverySource::HostRegister(host)) => host < 32,
             (0..=31, RecoverySource::NativeSpill(_)) => true,
             (32..=63, RecoverySource::HostRegister(host)) => host >= 8 && host < 16,
+            (NZCV_BINDING, RecoverySource::Flags(_)) => true,
             _ => false,
         }
     }
@@ -48,6 +215,13 @@ impl RecoveryBinding {
         Self {
             guest,
             source: RecoverySource::HostRegister(register),
+        }
+    }
+    /// NZCV, which `setter` recomputes.
+    pub const fn flags(setter: FlagSetter) -> Self {
+        Self {
+            guest: NZCV_BINDING,
+            source: RecoverySource::Flags(setter),
         }
     }
     pub const fn spill(guest: u8, offset: SpillOffset) -> Self {
@@ -135,6 +309,7 @@ impl FaultRecovery {
         let mut present = 0u32;
         let mut vectors = [[0; 2]; 32];
         let mut vectors_present = 0u32;
+        let mut flags: Option<FlagSetter> = None;
         for entry in table {
             if entry.start >= entry.end {
                 return Err(FaultRecoveryError::InvalidNativeRange {
@@ -169,6 +344,20 @@ impl FaultRecovery {
                 phase,
             });
             for binding in &entry.bindings {
+                if let RecoverySource::Flags(setter) = binding.source {
+                    if !binding.is_valid() {
+                        return Err(FaultRecoveryError::InvalidGuestRegister {
+                            register: binding.guest,
+                        });
+                    }
+                    if flags.is_some_and(|flags| flags != setter) {
+                        return Err(FaultRecoveryError::ConflictingGuestBinding {
+                            register: binding.guest,
+                        });
+                    }
+                    flags = Some(setter);
+                    continue;
+                }
                 if binding.guest >= VECTOR_BINDING {
                     let vector = binding.guest - VECTOR_BINDING;
                     if !binding.is_valid() {
@@ -212,6 +401,7 @@ impl FaultRecovery {
                         .spills
                         .get(offset)
                         .ok_or(FaultRecoveryError::NativeSpillUnavailable { offset })?,
+                    RecoverySource::Flags(_) => unreachable!("taken above"),
                 };
                 let slot = &mut values[usize::from(binding.guest)];
                 let bit = 1 << binding.guest;
@@ -237,6 +427,13 @@ impl FaultRecovery {
             } else {
                 state.x[guest] = values[guest];
             }
+        }
+        // From the registers as the fault left them, which still hold what
+        // the setter read.
+        if let Some(setter) = flags {
+            state.nzcv = setter
+                .nzcv(state)
+                .ok_or(FaultRecoveryError::InvalidFlagSetter { bits: setter.0 })?;
         }
         Ok(settlement)
     }
@@ -286,6 +483,10 @@ pub enum FaultRecoveryError {
     ConflictingRecoverySite,
     ConflictingGuestBinding {
         register: u8,
+    },
+    /// A flag binding whose bits name no setter.
+    InvalidFlagSetter {
+        bits: u64,
     },
 }
 impl core::fmt::Display for FaultRecoveryError {
@@ -342,6 +543,9 @@ impl core::fmt::Display for FaultRecoveryError {
             }
             Self::ConflictingGuestBinding { register } => {
                 write!(f, "recovery entries disagree on guest register {register}")
+            }
+            Self::InvalidFlagSetter { bits } => {
+                write!(f, "fault recovery names no flag setter in {bits:#x}")
             }
         }
     }

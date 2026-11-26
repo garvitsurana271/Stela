@@ -46,6 +46,9 @@ pub(crate) struct Code {
     /// left there is kept.
     defer_nzcv: bool,
     deferred_nzcv: Option<bool>,
+    /// The rows (source-map indices) whose faults recompute NZCV from a
+    /// setter (`x86_64::flag_window`), the word unstored there.
+    nzcv_windows: Vec<(core::ops::Range<usize>, crate::block::FlagSetter)>,
 }
 
 /// Exact faulting instruction interval, separate from source retirement.
@@ -126,6 +129,7 @@ impl Code {
             vectors: Default::default(),
             defer_nzcv: false,
             deferred_nzcv: None,
+            nzcv_windows: Vec::new(),
         }
     }
     /// Code that keeps [`super::super::pinned`] guest registers in host
@@ -156,6 +160,27 @@ impl Code {
     pub(crate) fn take_deferred_nzcv(&mut self) -> Option<bool> {
         self.defer_nzcv = false;
         self.deferred_nzcv.take()
+    }
+    /// Faults in the instructions at `rows` of the block's source map
+    /// recompute NZCV from `setter`.
+    pub(in crate::x86_64) fn add_nzcv_window(
+        &mut self,
+        rows: core::ops::Range<usize>,
+        setter: crate::block::FlagSetter,
+    ) {
+        debug_assert!(
+            self.nzcv_windows
+                .iter()
+                .all(|(other, _)| other.end <= rows.start || rows.end <= other.start)
+        );
+        self.nzcv_windows.push((rows, setter));
+    }
+    /// The setter faults in the instruction at `row` recompute NZCV from.
+    pub(in crate::x86_64) fn nzcv_window(&self, row: usize) -> Option<crate::block::FlagSetter> {
+        self.nzcv_windows
+            .iter()
+            .find(|(rows, _)| rows.contains(&row))
+            .map(|&(_, setter)| setter)
     }
     /// The instructions from here on have `index` in the block's source map.
     pub(crate) fn set_instruction(&mut self, index: usize) {
@@ -467,6 +492,7 @@ impl Code {
             vectors: Default::default(),
             defer_nzcv: false,
             deferred_nzcv: None,
+            nzcv_windows: Vec::new(),
         };
         self.instructions = at.instructions;
         tail

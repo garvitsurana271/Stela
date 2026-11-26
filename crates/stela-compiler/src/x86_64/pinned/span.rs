@@ -1,6 +1,7 @@
 //! Keep the unpinned guest registers a run of a block's instructions uses
 //! most in scratch registers across that run: ALU rows, general and vector
-//! accesses, prefetches and the conditional branches the block runs past.
+//! accesses, prefetches, the vector computations that reach no general
+//! register and the conditional branches the block runs past.
 //!
 //! The run's first instruction loads the locals it reads before writing them,
 //! and its end stores the ones it wrote, as does each conditional branch it
@@ -13,13 +14,25 @@
 //! would find a pinned register. A run admits only operations whose emitters
 //! do so and that keep their own scratch out of the hosts it maps.
 use super::{LOCAL_HOSTS, LocalRegisters, PINNED};
+use crate::TargetCpu;
 use crate::{
     aarch64::{
         AddressMode, Instruction, MemoryTransfer, Operation, Register, WideMove, bitfield,
-        conditional_select::CompareRight, integer_math, prefetch, simd,
+        conditional_select::CompareRight, integer_math, non_temporal, prefetch, simd,
     },
     x86_64::asm::{Code, Gpr, Mem, Size},
 };
+
+/// What the block around a run leaves its locals.
+#[derive(Clone, Copy)]
+pub(in crate::x86_64) struct Hosts {
+    /// No access keeps a masked address ([`crate::x86_64::masked_base`]),
+    /// so R10 and R11 stay free across a run's accesses.
+    pub slots_free: bool,
+    /// The host, whose features decide which vector computations a run
+    /// admits ([`vector_computation`]).
+    pub target: TargetCpu,
+}
 
 const GPRS: usize = 31;
 const UNPINNED: u32 = {
@@ -219,6 +232,23 @@ fn effects(operation: &Operation) -> Option<Effects> {
             takes_r8: false,
             memory: true,
         },
+        // LDNP and STNP: a pair at a signed offset, which has no writeback.
+        Operation::MemoryNonTemporal(operand) => {
+            let data = match operand.data {
+                non_temporal::Data::Integer(data) => bits(&data),
+                non_temporal::Data::Vector(_) => 0,
+            };
+            Effects {
+                reads: bit(operand.base) | if operand.load { 0 } else { data },
+                writes: if operand.load { data } else { 0 },
+                takes_r8: false,
+                memory: true,
+            }
+        }
+        // A vector computation reaches no general register.
+        Operation::Simd(operand) if vector_computation(&operand).is_some() => {
+            alu(&[], Register::Zero)
+        }
         // A region's branches that do not fall through.
         Operation::BranchCondition { .. } | Operation::Branch { .. } => alu(&[], Register::Zero),
         Operation::BranchZero { source, .. } | Operation::BranchBit { source, .. } => {
@@ -226,6 +256,42 @@ fn effects(operation: &Operation) -> Option<Effects> {
         }
         _ => return None,
     })
+}
+
+/// Whether `operand` is a vector computation a run admits: one that reads
+/// and writes only vectors, whose emitter keeps its general scratch to RAX,
+/// RCX and RDX. `Some` names the host feature its emitter needs to do so (the
+/// SHA-256 fallback without one takes R8 to R11), if any.
+fn vector_computation(operand: &simd::Operand) -> Option<Option<TargetCpu>> {
+    use simd::Operand;
+    match operand {
+        Operand::Integer { .. }
+        | Operand::Compare { .. }
+        | Operand::MoveImmediate { .. }
+        | Operand::Halving(_)
+        | Operand::Reduce(_)
+        | Operand::Saturate(_)
+        | Operand::Immediate(simd::immediates::Operand::Constant { .. }) => Some(None),
+        Operand::Aes(_) => Some(Some(TargetCpu::Aes)),
+        Operand::Sha256(_) => Some(Some(TargetCpu::Sha)),
+        _ => None,
+    }
+}
+
+/// The general registers an instruction a run admits writes.
+pub(in crate::x86_64) fn writes(instruction: &Instruction) -> u32 {
+    effects(&instruction.operation).map_or(u32::MAX, |effect| effect.writes)
+}
+
+/// Whether a run on `target` admits `operation`, whose [`effects`] it knows.
+fn admitted(operation: &Operation, target: TargetCpu) -> bool {
+    match operation {
+        Operation::Simd(operand) => match vector_computation(operand) {
+            Some(Some(feature)) => target.supports(feature),
+            _ => true,
+        },
+        _ => true,
+    }
 }
 
 /// A planned run: how many instructions it covers, its locals, and the ones
@@ -242,19 +308,29 @@ pub(in crate::x86_64) struct Span {
 impl Span {
     /// The run at the start of `instructions`, if one would save frame
     /// accesses, and how many instructions the planner examined.
-    pub(in crate::x86_64) fn plan(instructions: &[Instruction]) -> (usize, Option<Self>) {
-        Self::plan_with(instructions, false)
+    pub(in crate::x86_64) fn plan(
+        instructions: &[Instruction],
+        around: Hosts,
+    ) -> (usize, Option<Self>) {
+        Self::plan_with(instructions, false, around)
     }
 
     /// The run of a self-loop's whole body, whose locals are loaded once
     /// per entry and stored at its exits: each local saves every access an
     /// iteration makes. `None` unless the run covers the body.
-    pub(in crate::x86_64) fn plan_loop(instructions: &[Instruction]) -> Option<Self> {
-        let (rows, plan) = Self::plan_with(instructions, true);
+    pub(in crate::x86_64) fn plan_loop(
+        instructions: &[Instruction],
+        around: Hosts,
+    ) -> Option<Self> {
+        let (rows, plan) = Self::plan_with(instructions, true, around);
         plan.filter(|_| rows == instructions.len())
     }
 
-    fn plan_with(instructions: &[Instruction], looped: bool) -> (usize, Option<Self>) {
+    fn plan_with(
+        instructions: &[Instruction],
+        looped: bool,
+        around: Hosts,
+    ) -> (usize, Option<Self>) {
         let mut rows = 0;
         let mut live_in = 0;
         let mut touched = 0;
@@ -264,7 +340,9 @@ impl Span {
         let mut memory = false;
         let mut uses = [0_u16; GPRS];
         for instruction in instructions {
-            let Some(effect) = effects(&instruction.operation) else {
+            let Some(effect) = effects(&instruction.operation)
+                .filter(|_| admitted(&instruction.operation, around.target))
+            else {
                 break;
             };
             let reads = effect.reads & UNPINNED;
@@ -300,8 +378,9 @@ impl Span {
             *usable = match host {
                 Gpr::R9 => true,
                 Gpr::R8 => !takes_r8,
-                // The accesses keep masked addresses in R10 and R11.
-                _ => !memory,
+                // The accesses keep masked addresses in R10 and R11,
+                // where they keep any.
+                _ => !memory || around.slots_free,
             };
         }
         let mut locals = [None; LOCAL_HOSTS.len()];
@@ -416,6 +495,16 @@ impl Run {
         code.set_dirty_locals(self.dirty());
     }
 
+    /// The run's hosts differ from their frame slots, from here on, only for
+    /// the guest registers in `written` (a region's
+    /// [`crate::x86_64::block::edges::Region::written_before`] at a row,
+    /// where its paths join): its exits store them, and its faults recover
+    /// them, alone.
+    pub(in crate::x86_64) fn set_written(&mut self, code: &mut Code, written: u32) {
+        self.written = written;
+        code.set_dirty_locals(self.dirty());
+    }
+
     /// Store the locals the run has written, which a fault or branch from
     /// here on finds in their frame slots again. What RAX, the flags and the
     /// vector registers hold is unchanged.
@@ -448,5 +537,106 @@ pub(in crate::x86_64) fn write_back(code: &mut Code, dirty: Dirty) {
     for (index, host) in dirty.into_iter().flatten() {
         let slot = Mem::base(Gpr::Rdi, i32::from(index) * 8);
         asm.mov_store(Size::Qword, slot, host);
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::{GuestAddress, Lifter, aarch64::Decoder, x86_64::MemoryChecks};
+    use alloc::{format, string::String, vec, vec::Vec};
+
+    /// The registers objdump names R8 to R11 by, at every width.
+    fn names_locals(text: &str) -> bool {
+        text.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| {
+                ["r8", "r9", "r10", "r11"].iter().any(|name| {
+                    token
+                        .strip_prefix(name)
+                        .is_some_and(|rest| matches!(rest, "" | "d" | "w" | "b"))
+                })
+            })
+    }
+
+    /// The vector computations a run admits keep R8 to R11 out of their
+    /// code, on the baseline host and this one, with the vector cache and
+    /// without: the words of the SIMD and FP encoding groups, sampled.
+    /// Manual, as it needs objdump.
+    #[test]
+    #[ignore = "manual: needs objdump"]
+    fn vector_computations_leave_the_locals_hosts_alone() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut checked = 0;
+        for target in [TargetCpu::X86_64_V2, TargetCpu::detect()] {
+            let mut code_bytes: Vec<(u32, Vec<u8>)> = vec![];
+            for _ in 0..(1 << 21) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let group = if state >> 63 == 0 { 0b0111 } else { 0b1111 };
+                let word = (state as u32 & !(0xf << 25)) | group << 25;
+                let Ok(instruction) = Decoder.lift(GuestAddress(0x1000), word) else {
+                    continue;
+                };
+                let Operation::Simd(operand) = instruction.operation else {
+                    continue;
+                };
+                if vector_computation(&operand).is_none()
+                    || !admitted(&instruction.operation, target)
+                {
+                    continue;
+                }
+                for cached in [false, true] {
+                    let mut code = Code::new();
+                    code.set_pinned(true);
+                    code.set_vector_cache(cached);
+                    let mut fixups = vec![];
+                    crate::x86_64::emit_instruction(
+                        &mut code,
+                        &instruction,
+                        &mut fixups,
+                        target,
+                        MemoryChecks::DEFAULT,
+                    );
+                    code.flush_vectors();
+                    code_bytes.push((word, code.to_vec()));
+                }
+            }
+            // One listing of every emission, each padded so it decodes alone.
+            let mut all = vec![];
+            let mut ranges = vec![];
+            for (word, bytes) in &code_bytes {
+                ranges.push((all.len(), all.len() + bytes.len(), *word));
+                all.extend_from_slice(bytes);
+                all.extend_from_slice(&[0x90; 16]);
+            }
+            let path = std::env::temp_dir().join(format!("stela-span-{}.bin", std::process::id()));
+            std::fs::write(&path, &all).unwrap();
+            let text = std::process::Command::new("objdump")
+                .args(["-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel"])
+                .arg(&path)
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .expect("objdump");
+            let _ = std::fs::remove_file(&path);
+            for line in text.lines() {
+                let Some((offset, rest)) = line.trim_start().split_once(":\t") else {
+                    continue;
+                };
+                let Ok(offset) = usize::from_str_radix(offset, 16) else {
+                    continue;
+                };
+                let at = ranges.partition_point(|&(start, _, _)| start <= offset);
+                let Some(&(_, end, word)) = at.checked_sub(1).and_then(|at| ranges.get(at)) else {
+                    continue;
+                };
+                if offset < end {
+                    assert!(!names_locals(rest), "{word:08x} on {target:?}: {rest}");
+                }
+            }
+            checked += ranges.len();
+        }
+        assert!(checked > 1000, "only {checked} emissions checked");
+        std::println!("checked {checked} emissions");
     }
 }

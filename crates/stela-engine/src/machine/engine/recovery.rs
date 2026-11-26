@@ -217,6 +217,7 @@ impl<'a> Template<'a> {
                 || bindings.any(|binding| match binding.source {
                     RecoverySource::HostRegister(register) => register >= 16,
                     RecoverySource::NativeSpill(_) => true,
+                    RecoverySource::Flags(_) => false,
                 })
         }
         // Rebasing a row moves its PC alone, not its phase or bindings.

@@ -99,6 +99,7 @@ pub(crate) mod checked_pointer;
 mod conditional_select;
 mod crc;
 pub(crate) mod exclusive;
+mod flag_window;
 pub mod flag_word;
 mod flags;
 mod fp_register;

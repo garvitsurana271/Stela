@@ -4,8 +4,6 @@
 //! emitter, which stores NZCV at each setter; and the word a fault, an
 //! exit and a frame-bound emitter find.
 use super::{emit_for_target, emit_system_mode};
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-use crate::x86_64::flag_word;
 use crate::{
     GuestAddress, GuestState, Lifter, TargetCpu,
     aarch64::{Decoder, Instruction},
@@ -233,13 +231,15 @@ fn the_word_is_stored_before_what_may_need_it() {
     assert!(runs > 3_000, "{runs}");
 }
 
-/// A load that faults after a setter, before its reader: the word at the
-/// fault is the setter's NZCV, whether a reader or another setter follows,
-/// so the engine's settlement finds it.
+/// A load that faults after a setter, before its reader: the engine's
+/// settlement finds the setter's NZCV, whether a reader or another setter
+/// follows: in the word, or recomputed where the word is dead (a flag
+/// window, `x86_64::flag_window`).
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn a_fault_after_a_setter_finds_its_nzcv() {
     use super::vector_cache_tests::faulting;
+    use crate::block::{FaultRecovery, HostFaultSnapshot, HostGprSnapshot, HostSpillSnapshot};
     let guard = faulting::guard_page();
     let mut faults = 0;
     for target in targets() {
@@ -249,7 +249,7 @@ fn a_fault_after_a_setter_finds_its_nzcv() {
                 let words = [setter, LDR_X11_X12, after, ADD_X3];
                 let instructions = lift(&words);
                 let end = GuestAddress(0x1000 + 4 * words.len() as u64);
-                let (system, _) = emit_system_mode(
+                let (system, recovery) = emit_system_mode(
                     &instructions,
                     None,
                     end,
@@ -258,6 +258,7 @@ fn a_fault_after_a_setter_finds_its_nzcv() {
                     NativeSystem::NONE,
                 );
                 let code = pinned::entered(&system.x86_64_code);
+                let prefix = code.len() - system.x86_64_code.len();
                 for &left in &VALUES {
                     for &right in &VALUES {
                         let mut state = GuestState {
@@ -268,12 +269,24 @@ fn a_fault_after_a_setter_finds_its_nzcv() {
                         state.x[0] = left;
                         state.x[1] = right;
                         state.x[12] = guard;
-                        assert!(
-                            faulting::run(&code, &mut state).is_err(),
-                            "{words:08x?} does not fault"
-                        );
+                        let fault = faulting::run(&code, &mut state).expect_err("the load faults");
+                        // The engine's settlement: the pinned registers, then
+                        // the row's bindings, which a flag window's recompute.
+                        let gprs = HostGprSnapshot::legacy(fault.gprs).with_vectors(fault.vectors);
+                        pinned::settle(&gprs, &mut state);
+                        FaultRecovery::apply(
+                            &recovery,
+                            fault.offset - prefix,
+                            HostFaultSnapshot {
+                                gprs: &gprs,
+                                spills: &HostSpillSnapshot::new(),
+                            },
+                            &mut state,
+                        )
+                        .expect("a guest site")
+                        .expect("a guest site");
                         assert_eq!(
-                            flag_word::arm(state.nzcv),
+                            state.nzcv,
                             flags(left, right),
                             "{words:08x?} {left:#x} {right:#x}"
                         );

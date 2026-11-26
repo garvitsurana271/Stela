@@ -272,45 +272,50 @@ impl NativeMemory {
         }
         let arena_bytes = runs::ARENA_PAGES * PAGE;
         let bytes = PAGE << order;
-        let (base, page) = {
+        // Nothing is allocated under the arenas' spin lock: an allocation may
+        // end a GPU job's slice there (the heap's allocation hook), and every
+        // other processor asking Linux for a page would spin on the lock until
+        // the job ran again.
+        let found = {
             let mut locked = self.runs.lock();
-            let arenas = locked.arenas();
-            let mut found = None;
-            for arena in arenas.iter_mut() {
-                if let Some(page) = arena.buddy.allocate(order) {
-                    found = Some((arena.base, page));
-                    break;
-                }
-            }
-            match found {
-                Some(found) => found,
-                None => {
-                    if arenas.try_reserve(1).is_err() {
-                        return Ok(None);
-                    }
-                    let Some(mut buddy) = runs::Buddy::new() else {
-                        return Ok(None);
+            locked
+                .arenas()
+                .iter_mut()
+                .find_map(|arena| Some((arena.base, arena.buddy.allocate(order)?)))
+        };
+        let (base, page) = match found {
+            Some(found) => found,
+            None => {
+                let Some(mut buddy) = runs::Buddy::new() else {
+                    return Ok(None);
+                };
+                let layout = Layout::from_size_align(arena_bytes, arena_align)
+                    .map_err(|_| MemoryError::InvalidAlignment)?;
+                // SAFETY: a valid nonzero layout; the arena owns the block
+                // until it is wholly free and given back with it.
+                let Some(base) = NonNull::new(unsafe { self.heap.alloc(layout) }) else {
+                    return Ok(None);
+                };
+                let in_heap = (base.as_ptr() as usize)
+                    .checked_sub(cpu)
+                    .is_some_and(|offset| offset + arena_bytes <= capacity);
+                let page = buddy.allocate(order);
+                let (true, Some(page)) = (in_heap, page) else {
+                    // SAFETY: the block just allocated with this layout.
+                    unsafe { self.heap.dealloc(base.as_ptr(), layout) };
+                    return if in_heap {
+                        Err(MemoryError::OutOfMemory)
+                    } else {
+                        Err(MemoryError::OutsideReservation)
                     };
-                    let layout = Layout::from_size_align(arena_bytes, arena_align)
-                        .map_err(|_| MemoryError::InvalidAlignment)?;
-                    // SAFETY: a valid nonzero layout; the arena owns the block
-                    // until it is wholly free and given back with it.
-                    let Some(base) = NonNull::new(unsafe { self.heap.alloc(layout) }) else {
-                        return Ok(None);
-                    };
-                    let in_heap = (base.as_ptr() as usize)
-                        .checked_sub(cpu)
-                        .is_some_and(|offset| offset + arena_bytes <= capacity);
-                    if !in_heap {
-                        // SAFETY: the block just allocated with this layout.
-                        unsafe { self.heap.dealloc(base.as_ptr(), layout) };
-                        return Err(MemoryError::OutsideReservation);
-                    }
-                    let page = buddy.allocate(order).ok_or(MemoryError::OutOfMemory)?;
-                    arenas.push(runs::Arena { base, buddy });
-                    self.runs.count.fetch_add(1, Ordering::Relaxed);
-                    (base, page)
+                };
+                if !self.runs.push(runs::Arena { base, buddy }) {
+                    // SAFETY: as above; no run of it was handed out.
+                    unsafe { self.heap.dealloc(base.as_ptr(), layout) };
+                    return Ok(None);
                 }
+                self.runs.count.fetch_add(1, Ordering::Relaxed);
+                (base, page)
             }
         };
         let mut run = RunAllocation {

@@ -188,6 +188,39 @@ impl Arenas {
         }
         Locked { owner: self }
     }
+
+    /// Adds `arena`, growing the list outside the lock: false when no room
+    /// for it could be allocated.
+    pub(crate) fn push(&self, arena: Arena) -> bool {
+        loop {
+            let wanted = {
+                let mut locked = self.lock();
+                let arenas = locked.arenas();
+                if arenas.len() < arenas.capacity() {
+                    arenas.push(arena);
+                    return true;
+                }
+                arenas.capacity() * 2 + 4
+            };
+            let mut bigger = Vec::new();
+            if bigger.try_reserve_exact(wanted).is_err() {
+                return false;
+            }
+            let old = {
+                let mut locked = self.lock();
+                let arenas = locked.arenas();
+                if arenas.capacity() >= bigger.capacity() {
+                    // Another request grew it meanwhile.
+                    None
+                } else {
+                    bigger.append(arenas);
+                    Some(core::mem::replace(arenas, bigger))
+                }
+            };
+            // The smaller list (or the unused one) is freed outside the lock.
+            drop(old);
+        }
+    }
 }
 
 #[cfg(test)]

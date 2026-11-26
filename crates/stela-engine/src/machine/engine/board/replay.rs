@@ -30,12 +30,20 @@ const SAMPLE: u64 = 8;
 /// runs (log-uniform), and `new` blocks a beat that run once. Each beat
 /// `turnover` of the hot blocks give way to new ones, which keep their
 /// odds: the code of a launch, which the guest keeps running.
+///
+/// The first `paired` of the hot blocks are code of pages the guest maps
+/// at two addresses (the shared cache at two slides): each of their runs
+/// is at one address or the other, odds even. A board that installs a
+/// block per address holds two blocks of each; one whose addresses share
+/// one install (`shared`) holds one, as for any other block.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Guest {
     pub(super) hot: usize,
     pub(super) least: f64,
     pub(super) new: usize,
     pub(super) turnover: usize,
+    pub(super) paired: usize,
+    pub(super) shared: bool,
 }
 
 /// What a replay counted per beat after its warm-up.
@@ -50,6 +58,10 @@ pub(super) struct Outcome {
     pub(super) outs: [u64; 4],
     /// Blocks a retirement copied into tenured code ([`Policy::Survivors`]).
     pub(super) copied: u64,
+    /// Runs of blocks of the hot pool, and those that found their block
+    /// in the window.
+    pub(super) hot_runs: u64,
+    pub(super) hot_hits: u64,
 }
 
 /// What a replay's ring does beyond its own choices.
@@ -195,13 +207,17 @@ fn drive(guest: Guest, mut run: impl FnMut(usize, &mut u64, bool, bool)) {
         }
         for _ in 0..TICKS {
             runs.clear();
-            runs.extend(
-                (0..guest.hot)
-                    .filter(|&at| uniform(&mut seed) < odds[at])
-                    .map(|at| members[at]),
-            );
+            for at in 0..guest.hot {
+                if uniform(&mut seed) >= odds[at] {
+                    continue;
+                }
+                // A block of a paired page at its second address is
+                // another block, unless the addresses share one install.
+                let slide = at < guest.paired && !guest.shared && next(&mut seed) & 1 == 1;
+                runs.push(2 * members[at] + usize::from(slide));
+            }
             for _ in 0..guest.new / TICKS as usize {
-                runs.push(fresh | ONCE);
+                runs.push(2 * fresh | ONCE);
                 fresh += 1;
             }
             // Shuffle: the guest's runs interleave.
@@ -215,9 +231,10 @@ fn drive(guest: Guest, mut run: impl FnMut(usize, &mut u64, bool, bool)) {
     }
 }
 
-/// The blocks `guest` ever runs.
+/// The blocks `guest` ever runs: two numbers per block, its second
+/// address's the odd one.
 fn total(guest: Guest) -> usize {
-    guest.hot + (guest.new + guest.turnover) * (WARM_BEATS + BEATS) as usize + 1
+    2 * (guest.hot + (guest.new + guest.turnover) * (WARM_BEATS + BEATS) as usize + 1)
 }
 
 fn per_beat(outcome: Outcome) -> Outcome {
@@ -227,6 +244,8 @@ fn per_beat(outcome: Outcome) -> Outcome {
         promoted: outcome.promoted / BEATS,
         retired: outcome.retired / BEATS,
         copied: outcome.copied / BEATS,
+        hot_runs: outcome.hot_runs / BEATS,
+        hot_hits: outcome.hot_hits / BEATS,
         ..outcome
     }
 }
@@ -264,6 +283,10 @@ pub(super) fn replay_in(
     };
     drive(guest, |block, seed, counting, hot| {
         model.counting = counting;
+        if counting && hot {
+            model.outcome.hot_runs += 1;
+            model.outcome.hot_hits += u64::from(model.part_of[block].is_some());
+        }
         match model.part_of[block] {
             Some(part) => {
                 if next(seed).is_multiple_of(SAMPLE) {
@@ -326,6 +349,8 @@ fn a_window_that_holds_sign_ins_hot_code_with_a_small_nursery_keeps_it() {
         least: 0.25,
         new: 900,
         turnover: 0,
+        paired: 0,
+        shared: false,
     };
     let before = replay(guest, 10_500, 4, Policy::Ring);
     let after = replay(guest, 16_700, super::ring::NURSERY_SHARE, Policy::Ring);
@@ -354,6 +379,8 @@ fn sign_in_replay_on_the_real_ring() {
                 least: 0.25,
                 new: 900,
                 turnover,
+                paired: 0,
+                shared: false,
             };
             for (window, blocks) in [
                 (512, 10_500),
@@ -396,6 +423,8 @@ fn finer_parts_and_a_smaller_nursery_keep_a_window_sized_pool() {
         least: 0.25,
         new: 1_200,
         turnover: 300,
+        paired: 0,
+        shared: false,
     };
     let before = replay_in(guest, 27_000, 32, 8, Policy::Ring);
     let after = replay_in(guest, 27_000, 64, super::ring::NURSERY_SHARE, Policy::Ring);
@@ -428,6 +457,8 @@ fn finder_window_replay_by_parts_and_nursery() {
                 least: 0.25,
                 new,
                 turnover: 300,
+                paired: 0,
+                shared: false,
             };
             let mut line = std::format!(
                 "REPLAY hot={hot}00 new={new}00 lru_again={}",
@@ -441,6 +472,87 @@ fn finder_window_replay_by_parts_and_nursery() {
                 ));
             }
             std::println!("{line} (again per beat, x100 for the laptop)");
+        }
+    }
+}
+
+/// The Finder window with its shared cache at two slides, as boot 35 of
+/// the 0.6.1 profile ran it: 1093 sampled pages ran at both, holding 64%
+/// of the user samples, and the hot code was about the window's size. Of
+/// 26 thousand hot blocks (scaled a hundredfold) installed per address,
+/// 64% are the two copies of 8 320 paired blocks: 17 680 blocks in all. A
+/// board whose two addresses of a page share one install holds those
+/// 17 680, which the window keeps, and installs a small part again of what
+/// a board installing each address does.
+#[test]
+fn one_install_for_both_slides_keeps_a_window_sized_pool() {
+    let guest = Guest {
+        hot: 17_680,
+        least: 0.25,
+        new: 1_200,
+        turnover: 300,
+        paired: 8_320,
+        shared: false,
+    };
+    let apart = replay_in(guest, 27_000, 64, super::ring::NURSERY_SHARE, Policy::Ring);
+    let shared = replay_in(
+        Guest {
+            shared: true,
+            ..guest
+        },
+        27_000,
+        64,
+        super::ring::NURSERY_SHARE,
+        Policy::Ring,
+    );
+    assert!(shared.again * 3 <= apart.again, "{apart:?} {shared:?}");
+    assert!(shared.installs < apart.installs, "{apart:?} {shared:?}");
+    assert!(
+        shared.hot_hits * apart.hot_runs > apart.hot_hits * shared.hot_runs,
+        "{apart:?} {shared:?}"
+    );
+}
+
+/// The table behind it: shares of the hot pool at two slides and windows,
+/// each address installed apart or both sharing one install. Manual:
+/// `cargo test -p stela-engine --release --lib two_slides_replay --
+/// --ignored --nocapture`.
+#[test]
+#[ignore = "manual: opt-in"]
+fn two_slides_replay_apart_and_shared() {
+    // Hot copies per address, of which a share are two copies of a paired
+    // block: the 0.6.1 profile's Finder window is 26 000 and 64%.
+    for copies in [20_000usize, 26_000, 32_000] {
+        for percent in [0usize, 32, 50, 64, 80] {
+            let paired = copies * percent / 200;
+            let guest = Guest {
+                hot: copies - paired,
+                least: 0.25,
+                new: 1_200,
+                turnover: 300,
+                paired,
+                shared: false,
+            };
+            let mut line = std::format!("REPLAY copies={copies}00 paired={percent}%");
+            for window in [21_000, 27_000, 33_000] {
+                for shared in [false, true] {
+                    let outcome = replay_in(
+                        Guest { shared, ..guest },
+                        window,
+                        64,
+                        super::ring::NURSERY_SHARE,
+                        Policy::Ring,
+                    );
+                    line.push_str(&std::format!(
+                        " w={window}/{}:installs={}/again={}/hit={:.3}",
+                        if shared { "one" } else { "apart" },
+                        outcome.installs,
+                        outcome.again,
+                        outcome.hot_hits as f64 / outcome.hot_runs.max(1) as f64,
+                    ));
+                }
+            }
+            std::println!("{line} (per beat, x100 for the laptop)");
         }
     }
 }

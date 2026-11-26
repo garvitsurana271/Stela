@@ -110,6 +110,12 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateGpuAspm);
                 }
             }
+            PLANE_COPIES => {
+                let mode = PlaneCopies::parse(value().ok_or(Error::PlaneCopies)?)?;
+                if options.plane_copies.replace(mode).is_some() {
+                    return Err(Error::DuplicatePlaneCopies);
+                }
+            }
             AMX_NATIVE => {
                 let model = value().and_then(AmxModel::parse).ok_or(Error::AmxNative)?;
                 if options.amx_native.replace(model).is_some() {

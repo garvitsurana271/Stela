@@ -164,6 +164,68 @@ impl PlaneChanges {
     }
 }
 
+/// How a rendered two-plane extended-range surface keeps a device copy of
+/// its planes on a GPU of its own memory ([`PlaneCopy`]), for every device
+/// opened after [`set_plane_copies`] (`--plane-copies`). A test of the
+/// copies: the display composes a surface's layer from its copy, while the
+/// CPU, other processes' textures and macOS's screenshots read the planes in
+/// guest RAM, so a copy that came to differ from its planes shows a right
+/// screen and a wrong screenshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PlaneCopies {
+    /// Kept, and the display composes from them.
+    #[default]
+    On,
+    /// Kept, but the display composes every layer from its guest RAM, as
+    /// the CPU reads it: the screen then shows what a screenshot reads.
+    Rows,
+    /// Not kept: textures sample, and encodes write and compare with
+    /// their mirror, the planes in guest RAM, as before the copies.
+    Off,
+}
+
+impl PlaneCopies {
+    const NAMES: [(&'static str, Self); 3] =
+        [("on", Self::On), ("rows", Self::Rows), ("off", Self::Off)];
+
+    /// The mode `--plane-copies` names.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::NAMES
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|&(_, mode)| mode)
+    }
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES
+            .iter()
+            .find(|(_, mode)| *mode == self)
+            .map_or("on", |(name, _)| name)
+    }
+}
+
+static PLANE_COPIES: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Sets how devices opened after it keep device copies of rendered
+/// two-plane extended-range surfaces ([`PlaneCopies`]).
+pub fn set_plane_copies(mode: PlaneCopies) {
+    let code = match mode {
+        PlaneCopies::On => 0,
+        PlaneCopies::Rows => 1,
+        PlaneCopies::Off => 2,
+    };
+    PLANE_COPIES.store(code, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The mode [`set_plane_copies`] set, [`PlaneCopies::On`] unless set.
+pub fn plane_copies() -> PlaneCopies {
+    match PLANE_COPIES.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => PlaneCopies::Rows,
+        2 => PlaneCopies::Off,
+        _ => PlaneCopies::On,
+    }
+}
+
 /// The stamps passes mark their dirty tiles with, one per pass on any
 /// texture, never zero. After 2^32 passes a stamp repeats: a tile last
 /// marked that long ago is then converted again, which its mirror makes a
@@ -417,9 +479,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// layout in it and its size. A copy is kept where the GPU's own memory
     /// is not the guest RAM the planes lie in and the texture is rendered:
     /// passes that sample it then read at the GPU's memory speed, and its
-    /// encodes compare with it. `None` elsewhere, and when no device memory
-    /// is left for it, which is reported once: the planes are then sampled
-    /// in place.
+    /// encodes compare with it. `None` elsewhere, with `--plane-copies off`
+    /// ([`PlaneCopies::Off`]), and when no device memory is left for it,
+    /// which is reported once: the planes are then sampled in place.
     #[allow(clippy::type_complexity)]
     fn device_planes(
         &mut self,
@@ -427,7 +489,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     ) -> Result<Option<(BufferAllocation, [PlaneLayout; 2], u64)>> {
         let rendered =
             descriptor.usage.is_empty() || descriptor.usage.contains(TextureUsage::RENDER_TARGET);
-        if self.capabilities.has_unified_memory || !rendered {
+        if self.capabilities.has_unified_memory
+            || !rendered
+            || self.plane_copies == PlaneCopies::Off
+        {
             return Ok(None);
         }
         let (layouts, size) = device_layout(
@@ -493,6 +558,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         surface: u32,
         source: [u32; 4],
     ) -> Option<PlaneCopy> {
+        // `--plane-copies rows`: the display reads what the CPU does.
+        if self.plane_copies != PlaneCopies::On {
+            return None;
+        }
         let [x, y, width, height] = source.map(u64::from);
         self.resources
             .extended_planes
@@ -1484,6 +1553,63 @@ mod tests {
         for texture in [texture, other] {
             device.destroy_texture(texture).unwrap();
         }
+    }
+
+    /// `--plane-copies off` leaves a rendered surface's texture without a
+    /// device copy, so its shaders sample and its encodes write the planes
+    /// in guest RAM, as the CPU and screenshots read them; `rows` keeps the
+    /// copy, but the display composes the surface from its guest RAM, where
+    /// `on` composes it from the copy.
+    #[test]
+    fn plane_copies_off_keeps_no_copy_and_rows_composes_from_guest_ram() {
+        let mut device = device();
+        let buffer = device
+            .new_buffer(5_251_264, options(StorageMode::Shared))
+            .unwrap();
+        let rendered = surface_texture(PixelFormat::Rgb10A8_2pXr10);
+        device.plane_copies = PlaneCopies::Off;
+        let texture = device
+            .new_extended_plane_texture(buffer, &rendered, PLANES)
+            .unwrap();
+        assert!(device.resources.extended_planes[&texture.0].copy.is_none());
+        device.destroy_texture(texture).unwrap();
+
+        device.plane_copies = PlaneCopies::Rows;
+        let texture = device
+            .new_extended_plane_texture(buffer, &rendered, PLANES)
+            .unwrap();
+        let copy = device.resources.extended_planes[&texture.0].copy;
+        assert!(copy.is_some(), "rows keeps the copy shaders sample");
+        let mut commands = device.new_command_buffer();
+        device
+            .begin_render(
+                &mut commands,
+                &reported(texture, LoadAction::Load, Some((7, 1))),
+            )
+            .unwrap();
+        commands.end_encoding(&mut device.resolver()).unwrap();
+        commands
+            .surfaces
+            .push(crate::metal::device::resources::SurfaceNote {
+                texture: Some(texture),
+                surface: 7,
+                seed: 1,
+            });
+        device.commit(commands).unwrap();
+        let whole = [0, 0, 1280, 800];
+        assert_eq!(device.surface_copy(7, whole), None);
+        device.plane_copies = PlaneCopies::On;
+        assert_eq!(device.surface_copy(7, whole), copy);
+        device.destroy_texture(texture).unwrap();
+    }
+
+    #[test]
+    fn plane_copies_modes_read_back_by_name() {
+        for mode in [PlaneCopies::On, PlaneCopies::Rows, PlaneCopies::Off] {
+            assert_eq!(PlaneCopies::parse(mode.name()), Some(mode));
+        }
+        assert_eq!(PlaneCopies::parse("display"), None);
+        assert_eq!(PlaneCopies::default(), PlaneCopies::On);
     }
 
     /// Over unified memory an encode writes the planes in place, every

@@ -3540,6 +3540,8 @@ fn start_devices(
                 }
             });
             gpu::link::choose(options.gpu_aspm());
+            #[cfg(feature = "nvk")]
+            gpu::gate::choose_plane_copies(options.plane_copies());
             if options.boots_macos()
                 && let Ok(work) = work
                 && open_gpus(

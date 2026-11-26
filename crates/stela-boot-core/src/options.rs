@@ -365,6 +365,49 @@ impl GpuAspm {
     }
 }
 
+/// How a GPU of its own memory keeps device copies of the two-plane
+/// extended-range surfaces macOS renders, WindowServer's framebuffers and
+/// windows among them (`--plane-copies on|rows|off`): `rows` keeps them but
+/// composes the display from the surfaces' guest RAM, which the CPU and
+/// macOS's screenshots read, so the screen shows what a screenshot reads;
+/// `off` keeps none, as 0.6.0 did. A test of a screenshot that differs from
+/// the screen; a hand-written opt-in setup never writes, so the options
+/// revision stays 13.
+pub const PLANE_COPIES: &str = "--plane-copies";
+
+/// `--plane-copies`' value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlaneCopies {
+    /// The default: kept, and the display composes from them.
+    #[default]
+    On,
+    /// Kept, the display composing from the surfaces' guest RAM.
+    Rows,
+    /// Not kept.
+    Off,
+}
+
+impl PlaneCopies {
+    const NAMES: [(&'static str, Self); 3] =
+        [("on", Self::On), ("rows", Self::Rows), ("off", Self::Off)];
+
+    pub fn parse(value: &str) -> Result<Self, Error> {
+        Self::NAMES
+            .iter()
+            .find(|(name, _)| *name == value)
+            .map(|(_, mode)| *mode)
+            .ok_or(Error::PlaneCopies)
+    }
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES
+            .iter()
+            .find(|(_, mode)| *mode == self)
+            .map(|(name, _)| *name)
+            .unwrap_or_default()
+    }
+}
+
 /// Runs the host's ACPI in hardware mode (`--acpi-hardware`): the SCI,
 /// fixed events and GPEs, the embedded controller's queries and the
 /// notifications they send ([`crate::acpi_hardware`]). A hand-written
@@ -789,6 +832,9 @@ pub struct System {
     /// The GPU links' power management ([`GPU_ASPM`]);
     /// [`GpuAspm::Firmware`] unless given ([`Self::gpu_aspm`]).
     pub gpu_aspm: Option<GpuAspm>,
+    /// The device copies of rendered two-plane surfaces ([`PLANE_COPIES`]);
+    /// [`PlaneCopies::On`] unless given ([`Self::plane_copies`]).
+    pub plane_copies: Option<PlaneCopies>,
     /// [`AMX_NATIVE`]'s value, unset where the line has none
     /// ([`Self::amx_model`]).
     pub amx_native: Option<AmxModel>,
@@ -933,6 +979,7 @@ impl Default for System {
             laptop: None,
             asus_mode: None,
             gpu_aspm: None,
+            plane_copies: None,
             amx_native: None,
             hle: false,
             hle_off: Vec::new(),
@@ -1150,6 +1197,12 @@ impl System {
     /// [`GpuAspm::Firmware`].
     pub fn gpu_aspm(&self) -> GpuAspm {
         self.gpu_aspm.unwrap_or_default()
+    }
+
+    /// The device copies of rendered two-plane surfaces: `--plane-copies`,
+    /// else [`PlaneCopies::On`].
+    pub fn plane_copies(&self) -> PlaneCopies {
+        self.plane_copies.unwrap_or_default()
     }
 
     /// Whether the translation pack is preloaded in the background: only
@@ -1555,6 +1608,7 @@ impl fmt::Display for System {
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;
         line.value(GPU_ASPM, self.gpu_aspm.map(GpuAspm::name))?;
+        line.value(PLANE_COPIES, self.plane_copies.map(PlaneCopies::name))?;
         line.value(AMX_NATIVE, self.amx_native)?;
         line.flag("--hle", self.hle)?;
         line.value(

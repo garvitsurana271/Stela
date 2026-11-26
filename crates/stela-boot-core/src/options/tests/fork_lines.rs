@@ -99,7 +99,7 @@ fn on(option: &str) -> bool {
     value(option) == "on"
 }
 
-fn forks() -> [Fork; 12] {
+fn forks() -> [Fork; 13] {
     [
         Fork {
             valid: &["--acpi-hardware"],
@@ -164,6 +164,19 @@ fn forks() -> [Fork; 12] {
                 ("--gpu-aspm performance", Error::GpuAspm),
             ],
             duplicate: Some(Error::DuplicateGpuAspm),
+        },
+        Fork {
+            valid: &[
+                "--plane-copies on",
+                "--plane-copies rows",
+                "--plane-copies off",
+            ],
+            set: |o, t| o.plane_copies = Some(PlaneCopies::parse(value(t)).unwrap()),
+            bad: &[
+                ("--plane-copies", Error::PlaneCopies),
+                ("--plane-copies none", Error::PlaneCopies),
+            ],
+            duplicate: Some(Error::DuplicatePlaneCopies),
         },
         Fork {
             valid: &["--hle"],
@@ -259,6 +272,7 @@ fn setup_lines_and_the_stick_s_choices_mean_what_they_meant() {
         assert_eq!(options.tlbi_keep(), (false, false));
         assert!(!options.host_core());
         assert_eq!(options.gpu_aspm, None);
+        assert_eq!(options.plane_copies, None);
         assert!(!options.hle && options.hle_off.is_empty());
         assert!(!options.core_trial);
         assert!(options.tier2.is_none() && !options.tier2_check && !options.tier2_runs());

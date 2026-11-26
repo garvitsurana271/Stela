@@ -177,6 +177,36 @@ fn a_gpu_link_keeps_the_firmwares_aspm_unless_gpu_aspm_turns_it_off() {
 }
 
 #[test]
+fn rendered_surfaces_keep_device_copies_unless_plane_copies_says_otherwise() {
+    let plain = System::parse("--system").unwrap();
+    assert_eq!(plain.plane_copies(), PlaneCopies::On);
+    assert_eq!(plain.plane_copies, None);
+    for (text, mode) in [
+        ("--system --plane-copies on", PlaneCopies::On),
+        ("--system --plane-copies rows", PlaneCopies::Rows),
+        ("--system --plane-copies off", PlaneCopies::Off),
+        (
+            "--system --gpu-aspm off --plane-copies rows",
+            PlaneCopies::Rows,
+        ),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.plane_copies(), mode);
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --plane-copies", Error::PlaneCopies),
+        ("--system --plane-copies display", Error::PlaneCopies),
+        (
+            "--system --plane-copies off --plane-copies rows",
+            Error::DuplicatePlaneCopies,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
+#[test]
 fn audio_hpet_handoff_requires_an_audio_diagnostic() {
     assert_eq!(
         System::parse("--system --audio-own-hpet").unwrap_err(),

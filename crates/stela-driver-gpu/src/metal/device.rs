@@ -175,6 +175,10 @@ pub struct Device<B: Backend, C: Compiler> {
     allocated: u64,
     /// Display layers composed from a device copy of their planes.
     display_copies: u64,
+    /// Whether rendered two-plane surfaces keep device copies of their
+    /// planes and the display composes from them, as the device opened
+    /// (`--plane-copies`).
+    plane_copies: resources::PlaneCopies,
     /// The allocations that ran out of memory ([`reclaim`]).
     shortage: reclaim::Shortage,
     /// The service's lock, which says when the platform withdrew a host
@@ -395,6 +399,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             peak_pinned: 0,
             allocated: 0,
             display_copies: 0,
+            plane_copies: resources::plane_copies(),
             shortage: reclaim::Shortage::default(),
             host_calls: None,
             memory_cap: crate::metal::vulkan::physical::VRAM_CAP,

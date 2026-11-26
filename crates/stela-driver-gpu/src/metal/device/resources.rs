@@ -49,7 +49,7 @@ mod extended_planes;
 mod read_back;
 pub use aligned_copies::{RowCopy, SurfaceNote};
 pub(super) use extended_planes::PlaneActions;
-pub use extended_planes::PlaneChanges;
+pub use extended_planes::{PlaneChanges, PlaneCopies, plane_copies, set_plane_copies};
 pub use read_back::ReadBack;
 
 const TEXTURE_ARRAYS: [HeapArray; 2] = [HeapArray::SampledImages, HeapArray::StorageImages];

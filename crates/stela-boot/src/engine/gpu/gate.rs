@@ -1530,6 +1530,33 @@ pub(in crate::engine) fn profile_passes() {
     pass_times::set_pass_profile(true);
 }
 
+/// `--plane-copies`: how the Metal devices opened after it keep device
+/// copies of the two-plane surfaces macOS renders, said once when it is not
+/// the default.
+pub(in crate::engine) fn choose_plane_copies(mode: stela_boot_core::options::PlaneCopies) {
+    use stela_boot_core::options::PlaneCopies as Asked;
+    use stela_drivers::gpu::metal::device::resources::{PlaneCopies, set_plane_copies};
+    let (copies, what) = match mode {
+        Asked::On => (PlaneCopies::On, ""),
+        Asked::Rows => (
+            PlaneCopies::Rows,
+            "kept, but the display composes every surface from its guest RAM, as the CPU              and screenshots read it",
+        ),
+        Asked::Off => (
+            PlaneCopies::Off,
+            "none kept: shaders sample and encodes write the surfaces in guest RAM",
+        ),
+    };
+    set_plane_copies(copies);
+    if !what.is_empty() {
+        output::arguments(format_args!(
+            "GPU PLANE COPIES {}: {what}
+",
+            mode.name()
+        ));
+    }
+}
+
 /// The service of the GPU named `name`, once the services are open.
 pub(super) fn service_of(name: &str) -> Option<&'static Arc<Shared>> {
     // SAFETY: the names are published before the services and leaked.

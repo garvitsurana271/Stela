@@ -1,7 +1,9 @@
 //! Tier 1's output, pinned: a deterministic corpus of blocks compiled with
 //! the options the system-mode engine compiles with, each result's digest
 //! compared against the golden set `tier1_golden.txt`, which the compiler
-//! of `72a0c83c0` (before tier 2 existed) produced.
+//! of `72a0c83c0` (before tier 2 existed) produced, written again for the
+//! block ABI's guest-state-v16 frame layout, whose shorter frame
+//! displacements change the blocks' bytes and the offsets into them.
 //!
 //! Tier 2 (`--tier2`) must leave every tier-1 compilation byte for byte as
 //! it was: the native code, its source map, relocations, direct exits,

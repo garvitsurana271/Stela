@@ -23,10 +23,22 @@ const AP_EL0: u64 = 1 << 6;
 const LIMIT: u64 = 1 << 48;
 
 /// `cmp rax,[rdi+lower_limit]`.
+/// The ModRM and displacement of `[rdi+lower_limit]` with `reg` in the
+/// reg field: the shortest displacement, as the compiler's frame accesses.
+fn limit_operand(reg: u8) -> Vec<u8> {
+    let offset = core::mem::offset_of!(GuestState, lower_limit);
+    match i8::try_from(offset) {
+        Ok(short) => vec![0x47 | reg << 3, short as u8],
+        Err(_) => {
+            let mut bytes = vec![0x87 | reg << 3];
+            bytes.extend((offset as u32).to_le_bytes());
+            bytes
+        }
+    }
+}
+
 fn compare_bytes() -> Vec<u8> {
-    let mut bytes = vec![0x48, 0x3b, 0x87];
-    bytes.extend((core::mem::offset_of!(GuestState, lower_limit) as u32).to_le_bytes());
-    bytes
+    [vec![0x48, 0x3b], limit_operand(0)].concat()
 }
 
 fn contains(code: &[u8], bytes: &[u8]) -> bool {
@@ -36,12 +48,10 @@ fn contains(code: &[u8], bytes: &[u8]) -> bool {
 /// Whether `code` compares any GPR with `[rdi+lower_limit]`: RAX, or a
 /// pinned base the check reads in place.
 fn compares_with_the_limit(code: &[u8]) -> bool {
-    let offset = (core::mem::offset_of!(GuestState, lower_limit) as u32).to_le_bytes();
-    code.windows(7).any(|window| {
-        matches!(window[0], 0x48 | 0x4c)
-            && window[1] == 0x3b
-            && window[2] & 0xc7 == 0x87
-            && window[3..] == offset
+    (0..8).any(|reg| {
+        [0x48, 0x4c]
+            .into_iter()
+            .any(|rex| contains(code, &[vec![rex, 0x3b], limit_operand(reg)].concat()))
     })
 }
 

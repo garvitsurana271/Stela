@@ -140,10 +140,19 @@ fn options_with(regions: bool) -> Options {
     .with_native_system(system)
 }
 
+/// The next fixed address [`map`] places memory at.
+static PLACE: AtomicUsize = AtomicUsize::new(0x4000_0000_0000);
+/// MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE.
+const FIXED_PRIVATE: i32 = 0x22 | 0x10_0000;
+
+/// Private anonymous read-write memory at the same address in every run, so
+/// a block's data-dependent path (the arena's words are addresses in it)
+/// and so its trace do not change with where the kernel would place it.
 fn map(bytes: usize) -> *mut u8 {
-    // SAFETY: private anonymous read-write memory.
-    let page = unsafe { mmap(core::ptr::null_mut(), bytes, 3, 0x22, -1, 0) };
-    assert_ne!(page as usize, usize::MAX);
+    let at = PLACE.fetch_add(bytes.next_multiple_of(1 << 24), Ordering::Relaxed);
+    // SAFETY: private anonymous read-write memory where nothing is mapped.
+    let page = unsafe { mmap(at as *mut c_void, bytes, 3, FIXED_PRIVATE, -1, 0) };
+    assert_eq!(page as usize, at);
     page.cast()
 }
 

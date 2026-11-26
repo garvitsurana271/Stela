@@ -122,9 +122,20 @@ const PACK_MARGIN: u64 = 16 * MIB;
 /// Windows let such a GPU map up to half of RAM, and macOS on Apple silicon
 /// about two thirds, but those are limits on memory the system takes back
 /// under pressure; here the share is held from the guest for the boot, so
-/// it is a sixth: 2.6 GiB on a 16 GB PC, 5.2 GiB on a 32 GB PC, and the
-/// floor's 2.5 GiB below about 15 GiB free.
-const GPU_SHARE: u64 = 6;
+/// it is a quarter: 3.6 to 3.9 GiB on a 16 GB PC, 7.3 to 7.8 GiB on a 32 GB
+/// PC, and the floor's 2.5 GiB below 10 GiB free.
+///
+/// A sixth left a 16 GB PC with a 512 MiB carve-out (14 842 MiB free) on
+/// the floor, and its Metal device told the guest 1534 MiB: Setup's Liquid
+/// Glass UI, blurring full-screen RGBA16F targets, ran it out of that at
+/// 1527 MiB held, and WindowServer died with the refused commit. A 32 GB PC
+/// got through Setup and the desktop at a 2.9 GiB peak. A quarter tells the
+/// 16 GB PC 2.4 GiB and a 16 GiB one 2.6 GiB; what it takes comes from the
+/// heap's growth past its floor while the guest keeps [`GUEST_ROOM`] (3.4
+/// GiB of heap where the heap's own peak beside the share was 2.0 to 2.4
+/// GiB, [`HEAP_OWN`]), so a 16 GB PC's guest keeps 6 GiB, and a 12 GB PC's
+/// share grows by 150 to 400 MiB.
+const GPU_SHARE: u64 = 4;
 /// The share a macOS desktop needs. A 16 GiB VM's AMD integrated GPU (512
 /// MiB carve-out, 3272 MiB of GTT) held 2058 MiB of RADV's heaps after a
 /// sign-in and seven app launches, the guest holding 1326 MiB (`driver

@@ -713,13 +713,14 @@ fn the_window_takes_the_code_budget_first_and_the_guest_keeps_its_dram() {
 ///   short of [`GPU_FLOOR`];
 /// - the 12 GiB VM of the AMD port's first run (`free=10842M heap=3300M
 ///   code=688M pool=710M guest=6144M`, where the heap ran out holding the
-///   GPU's pages) gives it the floor, 2.5 GiB, beside its 512 MiB carve-out;
-///   its heap is that of a host with 8.1 GiB free, the heap's floor.
-///   A 16 GiB VM's heap peaked at 4482 MiB with 2058 MiB of driver heaps in
-///   a session of seven app launches, so its own part held 2.4 GiB, or up
-///   to 2.9 GiB where the carve-out held some of the driver's buffers;
-/// - 16 and 32 GiB hosts give it a sixth, the heap its target and the guest
-///   its room.
+///   GPU's pages) gives it a quarter, 2.6 GiB, beside its 512 MiB
+///   carve-out; its heap is that of a host with 8.1 GiB free, the heap's
+///   floor. A 16 GiB VM's heap peaked at 4482 MiB with 2058 MiB of driver
+///   heaps in a session of seven app launches, so its own part held 2.4
+///   GiB, or up to 2.9 GiB where the carve-out held some of the driver's
+///   buffers;
+/// - 16 and 32 GiB hosts give it a quarter and the guest its room; the
+///   heap grows toward its target with what is left.
 #[test]
 fn integrated_gpu_hosts_split_as_expected() {
     let hosts = [7354 * MIB, free(8), 10842 * MIB, free(16), free(32)];
@@ -745,9 +746,9 @@ fn integrated_gpu_hosts_split_as_expected() {
         [
             [2592, 528, 382, 3072, 780],
             [2592, 528, 382, 3072, 1362],
-            [2688, 656, 548, 4390, 2560],
-            [4208, 1024, 724, 7272, 2644],
-            [4992, 1904, 858, 18700, 5290],
+            [2672, 640, 534, 4286, 2710],
+            [4106, 944, 710, 6144, 3968],
+            [4848, 1728, 832, 16400, 7936],
         ]
     );
     // The same hosts with a GPU of its own give it nothing.
@@ -756,7 +757,7 @@ fn integrated_gpu_hosts_split_as_expected() {
     }
 }
 
-/// On every host an integrated GPU takes a sixth within its bounds, the
+/// On every host an integrated GPU takes a quarter within its bounds, the
 /// parts are sized as on a host with that much less, and the share is short
 /// of its target only where more would put the guest under its floor.
 #[test]
@@ -1189,10 +1190,10 @@ fn an_integrated_gpus_share_leaves_the_guest() {
         [
             [2592, 780, 3072],
             [2592, 1362, 3072],
-            [2688, 2560, 4400],
-            [2752, 2560, 5220],
-            [4208, 2644, 7272],
-            [4992, 5290, 18700],
+            [2672, 2712, 4294],
+            [2720, 2976, 4908],
+            [4106, 3968, 6144],
+            [4848, 7936, 16400],
         ]
     );
 }
@@ -1582,5 +1583,55 @@ fn sizes_of_window(installed: u64) -> u64 {
         8 => 624 * MIB,
         16 => 1200 * MIB,
         _ => unreachable!(),
+    }
+}
+
+/// What the Metal device of an integrated GPU works in as it opens, Linux
+/// holding [`FALLBACK_OPEN`] of the share (`share::working_set`), with the
+/// guest and the heap beside it, MiB, at 8 PEs. A 16 GB PC with a 512 MiB
+/// carve-out (`HOST MEMORY free=14842M`) sat on the floor's share at a
+/// sixth and told the guest 1534 MiB, which Setup's Liquid Glass UI ran out
+/// of at 1527 MiB held; a 32 GB PC (`free=30084M`, 5014 MiB at a sixth)
+/// got through Setup and the desktop at a 2.9 GiB peak. A quarter gives the
+/// 16 GB PCs 2.4 and 2.6 GiB, their guests keep [`GUEST_ROOM`] and their
+/// heaps stay 990 MiB or more past [`HEAP_OWN`]; 12 GB PCs take a little of
+/// their guests, and 8 GB PCs, whose share is what the guest's floor
+/// leaves, are as they were.
+#[test]
+fn a_16_gb_pcs_metal_device_works_in_a_quarter_of_its_ram() {
+    let rows = [
+        7354 * MIB,
+        free(8),
+        10854 * MIB,
+        free(12),
+        14842 * MIB,
+        free(16),
+        30084 * MIB,
+        free(32),
+    ]
+    .map(|free| {
+        let sizes = sizes(free, 8, 8, GpuMemory::Shared).unwrap();
+        let metal = stela_drivers::gpu::share::working_set(stela_drivers::gpu::share::ShareState {
+            held: FALLBACK_OPEN,
+            limit: sizes.gpu,
+        });
+        [sizes.heap, sizes.guest, sizes.gpu, metal].map(|bytes| bytes / MIB)
+    });
+    // heap, guest, share, Metal's working set.
+    assert_eq!(
+        rows,
+        [
+            [2592, 3072, 780, 188],
+            [2592, 3072, 1362, 637],
+            [2672, 4294, 2712, 1650],
+            [2720, 4908, 2976, 1848],
+            [3414, 6144, 3710, 2398],
+            [4106, 6144, 3968, 2592],
+            [4768, 15330, 7520, 5256],
+            [4848, 16400, 7936, 5568],
+        ]
+    );
+    for [heap, guest, _, _] in &rows[4..] {
+        assert!(*heap >= (HEAP_OWN + 960 * MIB) / MIB && *guest >= GUEST_ROOM / MIB);
     }
 }

@@ -434,6 +434,24 @@ impl Queue {
         self.in_flight.len()
     }
 
+    /// The newest serial the GPU was given whole on the queue's timeline
+    /// and has not been seen to finish, when one holds upload chunks or
+    /// `deferred` says released objects wait: what a device out of memory
+    /// waits for ([`super::reclaim`]). Held work, and work whose rest waits
+    /// for an event, is left out: no wait the device makes ends it.
+    pub(super) fn retiring_serial(&self, deferred: bool) -> Option<u64> {
+        let running = self
+            .in_flight
+            .iter()
+            .filter(|flight| flight.track == Track::Timeline);
+        let holds = deferred
+            || self
+                .in_flight
+                .iter()
+                .any(|flight| flight.track == Track::Timeline && !flight.chunks.is_empty());
+        running.map(|flight| flight.serial).max().filter(|_| holds)
+    }
+
     /// Whether a command buffer in flight may read what `release` frees,
     /// including one seen complete and not yet retired.
     pub(super) fn reads(&self, release: &super::pins::Release) -> bool {

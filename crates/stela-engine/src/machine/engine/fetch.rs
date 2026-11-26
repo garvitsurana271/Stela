@@ -156,16 +156,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.next()
     }
 
-    /// The number of the context a fetch in `half` runs in now: the EL with
-    /// the guarded level, the variant and the half's translation inputs
-    /// ([`contexts::Key`]). ITLB entries name it.
+    /// [`Self::numbered_context`] of `variant`, numbered here.
+    #[cfg(test)]
     pub(super) fn context(&mut self, el: u8, variant: Variant, half: usize) -> u64 {
         let id = self.variant_id(variant);
         self.numbered_context(el, variant, id, half)
     }
 
-    /// [`Self::context`] of `variant`, numbered `id`: the recent contexts
-    /// compare by the number.
+    /// The number of the context a fetch in `half` runs in now: the EL with
+    /// the guarded level, the variant (`variant`, numbered `id`) and the
+    /// half's translation inputs ([`contexts::Key`]). ITLB entries name it.
+    /// The recent contexts compare variants by their numbers.
     fn numbered_context(&mut self, el: u8, variant: Variant, id: VariantId, half: usize) -> u64 {
         let epoch = self.fetch_epoch(half);
         if let Some(recent) = self.recent[half]
@@ -296,7 +297,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     /// [`Self::contexts`] of `variant`, numbered `id`.
-    pub(super) fn numbered_contexts(&mut self, el: u8, variant: Variant, id: VariantId) -> [u64; 2] {
+    pub(super) fn numbered_contexts(
+        &mut self,
+        el: u8,
+        variant: Variant,
+        id: VariantId,
+    ) -> [u64; 2] {
         loop {
             let generation = self.translation_generation;
             let contexts = [0, 1].map(|half| self.numbered_context(el, variant, id, half));

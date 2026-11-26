@@ -320,11 +320,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// `physical` in `current` (its variant before the page's own:
     /// `page_variant`), then the other pages of its leaf
     /// ([`Self::take_leaf_pages`]).
+    #[cfg(test)]
     pub(super) fn translate_leaf(&mut self, pc: u64, key: u64, physical: u64, current: Variant) {
         self.numbered_leaf(pc, key, physical, current, &mut [None; 2]);
     }
 
-    /// [`Self::translate_leaf`] with what the fetch numbered of its variant
+    /// `translate_leaf` with what the fetch numbered of its variant
     /// (`numbers`, [`Self::numbered_page_variant`]).
     fn numbered_leaf(
         &mut self,
@@ -366,7 +367,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if number.is_none() {
             *number = self.known_variant(variant);
         }
-        debug_assert_eq!(*number, self.known_variant(variant), "numbers of another variant");
+        debug_assert_eq!(
+            *number,
+            self.known_variant(variant),
+            "numbers of another variant"
+        );
         (variant, *number)
     }
 

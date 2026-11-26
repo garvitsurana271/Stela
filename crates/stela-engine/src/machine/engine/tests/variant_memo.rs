@@ -29,7 +29,10 @@ fn the_memo_gives_the_registry_s_numbers() {
     // registry's number, and a guarded page's variant its own.
     for round in 0..3 {
         for (at, &variant) in variants.iter().enumerate().rev().skip(round) {
-            let registry = machine.variants.find(&variant).map(|at| VariantId(at as u32));
+            let registry = machine
+                .variants
+                .find(&variant)
+                .map(|at| VariantId(at as u32));
             assert_eq!(machine.known_variant(variant), Some(ids[at]));
             assert_eq!(registry, Some(ids[at]));
             assert_eq!(machine.variant_id(variant), ids[at]);
@@ -40,7 +43,10 @@ fn the_memo_gives_the_registry_s_numbers() {
             assert_ne!(machine.variant_id(guarded), ids[at]);
             assert_eq!(
                 machine.known_variant(guarded),
-                machine.variants.find(&guarded).map(|at| VariantId(at as u32))
+                machine
+                    .variants
+                    .find(&guarded)
+                    .map(|at| VariantId(at as u32))
             );
         }
     }
@@ -64,9 +70,9 @@ fn another_registry_forgets_the_memo() {
     assert_ne!(VariantId(renumbered as u32), id);
     machine.variants = other;
     assert_eq!(machine.known_variant(first), None);
-    assert_eq!(machine.known_variant(second), Some(VariantId(renumbered as u32)));
     assert_eq!(
-        machine.variant_id(first),
-        VariantId(renumbered as u32 + 1)
+        machine.known_variant(second),
+        Some(VariantId(renumbered as u32))
     );
+    assert_eq!(machine.variant_id(first), VariantId(renumbered as u32 + 1));
 }

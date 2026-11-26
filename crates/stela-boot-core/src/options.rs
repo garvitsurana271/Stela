@@ -724,7 +724,7 @@ pub struct System {
     /// Sign and authenticate the guest's pointers with a fast keyed
     /// multiply mix of key, modifier and pointer ([`FAST_PAC`]) in place of
     /// six AES rounds: PAC instructions take about a fifth fewer host
-    /// instructions and a quarter of their code bytes. WEAKER than Apple's
+    /// instructions and a third of their code bytes. WEAKER than Apple's
     /// QARMA-class cipher: the mix is not a pseudorandom function, so code
     /// already running in the guest that sees a few signed pointers can
     /// recover the multipliers and forge PACs, defeating macOS's pointer

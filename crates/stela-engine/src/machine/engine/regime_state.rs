@@ -218,6 +218,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// ID_AA64PFR0_EL1.CSV3 discloses FEAT_CSV3, the guest range check at
     /// every access (`identification::Speculation::faulting_data`).
     pub(super) fn memory_checks(&mut self) -> MemoryChecks {
+        if self.memory_checks.is_none() {
+            self.derived_version += 1;
+        }
         *self.memory_checks.get_or_insert_with(|| {
             let sctlr = self.cpu.regime_sctlr();
             let bit = if self.cpu.pstate.el == 0 { 4 } else { 3 };
@@ -247,6 +250,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     pub(super) fn native_system(&mut self) -> NativeSystem {
+        if self.native_system.is_none() {
+            self.derived_version += 1;
+        }
         *self.native_system.get_or_insert_with(|| NativeSystem {
             zero_block: system::native_zero_block(&self.cpu, &self.profile_missing),
             cache_clean: system::native_cache_clean(&self.cpu),

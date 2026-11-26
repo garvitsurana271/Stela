@@ -292,6 +292,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// forgot.
     pub(super) fn contexts(&mut self, el: u8, variant: Variant) -> [u64; 2] {
         let id = self.variant_id(variant);
+        self.numbered_contexts(el, variant, id)
+    }
+
+    /// [`Self::contexts`] of `variant`, numbered `id`.
+    pub(super) fn numbered_contexts(&mut self, el: u8, variant: Variant, id: VariantId) -> [u64; 2] {
         loop {
             let generation = self.translation_generation;
             let contexts = [0, 1].map(|half| self.numbered_context(el, variant, id, half));

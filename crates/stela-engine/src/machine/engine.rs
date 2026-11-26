@@ -690,6 +690,19 @@ const VARIANT_MEMO: usize = 4;
 
 /// [`Machine::variant_memo`]: variants with their numbers in the registry
 /// at `registry`, the oldest at `next`.
+/// What a fetch's variant derives from besides the memory checks and the
+/// native System features, which `version` (`Machine::derived_version`)
+/// stands for, and the registry its number is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FetchInputs {
+    version: u64,
+    registry: usize,
+    fp: bool,
+    single: bool,
+    scalable: Option<bool>,
+    timing: bool,
+}
+
 #[derive(Default)]
 struct VariantMemo {
     entries: [core::cell::Cell<Option<(Variant, VariantId)>>; VARIANT_MEMO],
@@ -1056,6 +1069,12 @@ pub struct Machine<H: Host, D: Devices> {
     memory_checks: Option<MemoryChecks>,
     /// [`Variant::system`] for the current EL, while valid.
     native_system: Option<NativeSystem>,
+    /// How many times `memory_checks` and `native_system` were derived
+    /// anew, which every change of either follows.
+    derived_version: u64,
+    /// A fetch's variant and its number, with what they were derived from
+    /// ([`Machine::fetch_variant`]).
+    fetch_variant: Option<(FetchInputs, Variant, VariantId)>,
     /// Whether blocks that branch back to their own start run their
     /// iterations inside themselves (`NativeSystem::self_loops`): on, but
     /// for tests that compare both forms.
@@ -1550,6 +1569,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             floating_point: None,
             memory_checks: None,
             native_system: None,
+            derived_version: 0,
+            fetch_variant: None,
             self_loops: true,
             regions: true,
             event_sample: None,

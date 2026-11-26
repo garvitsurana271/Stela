@@ -548,6 +548,12 @@ impl Ring {
     /// the choice that takes it away on. A publish checks it under the
     /// board's code lock: a retirement chooses its part before it lists the
     /// part's blocks under that lock, so a block it did not list sees it.
+    pub(in crate::machine::engine) fn part_live(&self, part: usize) -> bool {
+        self.live[part].load(Ordering::Acquire)
+    }
+
+    /// Whether `place`'s part still holds its generation's code ([`Self::part_live`]
+    /// is its part's flag alone).
     pub(in crate::machine::engine) fn live(&self, place: Place) -> bool {
         let part = place.part as usize;
         self.live[part].load(Ordering::Acquire) && self.holds(part) == place.generation

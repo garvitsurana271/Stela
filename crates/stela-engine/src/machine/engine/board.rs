@@ -217,6 +217,8 @@ pub(super) struct Code {
     pub(super) rebases: super::rebase::Rebases,
     /// The page keys of fetch pages its PEs read ([`super::known_keys`]).
     pub(super) known_keys: super::known_keys::KnownKeys,
+    /// The slots of shared code by code and page (`--share-aliases on`).
+    pub(super) aliases: Mutex<super::share_aliases::Table>,
 }
 
 /// A part's blocks being taken away page by page, in steps of bounded
@@ -828,6 +830,7 @@ impl Code {
             two_sided: Default::default(),
             rebases: super::rebase::Rebases::new(super::rebase::BOUND),
             known_keys: Default::default(),
+            aliases: Mutex::new(Default::default()),
         }
     }
 

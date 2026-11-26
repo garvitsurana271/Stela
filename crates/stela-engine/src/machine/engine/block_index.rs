@@ -131,6 +131,14 @@ impl BlockIndex {
         Some(&entries[start..start + count])
     }
 
+    /// The blocks at `physical`'s frame offset, of every PC and variant.
+    pub(super) fn at_offset(&mut self, physical: u64) -> impl Iterator<Item = usize> + '_ {
+        self.at(physical)
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.slot as usize)
+    }
+
     /// The block at `pc`, `physical` and `variant`: only the entries of
     /// its offset with its PC's tag load their blocks.
     pub(super) fn get(
@@ -541,7 +549,7 @@ mod tests {
             source_hash: 0,
             installer: 0,
             part: super::super::board::NO_PART,
-            device_stub: false,
+            marks: super::super::share_aliases::Marks::default(),
             hle: None,
             tier2: false,
         }

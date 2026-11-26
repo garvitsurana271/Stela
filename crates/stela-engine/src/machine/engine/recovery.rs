@@ -242,6 +242,12 @@ impl<'a> Template<'a> {
 
     /// The owner of the installed template: its rows, packed, or for a stored
     /// record where they are, until its first fault qualifies them.
+    /// Whether the template's code is position independent, compiled in
+    /// this boot: a stored form is never shared.
+    pub(super) fn position_independent(&self) -> bool {
+        matches!(self, Self::Compiled(emission) if emission.block.position_independent)
+    }
+
     pub(super) fn installed(self) -> CodeRecovery {
         let code_bytes = self.code().len() as u32;
         let rows = match self {
@@ -283,6 +289,23 @@ fn input_hash(bytes: &[u8]) -> u32 {
 
 impl CodeRecovery {
     /// The installed code's length.
+    /// The rows of the same position independent code run `delta` bytes
+    /// away, an alias's ([`super::share_aliases`]); `None` for rows not yet
+    /// qualified, which a stored block's are.
+    pub(super) fn rebased(&self, delta: u64) -> Option<Self> {
+        match &self.rows {
+            Rows::Qualified { code_bytes, rows } => Some(Self {
+                rows: Rows::Qualified {
+                    code_bytes: *code_bytes,
+                    rows: rows.rebased(delta),
+                },
+                #[cfg(test)]
+                qualification_attempts: 0,
+            }),
+            _ => None,
+        }
+    }
+
     pub(super) fn code_bytes(&self) -> usize {
         self.rows.code_bytes() as usize
     }

@@ -631,6 +631,9 @@ pub struct Statistics {
     /// What keeping the contexts across those TLBIs did (`--tlbi-keep on`,
     /// [`TlbiKeepCounts`]).
     pub tlbi_keep: TlbiKeepCounts,
+    /// What sharing translations across aliases did (`--share-aliases on`,
+    /// [`super::ShareAliasCounts`]).
+    pub share_aliases: super::ShareAliasCounts,
     pub compiled: u64,
     /// Of `compiled`, the blocks that run their iterations inside
     /// themselves (`CompiledBlock::self_loop`).
@@ -987,6 +990,7 @@ impl core::ops::AddAssign for Statistics {
             whole_tlbi_times,
             whole_tlbi_trigger,
             tlbi_keep,
+            share_aliases,
             compiled,
             self_loops,
             regions,
@@ -1147,6 +1151,7 @@ impl core::ops::AddAssign for Statistics {
         }
         self.whole_tlbi_trigger.add(&whole_tlbi_trigger);
         self.tlbi_keep.add(&tlbi_keep);
+        self.share_aliases.add(&share_aliases);
         self.tier2 += tier2;
         for (total, count) in self.record_misses.iter_mut().zip(record_misses) {
             *total += count;

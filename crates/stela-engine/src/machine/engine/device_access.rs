@@ -121,7 +121,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// board a PE runs the stubs of sites other PEs learnt.
     pub(super) fn device_stub(&self, index: usize, pc: u64) -> bool {
         let block = &self.code.blocks[index];
-        block.device_stub && block.pc == pc
+        block.marks.device_stub() && block.pc == pc
     }
 
     /// Install the stub of the device site at `pc` and `physical`: native
@@ -147,6 +147,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self_loop: false,
             region: false,
             cold: (0, 0),
+            position_independent: false,
         };
         let preparation = self.preparation(variant);
         let emission = Arc::new(super::stored::Emission::new(

@@ -60,6 +60,7 @@ mod pc_sampling;
 mod pointer_authentication;
 mod regime_state;
 mod scheduler;
+mod share_aliases;
 mod system_access;
 mod table_switches;
 mod timing;
@@ -76,6 +77,7 @@ pub use parallel::{
     SourceObservation, SourcePhase,
 };
 pub use rebase::RebaseCounts;
+pub use share_aliases::ShareAliasCounts;
 /// The reasons [`Statistics::switch_misses`] counts.
 pub const SWITCH_MISS_REASONS: usize = table_switches::miss::REASONS;
 pub use stela_contracts::dma::{DmaError, TransferFault};
@@ -481,8 +483,9 @@ struct Block {
     part: u8,
     /// A device site's stub ([`Machine::install_device_stub`]): its System
     /// exit is the site's access, on whichever PE runs it, whether or not
-    /// that PE learnt the site.
-    device_stub: bool,
+    /// that PE learnt the site. Or the owner of position independent code,
+    /// or an alias of one's ([`share_aliases`]).
+    marks: share_aliases::Marks,
     /// An HLE composite's mark ([`hle::Mark`]): where its native fast path
     /// ends, which a fault inside it is taken back from.
     hle: Option<hle::Mark>,
@@ -1037,6 +1040,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// Keeping the lookup contexts across a TLBI of everything, and
     /// verifying them before use (`--tlbi-keep on`, [`tlbi_keep`]).
     tlbi_keep: tlbi_keep::TlbiKeep,
+    /// One translation for every alias of physical code
+    /// (`--share-aliases on`, [`share_aliases`]).
+    share: share_aliases::Share,
     /// The pages forgotten contexts had taken last, by half and key: a
     /// context made anew for the key walks them again at once
     /// ([`Self::refill_pages`]).
@@ -1557,6 +1563,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             whole_tlbi_ttbr0: 0,
             whole_tlbis: 0,
             tlbi_keep: tlbi_keep::TlbiKeep::default(),
+            share: share_aliases::Share::default(),
             pending_refills: BTreeMap::new(),
             refills: Vec::new(),
             dropped_refills: BTreeMap::new(),

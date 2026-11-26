@@ -727,6 +727,8 @@ pub struct Counts {
     pub whole_tlbi_trigger: super::WholeTlbiTrigger,
     /// ([`super::Statistics::tlbi_keep`]).
     pub tlbi_keep: super::TlbiKeepCounts,
+    /// ([`super::Statistics::share_aliases`]).
+    pub share_aliases: super::ShareAliasCounts,
     /// What tier 2 did ([`super::Statistics::tier2`]).
     pub tier2: super::tier2::Tier2Counts,
     /// Its stamped transfers ([`chain::StampCount`]'s order), the exits it
@@ -2883,6 +2885,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             whole_tlbi_times: statistics.whole_tlbi_times,
             whole_tlbi_trigger: statistics.whole_tlbi_trigger,
             tlbi_keep: statistics.tlbi_keep,
+            share_aliases: statistics.share_aliases,
             tier2: statistics.tier2,
             transitions: [
                 statistics.native_transitions[stela_compiler::x86_64::transition::GUARDED_ENTER],

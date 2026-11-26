@@ -62,6 +62,12 @@ pub(super) struct Outcome {
     /// in the window.
     pub(super) hot_runs: u64,
     pub(super) hot_hits: u64,
+    /// With the addresses sharing one install (`Guest::shared`): runs of
+    /// paired blocks, which run position independent code, and the
+    /// aliases made for runs at the second address, one each time the
+    /// owner's install is new to it (`share_aliases`).
+    pub(super) shared_runs: u64,
+    pub(super) aliases: u64,
 }
 
 /// What a replay's ring does beyond its own choices.
@@ -93,10 +99,17 @@ struct Model {
     ran: Vec<bool>,
     pending: Vec<usize>,
     draining: bool,
+    /// The installed blocks whose second address has its alias.
+    aliased: Vec<bool>,
 }
 
 /// The bit of a run's block that says it runs once.
 const ONCE: usize = 1 << 62;
+/// The bit of a run's block that says it runs at its second address,
+/// sharing its first's install (`Guest::shared`).
+const ALIAS: usize = 1 << 61;
+/// The bit of a run's block that says it is a paired block's.
+const PAIRED: usize = 1 << 60;
 
 fn identity(block: usize) -> u64 {
     churn::identity(
@@ -111,6 +124,8 @@ impl Model {
         let generation = self.ring.generation();
         for block in core::mem::take(&mut self.blocks_of[part as usize]) {
             self.part_of[block] = None;
+            // An alias goes with its owner's code.
+            self.aliased[block] = false;
             if self.policy == Policy::Survivors && core::mem::take(&mut self.ran[block]) {
                 self.pending.push(block);
                 continue;
@@ -213,8 +228,11 @@ fn drive(guest: Guest, mut run: impl FnMut(usize, &mut u64, bool, bool)) {
                 }
                 // A block of a paired page at its second address is
                 // another block, unless the addresses share one install.
-                let slide = at < guest.paired && !guest.shared && next(&mut seed) & 1 == 1;
-                runs.push(2 * members[at] + usize::from(slide));
+                let second = at < guest.paired && next(&mut seed) & 1 == 1;
+                let slide = second && !guest.shared;
+                let alias = if second && guest.shared { ALIAS } else { 0 };
+                let paired = if at < guest.paired { PAIRED } else { 0 };
+                runs.push((2 * members[at] + usize::from(slide)) | alias | paired);
             }
             for _ in 0..guest.new / TICKS as usize {
                 runs.push((2 * fresh) | ONCE);
@@ -246,6 +264,8 @@ fn per_beat(outcome: Outcome) -> Outcome {
         copied: outcome.copied / BEATS,
         hot_runs: outcome.hot_runs / BEATS,
         hot_hits: outcome.hot_hits / BEATS,
+        shared_runs: outcome.shared_runs / BEATS,
+        aliases: outcome.aliases / BEATS,
         ..outcome
     }
 }
@@ -280,9 +300,15 @@ pub(super) fn replay_in(
         ran: vec![false; total],
         pending: Vec::new(),
         draining: false,
+        aliased: vec![false; total],
     };
     drive(guest, |block, seed, counting, hot| {
         model.counting = counting;
+        let (alias, paired) = (block & ALIAS != 0, block & PAIRED != 0);
+        let block = block & !(ALIAS | PAIRED);
+        if counting && guest.shared && paired {
+            model.outcome.shared_runs += 1;
+        }
         if counting && hot {
             model.outcome.hot_runs += 1;
             model.outcome.hot_hits += u64::from(model.part_of[block].is_some());
@@ -295,6 +321,12 @@ pub(super) fn replay_in(
                 }
             }
             None => model.install(block, hot),
+        }
+        // A run at the second address takes the alias of the install, made
+        // once per install: a slot, no code.
+        if alias && model.part_of[block].is_some() && !model.aliased[block] {
+            model.aliased[block] = true;
+            model.outcome.aliases += u64::from(counting);
         }
     });
     model.outcome.outs = model.ring.outs();
@@ -511,6 +543,66 @@ fn one_install_for_both_slides_keeps_a_window_sized_pool() {
         shared.hot_hits * apart.hot_runs > apart.hot_hits * shared.hot_runs,
         "{apart:?} {shared:?}"
     );
+}
+
+/// What sharing costs against what it saves, at the Finder window's 64%
+/// pairs: an install of a block per address against one install and an
+/// alias (a slot and its moved rows, no compile, no code) per address, and
+/// the price of running position independent code. Assumed costs, in TSC
+/// ticks: an install 30 000 (10 us, compiled or relocated, the code and
+/// its links), an alias 3 000; a shared run pays a load from the frame per
+/// guest address it uses (two, 1 tick each) and, for the third of its
+/// transfers that leave the page, a probe (75 ticks) where a stamped tail
+/// took 40. A replay run stands for every transfer a block made in its
+/// tick, which the replay does not know: the table gives how many each may
+/// stand for before sharing loses, against a laptop's tens.
+#[test]
+fn sharing_aliases_pays_for_its_runs_at_the_finder_window() {
+    const INSTALL: f64 = 30_000.0;
+    const ALIAS: f64 = 3_000.0;
+    const RUN: f64 = 2.0 + (75.0 - 40.0) / 3.0;
+    let guest = Guest {
+        hot: 17_680,
+        least: 0.25,
+        new: 1_200,
+        turnover: 300,
+        paired: 8_320,
+        shared: false,
+    };
+    let apart = replay_in(guest, 27_000, 64, super::ring::NURSERY_SHARE, Policy::Ring);
+    let shared = replay_in(
+        Guest {
+            shared: true,
+            ..guest
+        },
+        27_000,
+        64,
+        super::ring::NURSERY_SHARE,
+        Policy::Ring,
+    );
+    let saved =
+        (apart.installs as f64 - shared.installs as f64) * INSTALL - shared.aliases as f64 * ALIAS;
+    let per_run = shared.shared_runs as f64 * RUN;
+    let break_even = saved / per_run;
+    std::println!(
+        "SHARE REPLAY apart installs={} again={} | shared installs={} again={} aliases={} \
+         shared_runs={} | saved={:.0} ticks a beat, {:.1} ticks a shared run: even at {:.0} \
+         transfers a run",
+        apart.installs,
+        apart.again,
+        shared.installs,
+        shared.again,
+        shared.aliases,
+        shared.shared_runs,
+        saved,
+        RUN,
+        break_even,
+    );
+    assert!(
+        shared.installs + shared.aliases < apart.installs,
+        "{apart:?} {shared:?}"
+    );
+    assert!(saved > 0.0, "{apart:?} {shared:?}");
 }
 
 /// The table behind it: shares of the hot pool at two slides and windows,

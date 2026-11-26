@@ -39,6 +39,9 @@ pub struct Preparation {
     /// The PE has SME, and PSTATE.SM.
     scalable: Option<bool>,
     system: NativeSystem,
+    /// Compile blocks position independent where they can
+    /// (`--share-aliases on`).
+    position_independent: bool,
     /// [`Self::context`] of the lower and upper halves' address classes,
     /// which every fetch page lies in: each install of a block prepared
     /// elsewhere checks it.
@@ -109,10 +112,20 @@ impl Preparation {
             checks,
             scalable,
             system,
+            position_independent: false,
             contexts: [Digest::default(); 2],
         };
         preparation.contexts = HALVES.map(|class| preparation.describe(class));
         preparation
+    }
+
+    /// The same preparation compiling position independent where it can
+    /// (`stela_compiler::Options::with_position_independent`), whose
+    /// contexts then differ: the store never gives its blocks for another.
+    pub(super) fn with_position_independent(mut self, position_independent: bool) -> Self {
+        self.position_independent = position_independent;
+        self.contexts = HALVES.map(|class| self.describe(class));
+        self
     }
 
     /// What decides this preparation, for another process to make it again
@@ -180,13 +193,18 @@ impl Preparation {
             checks,
             scalable,
             system,
+            position_independent,
             contexts: _,
         } = self;
-        let described = format!(
+        let mut described = format!(
             "chip {chip:?} withheld {:#x} target {target:?} fp {fp} checks {checks:?} scalable {scalable:?} \
              system {system:?} class {class:#x}",
             admit.withheld(),
         );
+        // Off, the description is the one every earlier store keyed by.
+        if *position_independent {
+            described.push_str(" position-independent");
+        }
         Digest::of(described.as_bytes())
     }
 
@@ -222,6 +240,7 @@ impl Preparation {
         stela_compiler::Options::new(PROFILE, self.target)
             .with_memory_checks(self.checks)
             .with_native_system(self.system)
+            .with_position_independent(self.position_independent)
     }
 
     /// Prepare the block at `pc` from the admitted window `source`, which

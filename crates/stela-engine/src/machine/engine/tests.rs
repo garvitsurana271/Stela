@@ -10533,6 +10533,7 @@ mod recovery;
 mod reinstall_cost;
 mod retire_cost;
 mod run_overhead;
+mod share_aliases;
 mod shared_code;
 mod sharing;
 mod stage2_syndrome;

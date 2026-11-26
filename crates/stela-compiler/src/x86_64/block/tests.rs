@@ -3953,3 +3953,117 @@ fn cold_ranges_cover_the_code_behind_the_jumps_over_it() {
     }
     assert_eq!(compile(&[0x9100_0400, 0x9100_0421]).cold, (0, 0));
 }
+
+/// One position independent copy of a block runs as the block compiled at
+/// each address its page is mapped at: at the shared cache's two slides
+/// 0xdf88000 apart, the ADRP, ADR, BL's link and the exits' targets are
+/// those of the PC it runs at, through the page base alone. Its code holds
+/// no field to relocate and is the same compiled at either PC.
+#[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn a_position_independent_block_runs_as_compiled_at_each_address_of_its_page() {
+    use crate::{
+        GuestState, Lifter, PageBase, TargetCpu,
+        aarch64::Decoder,
+        x86_64::{native, pinned},
+    };
+    const SLIDE: u64 = 0xdf8_8000;
+    let checks = super::super::MemoryChecks::DEFAULT;
+    let system = super::super::NativeSystem::NONE;
+    // adrp x0,#+1 page; adr x3,#+12; add x5,x5,#1; then the terminal.
+    let body = [0xb000_0000_u32, 0x1000_0063, 0x9100_04a5];
+    let terminals = [
+        0x9400_0080_u32, // bl #+0x200
+        0x5400_0080,     // b.eq #+0x10
+        0x1400_0400,     // b #+0x1000, the next page
+    ];
+    let block = |entry: u64, terminal_word: u32| {
+        let instructions: Vec<_> = body
+            .iter()
+            .enumerate()
+            .map(|(at, &word)| {
+                Decoder
+                    .lift(GuestAddress(entry + 4 * at as u64), word)
+                    .unwrap()
+            })
+            .collect();
+        let branch_pc = GuestAddress(entry + 4 * body.len() as u64);
+        // BL is a call, whose link the terminal writes.
+        let terminator = match terminal_word >> 26 {
+            0x25 => Terminator::DirectCall(GuestAddress(
+                branch_pc.0 + 4 * u64::from(terminal_word & 0x3ff_ffff),
+            )),
+            _ => Terminator::Branch(Decoder.lift(branch_pc, terminal_word).unwrap().operation),
+        };
+        let terminal = (branch_pc, terminator);
+        (instructions, terminal, GuestAddress(branch_pc.0 + 4))
+    };
+    let canonical = 0x1_8a34_5f40;
+    for terminal_word in terminals {
+        let compile_independent = |entry| {
+            let (instructions, terminal, next) = block(entry, terminal_word);
+            emit_system_mode_position_independent(
+                &instructions,
+                Some(&terminal),
+                next,
+                TargetCpu::Baseline,
+                checks,
+                system,
+            )
+            .expect("position independent")
+            .0
+        };
+        let shared = compile_independent(canonical);
+        assert_eq!(shared.relocations, None);
+        assert_eq!(
+            compile_independent(canonical + SLIDE).x86_64_code,
+            shared.x86_64_code
+        );
+        let entered = pinned::entered(&shared.x86_64_code);
+        for entry in [canonical, canonical + SLIDE, canonical - 7 * SLIDE] {
+            let (instructions, terminal, next) = block(entry, terminal_word);
+            let (own, _) = emit_system_mode(
+                &instructions,
+                Some(&terminal),
+                next,
+                TargetCpu::Baseline,
+                checks,
+                system,
+            );
+            assert!(
+                own.relocations
+                    .as_ref()
+                    .is_some_and(|fields| !fields.is_empty())
+            );
+            for nzcv in [0, 0x4000_0000] {
+                let mut expected = GuestState {
+                    x: core::array::from_fn(|index| 0x1111 * index as u64),
+                    nzcv,
+                    ..GuestState::default()
+                };
+                let mut state = expected.clone();
+                state.page_base = PageBase(entry & !0xfff);
+                let exit = native::run(&pinned::entered(&own.x86_64_code), &mut expected);
+                assert_eq!(native::run(&entered, &mut state), exit, "{entry:#x}");
+                assert_eq!(state, expected, "{entry:#x}");
+                assert_eq!(state.x[0], (entry & !0xfff) + 0x1000);
+                assert_eq!(state.x[3], entry + 4 + 12);
+            }
+        }
+    }
+    // An ADRP whose page lies past a 32-bit offset keeps its field: no
+    // position independent block.
+    let entry = GuestAddress(0x1_8a34_5f40);
+    let far = [Decoder.lift(entry, 0x9000_0000 | 0x3_ffff << 5).unwrap()];
+    assert!(
+        emit_system_mode_position_independent(
+            &far,
+            None,
+            GuestAddress(entry.0 + 4),
+            TargetCpu::Baseline,
+            checks,
+            system,
+        )
+        .is_none()
+    );
+}

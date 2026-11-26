@@ -130,6 +130,7 @@ pub(crate) fn emit_ordinary_for_target(
             frame_loop: None,
             self_loop: None,
             region: false,
+            position_independent: false,
         },
         super::MemoryChecks::DEFAULT,
         super::NativeSystem::NONE,
@@ -156,6 +157,7 @@ pub(crate) fn emit_frame_loop(
             frame_loop: Some(entry),
             self_loop: None,
             region: false,
+            position_independent: false,
         },
         super::MemoryChecks::DEFAULT,
         super::NativeSystem::NONE,
@@ -199,6 +201,7 @@ pub(crate) fn emit_for_target(
             frame_loop: None,
             self_loop: None,
             region: false,
+            position_independent: false,
         },
         checks,
         super::NativeSystem::NONE,
@@ -278,6 +281,7 @@ pub(crate) fn emit_system_mode_looped(
                 false => SelfLoop::admit(instructions, terminal, native),
             },
             region,
+            position_independent: false,
         },
         super::MemoryChecks {
             guest_range: true,
@@ -285,6 +289,54 @@ pub(crate) fn emit_system_mode_looped(
         },
         native,
     )
+}
+
+/// [`emit_system_mode_looped`] of a block, not a region, that holds each
+/// guest address as its offset from the block's 4 KiB page added to the
+/// page the code runs at (`GuestState::page_base`): one copy of the code
+/// serves every address its page is mapped at, where a block at each
+/// address holds its own addresses (or a stored one has them relocated).
+/// Its source map, rows and exits name the addresses of the block's own
+/// PCs, as for any block. `None` when an address lies too far from the
+/// page for a 32-bit offset, or code the block appended holds one apart:
+/// then only [`emit_system_mode_looped`] compiles it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the engine installs one copy per address until it shares a page's"
+    )
+)]
+pub(crate) fn emit_system_mode_position_independent(
+    instructions: &[Instruction],
+    terminal: Option<&(GuestAddress, Terminator)>,
+    fallthrough: GuestAddress,
+    target: crate::TargetCpu,
+    checks: super::MemoryChecks,
+    native: super::NativeSystem,
+) -> Option<(NativeBlock, Vec<crate::block::FaultRecovery>, Shape)> {
+    let (block, rows, shape) = emit_selected(
+        instructions,
+        terminal,
+        fallthrough,
+        target,
+        RegionPolicy {
+            optimize: false,
+            fault_table: true,
+            pinned: true,
+            frame_loop: None,
+            self_loop: SelfLoop::admit(instructions, terminal, native),
+            region: false,
+            position_independent: true,
+        },
+        super::MemoryChecks {
+            guest_range: true,
+            ..checks
+        },
+        native,
+    );
+    // Code emitted position independent has no fields to relocate.
+    block.relocations.is_none().then_some((block, rows, shape))
 }
 
 /// A system-mode block whose conditional terminal branches back to its own
@@ -484,6 +536,9 @@ struct RegionPolicy {
     /// The instructions are a region's: its branches into itself jump
     /// there ([`edges`]).
     region: bool,
+    /// Emit its guest addresses relative to the page it runs at
+    /// ([`super::asm::Code::set_position_independent`]).
+    position_independent: bool,
 }
 
 /// The final address of a flagless ADD that overwrites its adjacent ADR(P).
@@ -529,6 +584,7 @@ fn emit_selected(
         frame_loop,
         self_loop,
         region,
+        position_independent,
     } = regions;
     let region = region.then(|| edges::Region::plan(instructions, terminal));
     let mut fault_recovery = vec![];
@@ -546,6 +602,14 @@ fn emit_selected(
             .or(terminal.map(|(pc, _)| *pc))
     {
         code.set_linked_block(first.0);
+    }
+    if position_independent
+        && let Some(first) = instructions
+            .first()
+            .map(|first| first.pc)
+            .or(terminal.map(|(pc, _)| *pc))
+    {
+        code.set_position_independent(first.0 & !0xfff);
     }
     code.set_constant_time(target.data_independent_timing());
     let frame_loop = frame_loop.map(|entry| super::region::FrameLoop::begin(code, entry));

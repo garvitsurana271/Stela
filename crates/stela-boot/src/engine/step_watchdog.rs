@@ -5,7 +5,9 @@
 //! run the guest. A core cycle counter, armed for each segment
 //! ([`enter`]) and put back once a second at most by every step that
 //! returns (`step_counts::WATCH`), overflows only when nothing returned for
-//! the whole limit; the local APIC delivers that overflow as an NMI, whose
+//! the whole limit by the time-stamp counter, an overflow before that
+//! putting it back from its NMI ([`check_in`]); the local APIC delivers
+//! that overflow as an NMI, whose
 //! terminal handler stops the boot with the stuck step and the instruction
 //! pointer it interrupted ([`nmi_reason`], `interrupts::fatal`), saved and
 //! shown like every stop.
@@ -38,6 +40,8 @@ static COUNTER: AtomicU8 = AtomicU8::new(NONE);
 /// AMD performance monitoring version 2: a global enable gates counter 0.
 static AMD_GLOBAL: AtomicBool = AtomicBool::new(false);
 static START: AtomicU64 = AtomicU64::new(0);
+/// The counter's width in bits, for a check's own count ([`check_in`]).
+static WIDTH: AtomicU32 = AtomicU32::new(0);
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 /// The processor whose local APIC delivers the NMI.
 static PROCESSOR: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -284,10 +288,11 @@ pub(super) unsafe fn install(tsc_hz: u64) {
         if !counted {
             return Err("the counter does not count from a full-width start");
         }
-        Ok((counter, start, taken))
+        Ok((counter, start, taken, width))
     });
     match found {
-        Ok((counter, start, taken)) => {
+        Ok((counter, start, taken, width)) => {
+            WIDTH.store(width, Ordering::Relaxed);
             let apic = apic();
             SAVED_LVT.store(apic.read(LVT_PERFORMANCE), Ordering::Relaxed);
             apic.write(LVT_PERFORMANCE, LVT_NMI);
@@ -451,6 +456,62 @@ fn rearm(now: u64) {
         ARMED_AT.store(now, Ordering::Relaxed);
     }
     WATCH.due_at(decide::next_rearm(now, TSC_HZ.load(Ordering::Relaxed)));
+}
+
+/// The counter's overflow NMI on this processor, before the limit has
+/// passed by the time-stamp counter since a step last returned: the counter
+/// counts again for what is left of it (`decide::check_in`), with its
+/// overflow cleared and the local APIC entry unmasked, and this returns 1,
+/// the NMI's gate then returning as for a `--profile` sample. 0 for any
+/// other NMI, or once the limit passed, which the watchdog's stop takes
+/// ([`nmi_is_watchdog`]). Only the counter's own registers are touched: the
+/// NMI may have interrupted anything.
+pub(crate) fn check_in() -> u64 {
+    let counter = COUNTER.load(Ordering::Acquire);
+    if counter == NONE || PROCESSOR.load(Ordering::Relaxed) != super::host::local::processor() {
+        return 0;
+    }
+    // Counting up from at least `START`, the counter reads below it only
+    // once it wrapped: this NMI is its overflow.
+    let start = START.load(Ordering::Relaxed);
+    if !counter_value(counter).is_some_and(|value| value < start) {
+        return 0;
+    }
+    let next = if ARMED.load(Ordering::Relaxed) {
+        let tsc_hz = TSC_HZ.load(Ordering::Relaxed);
+        let Some(cycles) = decide::check_in(
+            ARMED_AT.load(Ordering::Relaxed),
+            crate::apic::rdtsc(),
+            tsc_hz,
+        ) else {
+            return 0;
+        };
+        let Some(next) = decide::counter_start(cycles, WIDTH.load(Ordering::Relaxed)) else {
+            return 0;
+        };
+        next
+    } else {
+        // The segment ended ([`leave`]) as the counter overflowed: nothing
+        // is watched, and the stopped counter reads its full start again,
+        // so that no later NMI is taken for this one.
+        start
+    };
+    let cleared = match counter {
+        INTEL_FIXED => {
+            pmu::write(INTEL_FIXED_CTR1, next)
+                && pmu::write(INTEL_GLOBAL_OVF_CTRL, INTEL_FIXED1_GLOBAL)
+        }
+        _ => {
+            pmu::write(AMD_CTR0, next)
+                && (!AMD_GLOBAL.load(Ordering::Relaxed) || pmu::write(AMD_GLOBAL_STATUS_CLR, 1))
+        }
+    };
+    if !cleared {
+        return 0;
+    }
+    // Intel masks the entry at each delivery.
+    apic().write(LVT_PERFORMANCE, LVT_NMI);
+    1
 }
 
 /// Progress a long operation reports: the counter goes back as after a

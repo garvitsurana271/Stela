@@ -10,9 +10,14 @@
 //! [`message`]) with the interrupted instruction pointer.
 //!
 //! The counter counts unhalted core cycles, whose rate follows the core's
-//! clock: [`start_value`] counts [`CLOCK_FACTOR`] times the time-stamp
-//! counter's rate, so the NMI never comes before the limit, and comes at
-//! most `CLOCK_FACTOR` times later on a core that runs at its base clock.
+//! clock, so it does not time the limit itself: it overflows after
+//! [`CHECK_SECONDS`] of cycles at the time-stamp counter's rate
+//! ([`start_value`]), and an overflow that comes before the limit by the
+//! time-stamp counter puts it back for what is left of the limit, its NMI
+//! returning ([`check_in`]). The stop then comes within [`CHECK_FLOOR_MS`]
+//! of the limit on a core at or above its nominal clock, and within one
+//! check of it below, where 0.6.1 counted three times the limit's cycles at
+//! once and stopped after 45 to 90 s while saying 30 s (65 s on an i5-10500).
 //!
 //! Once the other processors run, the counter is off (`--profile` may use
 //! it) and they watch instead: each of them, between two slices of its
@@ -36,25 +41,54 @@ pub const LIMIT_SECONDS: u64 = 30;
 /// How often at most a returned step puts the counter back.
 pub const REARM_SECONDS: u64 = 1;
 
-/// The core clock's bound as a multiple of the time-stamp counter's rate:
-/// a turbo clock stays below three times the nominal one.
-pub const CLOCK_FACTOR: u64 = 3;
+/// How many seconds of cycles at the time-stamp counter's rate the counter
+/// counts before its NMI looks at the time ([`check_in`]): a core at a
+/// turbo clock overflows sooner and one below its nominal clock later, so
+/// the look, not the count, decides when the limit has passed.
+pub const CHECK_SECONDS: u64 = 5;
 
-/// The value a `width`-bit up-counter starts from to overflow after the
-/// limit's cycles at [`CLOCK_FACTOR`] times `tsc_hz`; `None` when the
-/// count does not fit or the rate is unknown.
+/// The fewest cycles a check puts the counter back for, in milliseconds at
+/// the time-stamp counter's rate: a core above its nominal clock overflows
+/// before each rest of the limit runs out, and this bounds how many such
+/// checks it takes and how late past the limit the last one comes.
+pub const CHECK_FLOOR_MS: u64 = 500;
+
+/// The value a `width`-bit up-counter starts from to overflow after
+/// [`CHECK_SECONDS`] of cycles at `tsc_hz`; `None` when the count does not
+/// fit or the rate is unknown.
 pub fn start_value(tsc_hz: u64, width: u32) -> Option<u64> {
-    if tsc_hz == 0 || !(32..=64).contains(&width) {
+    counter_start(tsc_hz.checked_mul(CHECK_SECONDS)?, width)
+}
+
+/// The value a `width`-bit up-counter starts from to overflow after
+/// `cycles`; `None` when they do not fit.
+pub fn counter_start(cycles: u64, width: u32) -> Option<u64> {
+    if !(32..=64).contains(&width) {
         return None;
     }
-    let cycles = tsc_hz
-        .checked_mul(LIMIT_SECONDS)?
-        .checked_mul(CLOCK_FACTOR)?;
     let mask = u64::MAX >> (64 - width);
     if cycles == 0 || cycles > mask {
         return None;
     }
     Some((mask - cycles).wrapping_add(1) & mask)
+}
+
+/// What the counter's overflow NMI at `now` does, the counter last put back
+/// by a returned step at `armed_at`, all by the time-stamp counter at
+/// `tsc_hz`: before the limit, the cycles to count again (what is left of
+/// the limit, at most [`CHECK_SECONDS`] and at least [`CHECK_FLOOR_MS`]),
+/// the NMI then returning; `None` once nothing returned for the whole
+/// limit, and the NMI is the watchdog's stop ([`attribute`]). A put-back
+/// time after `now` counts as none passed.
+pub fn check_in(armed_at: u64, now: u64, tsc_hz: u64) -> Option<u64> {
+    let limit = tsc_hz.checked_mul(LIMIT_SECONDS)?;
+    let quiet = now.saturating_sub(armed_at);
+    if tsc_hz == 0 || quiet >= limit {
+        return None;
+    }
+    let check = tsc_hz.saturating_mul(CHECK_SECONDS);
+    let floor = tsc_hz.saturating_mul(CHECK_FLOOR_MS) / 1000;
+    Some((limit - quiet).min(check).max(floor.max(1)))
 }
 
 /// When a step returning at `now` next puts the counter back.
@@ -472,16 +506,98 @@ mod tests {
     const HZ: u64 = 2_400_000_000;
 
     #[test]
-    fn the_counter_overflows_after_the_limit_at_the_bounded_clock() {
+    fn the_counter_overflows_after_one_check_at_the_nominal_clock() {
         let start = start_value(HZ, 48).unwrap();
-        assert_eq!((1u64 << 48) - start, HZ * LIMIT_SECONDS * CLOCK_FACTOR);
+        assert_eq!((1u64 << 48) - start, HZ * CHECK_SECONDS);
         let start = start_value(HZ, 64).unwrap();
-        assert_eq!(start.wrapping_neg(), HZ * LIMIT_SECONDS * CLOCK_FACTOR);
-        // A 32-bit counter cannot hold 216 G cycles; no rate, no counter.
+        assert_eq!(start.wrapping_neg(), HZ * CHECK_SECONDS);
+        assert_eq!(counter_start(1000, 48), Some((1 << 48) - 1000));
+        assert_eq!(counter_start(0, 48), None);
+        // A 32-bit counter cannot hold 12 G cycles; no rate, no counter.
         assert_eq!(start_value(HZ, 32), None);
         assert_eq!(start_value(0, 48), None);
         assert_eq!(start_value(HZ, 16), None);
         assert_eq!(start_value(u64::MAX / 2, 64), None);
+    }
+
+    /// When the watchdog stops a step that never returns on a core whose
+    /// clock is `ratio` (in hundredths) of the time-stamp counter's rate,
+    /// in milliseconds by the time-stamp counter: each overflow comes
+    /// after its cycles at that clock, and [`check_in`] decides.
+    fn stopped_after_ms(ratio: u64) -> u64 {
+        let armed_at = 1 << 40;
+        let mut now = armed_at;
+        let mut cycles = HZ * CHECK_SECONDS;
+        let mut checks = 0;
+        loop {
+            now += cycles * 100 / ratio;
+            match check_in(armed_at, now, HZ) {
+                Some(next) => cycles = next,
+                None => {
+                    let observation = Observation {
+                        armed: true,
+                        armed_at,
+                        step_began: armed_at,
+                        task: 1,
+                        sequence: 1,
+                        now,
+                        tsc_hz: HZ,
+                    };
+                    // The stop's NMI is the watchdog's, past the limit.
+                    assert!(attribute(&observation).is_some());
+                    return (now - armed_at) * 1000 / HZ;
+                }
+            }
+            checks += 1;
+            assert!(checks < 100, "the checks never end at {ratio}%");
+        }
+    }
+
+    #[test]
+    fn a_step_that_never_returns_stops_near_the_limit_at_any_clock() {
+        let limit = LIMIT_SECONDS * 1000;
+        // At or above the nominal clock (an i5-10500 turbos at 1.45 times
+        // it, where 0.6.1's count of three limits stopped after 65 s):
+        // within the floor of the limit.
+        for ratio in [100, 145, 200, 300, 450] {
+            let stopped = stopped_after_ms(ratio);
+            assert!(
+                (limit..limit + CHECK_FLOOR_MS).contains(&stopped),
+                "{ratio}%: {stopped} ms"
+            );
+        }
+        // Below it, within the slower clock's one check.
+        for ratio in [50, 80] {
+            let stopped = stopped_after_ms(ratio);
+            let late = CHECK_SECONDS * 1000 * (100 - ratio) / ratio;
+            assert!(
+                (limit..=limit + late).contains(&stopped),
+                "{ratio}%: {stopped} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn a_check_counts_what_is_left_of_the_limit() {
+        let armed_at = 1 << 40;
+        // Early on, one whole check; near the end, what is left; past the
+        // limit, the stop.
+        assert_eq!(
+            check_in(armed_at, armed_at + HZ, HZ),
+            Some(HZ * CHECK_SECONDS)
+        );
+        assert_eq!(check_in(armed_at, armed_at + 28 * HZ, HZ), Some(2 * HZ));
+        assert_eq!(
+            check_in(armed_at, armed_at + LIMIT_SECONDS * HZ - 1, HZ),
+            Some(HZ * CHECK_FLOOR_MS / 1000)
+        );
+        assert_eq!(check_in(armed_at, armed_at + LIMIT_SECONDS * HZ, HZ), None);
+        // A put-back time after the NMI's reading: none passed.
+        assert_eq!(
+            check_in(armed_at, armed_at - HZ, HZ),
+            Some(HZ * CHECK_SECONDS)
+        );
+        assert_eq!(check_in(armed_at, armed_at, 0), None);
     }
 
     #[test]

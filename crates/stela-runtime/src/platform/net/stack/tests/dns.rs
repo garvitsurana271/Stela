@@ -183,6 +183,59 @@ fn a_network_without_a_dns_server_asks_the_public_resolvers() {
     );
 }
 
+/// An address and gateway set by hand (`--ipv4`, `--ipv4-gateway`) with no
+/// `--dns` name no DNS server, as no DHCP runs: lookups ask the public
+/// resolvers, and the log says so. An I219 install set up so on 0.6.1
+/// stopped with `Dns("updates-http.cdn-apple.com: Failed")`.
+#[test]
+fn an_address_set_by_hand_without_dns_asks_the_public_resolvers() {
+    let clock = TestClock::default();
+    let link = Resolvers::new(
+        clock.clone(),
+        &[
+            (CLOUDFLARE, Reply::Address(FOUND)),
+            (QUAD9, Reply::Address(FOUND)),
+        ],
+        false,
+    );
+    let mut s = Stack::new(link, Jumping(clock), 7).unwrap();
+    s.set_ipv4(CLIENT_IP, 24, Some(SERVER_IP)).unwrap();
+    assert!(s.dhcp.is_none());
+    assert!(s.fixed_dns.is_none() && s.dns_servers.is_empty());
+    assert_eq!(
+        s.admission_notes(),
+        [String::from(
+            "no DNS server from DHCPv4 or IPv6 router advertisements: lookups ask the public resolvers 1.1.1.1, 9.9.9.9"
+        )]
+    );
+    assert_eq!(
+        s.resolve_now("updates-http.cdn-apple.com"),
+        Ok(FOUND.into())
+    );
+    assert_eq!(s.phy.link.asked, [CLOUDFLARE]);
+    assert!(
+        noted(
+            &s,
+            "DNS updates-http.cdn-apple.com: no DNS server from DHCPv4 or IPv6 router \
+             advertisements; asking the public resolvers 1.1.1.1, 9.9.9.9 instead (no --dns is set)"
+        ),
+        "{:?}",
+        s.notes
+    );
+    // A gateway left out leaves no route to them: the plain failure.
+    let clock = TestClock::default();
+    let link = Resolvers::new(clock.clone(), &[(CLOUDFLARE, Reply::Address(FOUND))], false);
+    let mut s = Stack::new(link, Jumping(clock), 7).unwrap();
+    s.set_ipv4(CLIENT_IP, 24, None).unwrap();
+    assert_eq!(
+        s.resolve_now("updates-http.cdn-apple.com"),
+        Err(NetError::Dns(String::from(
+            "no DNS server from DHCPv4 or IPv6 router advertisements"
+        )))
+    );
+    assert!(s.phy.link.asked.is_empty());
+}
+
 #[test]
 fn a_server_error_is_named_and_the_public_resolvers_answer_in_its_place() {
     let mut s = resolving(

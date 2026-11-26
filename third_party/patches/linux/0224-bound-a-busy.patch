@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Garvit Surana <251430630+garvitsurana271@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 15:55:07 +0000
+Subject: [PATCH] fix(nouveau): bound a busy fence wait by the clock and look
+ whether its GPU still answers each 10 ms of it, where a channel idle on a GPU
+ off the bus spun until the step watchdog stopped it, as neither its 15 s
+ timeout nor its once-a-tick look ever came due on jiffies that did not move
+
+nouveau_fence_wait_busy() never blocks, and on Stela's Linux layer
+jiffies move only when a task resumes or a service pass runs, so its
+jiffies timeout and patch 0218's "once a tick" nvkm_device_gone() look
+never fired inside one step. At a stop after an RTX 3050 Mobile left
+the bus, nouveau_drm_shutdown() idled each channel through this wait
+and the step watchdog ended it after 30 s, losing the end of the boot
+log. The wait now also ends once what was left of the fence's timeout
+has passed by ktime_get(), and looks at the device at once and then
+each NOUVEAU_FENCE_GONE_MS of that clock, as r535_gsp_gone() does.
+---
+ drivers/gpu/drm/nouveau/nouveau_fence.c | 28 ++++++++++++++++++++-----
+ 1 file changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_fence.c b/drivers/gpu/drm/nouveau/nouveau_fence.c
+index 8603e91673361837213d2cb9ca3fb1f27b0a0e2c..4a2bedd8da82e8232df2bd6729665e75aa41fdc3 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_fence.c
++++ b/drivers/gpu/drm/nouveau/nouveau_fence.c
+@@ -310,15 +310,33 @@ nouveau_fence_device(struct nouveau_fence *fence)
+ 	return device;
+ }
+ 
++/*
++ * How often, by the clock, a busy wait for a fence looks whether its GPU
++ * still answers MMIO (nvkm_device_gone()).
++ */
++#define NOUVEAU_FENCE_GONE_MS 10
++
+ static int
+ nouveau_fence_wait_busy(struct nouveau_fence *fence, bool intr)
+ {
+-	unsigned long looked = jiffies;
++	/*
++	 * The spin is bounded by ktime as well as by jiffies, and looks at the
++	 * device by ktime: a host whose jiffies do not move while a task spins
++	 * without blocking (Stela's Linux layer moves them when a task resumes
++	 * or reads the clock) would otherwise never see the fence's timeout
++	 * pass nor a look come due. The ktime bound is what is left of the
++	 * fence's timeout now.
++	 */
++	long left = (long)(fence->timeout - jiffies);
++	ktime_t start = ktime_get();
++	s64 limit = left > 0 ? jiffies_to_msecs(left) : 0;
++	s64 looked = -NOUVEAU_FENCE_GONE_MS, waited;
+ 	struct nvkm_device *device;
+ 	int ret = 0;
+ 
+ 	while (!nouveau_fence_done(fence)) {
+-		if (time_after_eq(jiffies, fence->timeout)) {
++		waited = ktime_ms_delta(ktime_get(), start);
++		if (time_after_eq(jiffies, fence->timeout) || waited >= limit) {
+ 			ret = -EBUSY;
+ 			break;
+ 		}
+@@ -326,10 +344,10 @@ nouveau_fence_wait_busy(struct nouveau_fence *fence, bool intr)
+ 		/*
+ 		 * A GPU off the bus signals nothing: the spin would last its whole
+ 		 * 15 s for each fence, and a channel teardown idles every channel
+-		 * of a file in turn. Look once a tick.
++		 * of a file in turn. Look at once, then each NOUVEAU_FENCE_GONE_MS.
+ 		 */
+-		if (jiffies != looked) {
+-			looked = jiffies;
++		if (waited >= looked + NOUVEAU_FENCE_GONE_MS) {
++			looked = waited;
+ 			device = nouveau_fence_device(fence);
+ 			if (device && nvkm_device_gone(device)) {
+ 				ret = -ENODEV;

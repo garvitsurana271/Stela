@@ -14,6 +14,7 @@
 #include <linux/printk.h>
 #include <linux/timekeeping.h>
 #include <stela/linux.h>
+#include <stela/service.h>
 
 /* Minimum admission is independent of full subsystem readiness. Authenticating
  * current preserves original Initial/Managed provenance even in atomic scope. */
@@ -31,6 +32,9 @@ static void atomic_minimum_us(u64 minimum)
     if (!owner->services->minimum_delay_us)
         stela_linux_fatal("missing actual atomic minimum provider");
     owner->services->minimum_delay_us(owner->context, minimum);
+    /* The delay spun and blocked nothing: a loop of them waiting on a
+     * jiffies bound sees the time it spent. */
+    stela_linux_jiffies_refresh();
 }
 
 /* The request's own shape is Stela's contract with its callers; a bad one

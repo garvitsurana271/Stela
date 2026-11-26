@@ -7,14 +7,19 @@
 #include <linux/sched/clock.h>
 #include <linux/timekeeping.h>
 #include <stela/linux.h>
+#include <stela/service.h>
 #include <stela/time.h>
 
+/* Each read also brings jiffies up to it: a task spinning on a jiffies bound
+ * while it reads the clock would otherwise wait on a count no tick moves. */
 ktime_t ktime_get(void)
 {
 	const struct stela_linux_owner *owner = stela_linux_owner();
 	if (!owner->services->now_ns)
 		__builtin_trap();
-	return owner->services->now_ns(owner->context);
+	ktime_t now = owner->services->now_ns(owner->context);
+	stela_linux_jiffies_at(now);
+	return now;
 }
 
 /* The owner's monotonic clock runs at the hardware's rate and nothing slews

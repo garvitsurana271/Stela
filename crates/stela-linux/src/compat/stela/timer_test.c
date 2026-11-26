@@ -15,6 +15,7 @@
 #include <stela/timer.h>
 
 void stela_linux_timer_test_sleeper(void);
+void stela_linux_timer_test_spinner(void);
 
 static unsigned int counted;
 static struct timer_list first, second, waker, completer, clearer;
@@ -184,4 +185,23 @@ void stela_linux_timer_test_sleeper(void)
 {
 	timer_list_waits();
 	hrtimer_waits();
+}
+
+/* A task that spins on a jiffies bound, as a driver's busy wait does, never
+ * blocks: jiffies move for it only through what it calls while it spins,
+ * udelay() and then clock reads alone. Without that the loop never ends and
+ * its step never returns. */
+void stela_linux_timer_test_spinner(void)
+{
+	/* From jiffies that are the clock's now. */
+	udelay(1);
+	ktime_t began = ktime_get();
+	unsigned long start = jiffies, end = start + HZ / 20;
+	while (time_before_eq(jiffies, end))
+		udelay(50);
+	assert(ktime_ms_delta(ktime_get(), began) >= 1000 / 20 - 2 * (1000 / HZ));
+	end = jiffies + HZ / 20;
+	while (time_before_eq(jiffies, end))
+		(void)ktime_get();
+	assert(time_after(jiffies, start + HZ / 10) && !irqs_disabled());
 }

@@ -58,11 +58,27 @@ static void update_jiffies(void)
 /* The service has no periodic tick, so jiffies move only when Linux code
  * runs. As Linux does when a CPU leaves tickless idle, a task that resumes
  * brings them up to the clock first: an expiry it computes from a stale
- * count would come early. An owner without a clock has no jiffies to move. */
+ * count would come early. So does a task that spins in udelay(), which
+ * never blocks (kernel/time.c). An owner without a clock has no jiffies to
+ * move. */
 void stela_linux_jiffies_refresh(void)
 {
     if (stela_linux_owner()->services->now_ns)
         update_jiffies();
+}
+
+/* Bring jiffies up to now, a clock sample ktime_get() just read: a task
+ * that spins on a jiffies bound reading the clock never blocks, so nothing
+ * else would move them during its step, where Linux's tick would. They move
+ * only forward, and a sample outside the clock's range moves nothing: the
+ * read itself is its caller's to judge. */
+void stela_linux_jiffies_at(s64 now)
+{
+    u64 sample;
+    if (now < 0 || now == S64_MAX || !sample_jiffies(now, &sample))
+        return;
+    if ((s64)(sample - READ_ONCE(jiffies_64)) > 0)
+        WRITE_ONCE(jiffies_64, sample);
 }
 
 void stela_linux_timer_queue_current(void)

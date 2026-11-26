@@ -396,7 +396,7 @@ fn lacks(name: &str, missing: &[(String, &str)], files: usize) -> ServiceError {
         Absent::NotOnUsb => {
             output::arguments(format_args!(
                 "GPU {name}: the USB's firmware bundle lacks {count} of this chip's {files} files \
-                 ({names}); `stela repair` completes it\n"
+                 ({names}); `stambha repair` on a computer with internet completes it\n"
             ));
             ServiceError::Refused(NO_FIRMWARE)
         }

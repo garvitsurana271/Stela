@@ -167,6 +167,9 @@ fn load_from(
     };
     let mut lacking = 0;
     let mut failed: Vec<&str> = Vec::new();
+    // Named by the manifest, and no such file on the volume: the USB lacks
+    // it, which `stela repair` puts right, rather than a read that failed.
+    let mut absent: Vec<&str> = Vec::new();
     for (artifact, why) in &selection.wanted {
         let Some(index) = bundled
             .bundle
@@ -185,7 +188,16 @@ fn load_from(
         let path = format!("{}/{}", bundle::DIRECTORY, object.path);
         let read = match open(root, &path) {
             Ok(Some(file)) => read_file(file, Some(object.length), MAX_IMAGE_BYTES),
-            Ok(None) => Err(stela_contracts::refuse!("the bundle names a missing file")),
+            Ok(None) => {
+                lacking += 1;
+                absent.push(artifact.sha256);
+                output::arguments(format_args!(
+                    "HOST FIRMWARE BUNDLE LACKS {} for {why}: the bundle names a missing file; \
+                     `stambha repair` writes it again\n",
+                    object.member
+                ));
+                continue;
+            }
             Err(error) => Err(error),
         };
         match read {
@@ -216,6 +228,8 @@ fn load_from(
                 .any(|object| object.sha256 == sha256)
             {
                 Held::Read
+            } else if absent.contains(&sha256) {
+                Held::Missing
             } else if failed.contains(&sha256) {
                 Held::Failed
             } else if left

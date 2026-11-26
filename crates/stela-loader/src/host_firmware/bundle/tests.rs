@@ -754,15 +754,21 @@ fn late_files_are_read_whole_by_family_within_the_handoffs_room() {
 
 #[test]
 fn the_engine_learns_what_became_of_each_bundle_file_before_the_exit() {
-    let files: Vec<_> = complete().into_iter().take(4).collect();
+    let files: Vec<_> = complete().into_iter().take(5).collect();
     let bytes = manifest(&files).unwrap();
     let bundle = Bundle::parse(&bytes).unwrap();
     let digests: Vec<&str> = files.iter().map(|(object, _)| object.sha256).collect();
-    let states = [Held::Read, Held::Failed, Held::NoRoom, Held::Unread];
+    let states = [
+        Held::Read,
+        Held::Missing,
+        Held::Failed,
+        Held::NoRoom,
+        Held::Unread,
+    ];
     let record = held_record(&bundle, |sha256| {
         states[digests.iter().position(|seen| *seen == sha256).unwrap()]
     });
-    assert_eq!(record.len(), 4 * 67);
+    assert_eq!(record.len(), 5 * 67);
     for (digest, state) in digests.iter().zip(states) {
         assert_eq!(held(Some(&record), digest), state);
     }
@@ -783,6 +789,12 @@ fn a_gpu_lacking_files_is_told_why_in_the_order_a_user_can_act_on() {
     // Any file the USB lacks: `stela repair` is the answer.
     assert_eq!(Absent::of([Unread, Lacks, Failed]), Absent::NotOnUsb);
     assert_eq!(Absent::of([NoBundle]), Absent::NotOnUsb);
+    // Named by the manifest and absent from its volume: the USB lacks it
+    // too, not a read of a file it holds. A Dell laptop's stick had every
+    // GSP-RM file listed and none on the volume, and the screen said the
+    // USB held the firmware and reading it failed.
+    assert_eq!(Absent::of([Missing; 4]), Absent::NotOnUsb);
+    assert_eq!(Absent::of([Read, Failed, Missing]), Absent::NotOnUsb);
     // On the USB, and a read failed.
     assert_eq!(Absent::of([Unread, Failed]), Absent::ReadFailed);
     // On the USB and not read: the GPU answered after the firmware's exit.

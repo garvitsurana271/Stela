@@ -343,6 +343,11 @@ impl Code {
     pub(crate) fn append(&mut self, other: Code) {
         debug_assert!(other.locals.is_none());
         let base = self.bytes.len();
+        // An empty buffer (moved slow paths) takes the page of the code it
+        // collects.
+        if base == 0 && self.position_independent.is_none() && !self.absolute {
+            self.position_independent = other.position_independent;
+        }
         // Other code relative to another page holds absolute addresses
         // here; its relocated fields stay fields.
         debug_assert!(self.position_independent.is_some() || other.position_independent.is_none());

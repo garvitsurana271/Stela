@@ -237,6 +237,11 @@ pub struct CompiledBlock {
     /// `--profile`'s host samples tell apart (`PES WHERE`). `(0, 0)` with
     /// none.
     pub cold: (u32, u32),
+    /// Every guest address the code holds is relative to the page it runs
+    /// at (`Options::with_position_independent`): its direct exits are
+    /// relative ones (`x86_64::chain::RELATIVE_EXIT_BYTES`) and it holds no
+    /// field to relocate.
+    pub position_independent: bool,
 }
 
 impl CompiledBlock {
@@ -250,6 +255,7 @@ impl CompiledBlock {
             self_loop: false,
             region: false,
             cold: (0, 0),
+            position_independent: false,
         }
     }
 }
@@ -635,7 +641,35 @@ impl CompilationPlan {
             // registers pinned; every other profile keeps the default checks.
             // Every profile keeps the locked recipes: system mode runs its
             // PEs concurrently.
-            let (mut native, fault_recovery, shape) = if profile.has(Features::FULL_SYSTEM) {
+            // A position independent block's page, its first PC's.
+            let home = (profile.has(Features::FULL_SYSTEM)
+                && options.position_independent()
+                && !parsed.region
+                && crate::x86_64::block::relocatable_terminal(parsed.terminal.as_ref()))
+            .then(|| {
+                parsed
+                    .instructions
+                    .first()
+                    .map(|first| first.pc)
+                    .or(parsed.terminal.as_ref().map(|(pc, _)| *pc))
+                    .unwrap_or(parsed.next_pc)
+                    .0
+                    & !0xfff
+            });
+            let independent = home.and_then(|_| {
+                crate::x86_64::block::emit_system_mode_position_independent(
+                    &parsed.instructions,
+                    parsed.terminal.as_ref(),
+                    parsed.next_pc,
+                    target,
+                    options.memory_checks(),
+                    options.native_system(),
+                )
+            });
+            let home = home.filter(|_| independent.is_some());
+            let (mut native, fault_recovery, shape) = if let Some(independent) = independent {
+                independent
+            } else if profile.has(Features::FULL_SYSTEM) {
                 crate::x86_64::block::emit_system_mode_looped(
                     &parsed.instructions,
                     parsed.terminal.as_ref(),
@@ -679,6 +713,7 @@ impl CompilationPlan {
                     parsed.terminal.as_ref(),
                     parsed.next_pc,
                     linked,
+                    home,
                 ),
             };
             // Code moved after its exits were emitted: each patch point
@@ -686,7 +721,12 @@ impl CompilationPlan {
             // system mode links; other profiles keep the ordinary bytes,
             // and the engine never links an exit that is not patchable.
             if linked.is_some() {
-                crate::x86_64::block::align_exits(&mut native.x86_64_code, &direct_exits, linked);
+                crate::x86_64::block::align_exits(
+                    &mut native.x86_64_code,
+                    &direct_exits,
+                    linked,
+                    home,
+                );
             }
             return Ok(CompiledBlock {
                 native,
@@ -696,6 +736,7 @@ impl CompilationPlan {
                 self_loop: shape.self_loop,
                 region: parsed.region,
                 cold: shape.cold,
+                position_independent: home.is_some(),
             });
         };
         Ok(CompiledBlock::unchained(native, parsed.source_bytes))

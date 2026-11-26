@@ -61,6 +61,11 @@ impl<'a> Asm<'a> {
     pub(crate) const fn linked_block(&self) -> Option<u64> {
         self.linked_block
     }
+    /// The block's page in position independent code
+    /// ([`code::Code::set_position_independent`]).
+    pub(crate) const fn independent_page(&self) -> Option<u64> {
+        self.position_independent
+    }
     /// `emit` given the frame's NZCV word from byte `offset`, which pinned
     /// code reaches through [`super::flag_word`] alone.
     pub(crate) fn with_flags(&mut self, offset: u32, emit: impl FnOnce(&mut Self, Mem)) {

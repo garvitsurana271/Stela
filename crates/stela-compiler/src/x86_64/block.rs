@@ -42,13 +42,17 @@ fn exit_point(asm: &mut Asm) {
 /// where they lie in it: each exit's patch point and link slot, and the
 /// dynamic exit ending its terminal, if it has one. Code installs at
 /// 8-byte aligned addresses, so an offset's alignment is its address's.
+/// `home` is a position independent block's page, whose exits are relative
+/// ones.
 pub(crate) fn align_exits(
     code: &mut [u8],
     exits: &[super::chain::DirectExit],
     linked: Option<u64>,
+    home: Option<u64>,
 ) {
     use super::chain::{
         DYNAMIC_EXIT_BYTES, align_direct_exit, align_dynamic_exit, align_link_slot,
+        align_relative_exit,
     };
     let mut terminal = super::chain::without_failures(code).len();
     for exit in exits {
@@ -56,7 +60,10 @@ pub(crate) fn align_exits(
         if slot != 0 {
             align_link_slot(code, exit.offset - slot, slot, 0);
         }
-        align_direct_exit(code, exit.offset, 0);
+        match home {
+            Some(_) => align_relative_exit(code, exit.offset, 0),
+            None => align_direct_exit(code, exit.offset, 0),
+        };
         terminal = terminal.min(exit.offset - slot);
     }
     if let Some(offset) = terminal.checked_sub(DYNAMIC_EXIT_BYTES) {
@@ -70,7 +77,9 @@ pub(crate) fn direct_exit(code: &mut Code, target: GuestAddress, kind: ExitKind)
 
 /// The exit of `word` to `target`, after its empty link slot in code whose
 /// exits keep one: the patch point, then what only the unlinked path runs,
-/// `movabs rax,target`, `mov edx,word` and the return.
+/// `movabs rax,target`, `mov edx,word` and the return. Position independent
+/// code loads the target from the page it runs at instead
+/// (`chain::RELATIVE_EXIT_BYTES`).
 pub(super) fn direct_exit_with(asm: &mut Asm, target: GuestAddress, word: impl Into<ExitWord>) {
     let word = word.into();
     let slot = super::chain::link_slot(asm.linked_block(), target, word.kind);
@@ -300,13 +309,6 @@ pub(crate) fn emit_system_mode_looped(
 /// PCs, as for any block. `None` when an address lies too far from the
 /// page for a 32-bit offset, or code the block appended holds one apart:
 /// then only [`emit_system_mode_looped`] compiles it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the engine installs one copy per address until it shares a page's"
-    )
-)]
 pub(crate) fn emit_system_mode_position_independent(
     instructions: &[Instruction],
     terminal: Option<&(GuestAddress, Terminator)>,
@@ -1957,6 +1959,7 @@ fn emit_selected(
                     fallthrough,
                     linked,
                     block.source_map.len(),
+                    None,
                 );
                 debug_assert!(exits.iter().all(|exit| exit.offset >= at));
             }
@@ -2665,18 +2668,31 @@ fn side_exit(skipped: usize) -> ExitWord {
     }
 }
 
+/// Whether a block ending in `terminal` may compile position independent:
+/// the engine completes a System or PAC terminal natively through a thunk
+/// that names its own address, which one copy at many addresses cannot.
+pub(crate) fn relocatable_terminal(terminal: Option<&(GuestAddress, Terminator)>) -> bool {
+    !matches!(
+        terminal.map(|(_, terminal)| terminal),
+        Some(Terminator::System(_) | Terminator::PointerAuthentication(_))
+    )
+}
+
 /// The direct exits to static successors that [`emit_terminal`] ended
 /// `native`'s code with, the target's last, after a conditional branch's
 /// fallthrough, and the side exits of the branches in `instructions`, in
-/// their order, that follow them.
+/// their order, that follow them. `home` is a position independent block's
+/// page, whose exits are relative ones.
 pub(crate) fn successor_exits(
     native: &NativeBlock,
     instructions: &[Instruction],
     terminal: Option<&(GuestAddress, Terminator)>,
     fallthrough: GuestAddress,
     linked: Option<u64>,
+    home: Option<u64>,
 ) -> Vec<super::chain::DirectExit> {
-    use super::chain::{DIRECT_EXIT_BYTES, DirectExit, link_slot};
+    use super::chain::{DirectExit, link_slot};
+    let exit_bytes = super::chain::exit_bytes(home);
     let branches: Vec<_> = instructions
         .iter()
         .enumerate()
@@ -2685,7 +2701,7 @@ pub(crate) fn successor_exits(
     let slot = |target| link_slot(linked, target, ExitKind::Direct);
     let side_bytes: usize = branches
         .iter()
-        .map(|(_, target)| slot(*target) + DIRECT_EXIT_BYTES)
+        .map(|(_, target)| slot(*target) + exit_bytes)
         .sum();
     // Check failures end the code, after every exit's RET.
     let mut end = super::chain::without_failures(&native.x86_64_code).len() - side_bytes;
@@ -2695,6 +2711,7 @@ pub(crate) fn successor_exits(
         fallthrough,
         linked,
         native.source_map.len(),
+        home,
     );
     for (run, target) in branches {
         let word = side_exit(native.source_map.len() - run);
@@ -2705,7 +2722,7 @@ pub(crate) fn successor_exits(
             kind: word.kind,
             skipped: word.skipped,
         });
-        end = offset + DIRECT_EXIT_BYTES;
+        end = offset + exit_bytes;
     }
     exits
 }
@@ -2718,8 +2735,10 @@ fn terminal_exits(
     fallthrough: GuestAddress,
     linked: Option<u64>,
     ran: usize,
+    home: Option<u64>,
 ) -> Vec<super::chain::DirectExit> {
-    use super::chain::{DIRECT_EXIT_BYTES, DirectExit, is_direct_exit, link_slot};
+    use super::chain::{DirectExit, is_exit, link_slot};
+    let exit_bytes = super::chain::exit_bytes(home);
     let paired = linked.is_some()
         && match terminal.map(|(_, terminal)| terminal) {
             Some(Terminator::DirectCall(_))
@@ -2735,19 +2754,24 @@ fn terminal_exits(
             _ => false,
         };
     if !paired {
-        return terminal_exits_before(code, terminal, fallthrough, linked);
+        return terminal_exits_before(code, terminal, fallthrough, linked, home);
     }
     let word = continuation_word(ran);
-    let Some(offset) = code.len().checked_sub(DIRECT_EXIT_BYTES) else {
+    let Some(offset) = code.len().checked_sub(exit_bytes) else {
         return vec![];
     };
-    if !is_direct_exit(&code[offset..], fallthrough, word) {
-        return vec![];
+    if !is_exit(&code[offset..], fallthrough, word, home) {
+        // A position independent call whose return lies in another page
+        // pairs no frame (`paired_exit`): its exit ends the code.
+        return match home {
+            Some(_) => terminal_exits_before(code, terminal, fallthrough, linked, home),
+            None => vec![],
+        };
     }
     let Some(before) = offset.checked_sub(link_slot(linked, fallthrough, word.kind)) else {
         return vec![];
     };
-    let mut exits = terminal_exits_before(&code[..before], terminal, fallthrough, linked);
+    let mut exits = terminal_exits_before(&code[..before], terminal, fallthrough, linked, home);
     exits.push(DirectExit {
         offset,
         target: fallthrough,
@@ -2763,8 +2787,10 @@ fn terminal_exits_before(
     terminal: Option<&(GuestAddress, Terminator)>,
     fallthrough: GuestAddress,
     linked: Option<u64>,
+    home: Option<u64>,
 ) -> Vec<super::chain::DirectExit> {
-    use super::chain::{DIRECT_EXIT_BYTES, DirectExit, is_direct_exit, link_slot};
+    use super::chain::{DirectExit, is_exit, link_slot};
+    let exit_bytes = super::chain::exit_bytes(home);
     let (target, kind, conditional) = match terminal.map(|(_, terminal)| terminal) {
         None => (fallthrough, ExitKind::Fallthrough, false),
         Some(Terminator::DirectCall(target)) => (*target, ExitKind::Call, false),
@@ -2786,9 +2812,9 @@ fn terminal_exits_before(
         Some(_) => return vec![],
     };
     // The target's exit ends the code, after a conditional's fallthrough's.
-    let last = code.len().checked_sub(DIRECT_EXIT_BYTES);
+    let last = code.len().checked_sub(exit_bytes);
     let before =
-        last.and_then(|last| last.checked_sub(link_slot(linked, target, kind) + DIRECT_EXIT_BYTES));
+        last.and_then(|last| last.checked_sub(link_slot(linked, target, kind) + exit_bytes));
     let candidates = [
         conditional
             .then_some(before)
@@ -2801,14 +2827,12 @@ fn terminal_exits_before(
         .flatten()
         .filter_map(|(offset, target, kind)| {
             // An always-true condition emits no fallthrough exit.
-            is_direct_exit(&code[offset..offset + DIRECT_EXIT_BYTES], target, kind).then_some(
-                DirectExit {
-                    offset,
-                    target,
-                    kind,
-                    skipped: 0,
-                },
-            )
+            is_exit(&code[offset..offset + exit_bytes], target, kind, home).then_some(DirectExit {
+                offset,
+                target,
+                kind,
+                skipped: 0,
+            })
         })
         .collect()
 }
@@ -2981,7 +3005,13 @@ fn paired_exit(
     exit: impl FnOnce(&mut Asm),
 ) {
     let mut asm = code.asm();
-    if asm.linked_block().is_none() {
+    // A position independent block's frame names its return address by the
+    // page it runs at, which a paired return takes from that address
+    // (`chain::paired_tail_for`): only a return to its own page pairs.
+    let elsewhere = asm
+        .independent_page()
+        .is_some_and(|page| return_address.0 & !0xfff != page);
+    if asm.linked_block().is_none() || elsewhere {
         exit(&mut asm);
         return;
     }

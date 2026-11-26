@@ -61,6 +61,7 @@ fn synthetic() -> CompiledBlock {
         self_loop: false,
         region: false,
         cold: (0, 0),
+        position_independent: false,
     }
 }
 

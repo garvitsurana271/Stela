@@ -1175,17 +1175,68 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// `variant`'s id, added to [`Self::variants`] the first time by
     /// whichever machine of the board meets it first.
     pub(super) fn variant_id(&mut self, variant: Variant) -> VariantId {
-        let id = self
-            .variants
-            .find_or_add(variant, || true)
-            .expect("a bounded set of variants");
-        VariantId(id as u32)
+        if let Some(id) = self.remembered_variant(&variant) {
+            return id;
+        }
+        let id = VariantId(
+            self.variants
+                .find_or_add(variant, || true)
+                .expect("a bounded set of variants") as u32,
+        );
+        self.remember_variant(variant, id);
+        id
     }
 
     /// `variant`'s id, once [`Self::variant_id`] gave it one: for a block
     /// compiled in it, or a context made in it ([`Self::context_salt`]).
     pub(super) fn known_variant(&self, variant: Variant) -> Option<VariantId> {
-        self.variants.find(&variant).map(|at| VariantId(at as u32))
+        if let Some(id) = self.remembered_variant(&variant) {
+            return Some(id);
+        }
+        let id = VariantId(self.variants.find(&variant)? as u32);
+        self.remember_variant(variant, id);
+        Some(id)
+    }
+
+    /// `variant`'s id if [`Machine::variant_memo`] holds it. The fields
+    /// that tell a fetch's variants apart are compared before the whole,
+    /// in place: an entry is a few hundred bytes.
+    fn remembered_variant(&self, variant: &Variant) -> Option<VariantId> {
+        let memo = &self.variant_memo;
+        // Numbers are a registry's: a machine given another (a test's board
+        // sharing one) forgets those of the one before.
+        let current = Arc::as_ptr(&self.variants) as usize;
+        if memo.registry.get() != current {
+            memo.registry.set(current);
+            for held in &memo.entries {
+                held.set(None);
+            }
+            return None;
+        }
+        memo.entries.iter().find_map(|held| {
+            // SAFETY: the memo is this machine's alone (a `Cell` is not
+            // `Sync`), and nothing sets it while this reference lives.
+            let (held, id) = unsafe { &*held.as_ptr() }.as_ref()?;
+            (held.guarded_page == variant.guarded_page
+                && held.translated == variant.translated
+                && held.single == variant.single
+                && held.fp == variant.fp
+                && held.checks == variant.checks
+                && held == variant)
+                .then_some(*id)
+        })
+    }
+
+    /// Remember that `variant` is numbered `id`, in place of the entry the
+    /// memo took longest ago.
+    fn remember_variant(&self, variant: Variant, id: VariantId) {
+        let memo = &self.variant_memo;
+        if memo.registry.get() != Arc::as_ptr(&self.variants) as usize {
+            return;
+        }
+        let next = memo.next.get();
+        memo.entries[next].set(Some((variant, id)));
+        memo.next.set((next + 1) % VARIANT_MEMO);
     }
 
     /// What block `index` was compiled for.

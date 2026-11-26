@@ -160,11 +160,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// the guarded level, the variant and the half's translation inputs
     /// ([`contexts::Key`]). ITLB entries name it.
     pub(super) fn context(&mut self, el: u8, variant: Variant, half: usize) -> u64 {
+        let id = self.variant_id(variant);
+        self.numbered_context(el, variant, id, half)
+    }
+
+    /// [`Self::context`] of `variant`, numbered `id`: the recent contexts
+    /// compare by the number.
+    fn numbered_context(&mut self, el: u8, variant: Variant, id: VariantId, half: usize) -> u64 {
         let epoch = self.fetch_epoch(half);
         if let Some(recent) = self.recent[half]
             .iter()
             .flatten()
-            .find(|recent| (recent.el, recent.variant, recent.epoch) == (el, variant, epoch))
+            .find(|recent| recent.el == el && recent.variant == id && recent.epoch == epoch)
         {
             return recent.number;
         }
@@ -178,7 +185,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             Some(number) => number,
             None => match self.spaces[half].kept(&key) {
                 Some(kept) if self.verify_kept(half, el, variant, kept) => kept,
-                _ => self.make_context(half, key, &controls),
+                _ => self.make_context(half, key, id, &controls),
             },
         };
         self.salt_clock += 1;
@@ -186,7 +193,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.recent[half].rotate_right(1);
         self.recent[half][0] = Some(Recent {
             el,
-            variant,
+            variant: id,
             // A frame's table may have filled and forgotten every context.
             epoch: self.fetch_epoch(half),
             number,
@@ -195,8 +202,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     /// A new context of `half` for `key`, whose inputs are `controls`.
-    fn make_context(&mut self, half: usize, key: contexts::Key, controls: &mmu::Controls) -> u64 {
-        let salt = self.context_salt(half, key.variant, key.ttbr0);
+    fn make_context(
+        &mut self,
+        half: usize,
+        key: contexts::Key,
+        id: VariantId,
+        controls: &mmu::Controls,
+    ) -> u64 {
+        let salt = self.context_salt(half, id, key.ttbr0);
         let made = self.next_context;
         self.next_context += 1;
         let (number, evicted) =
@@ -240,8 +253,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// took it since, so that its ITLB entries take the places of a
     /// forgotten context's; else the least recently used, so that the
     /// address spaces that ran last keep slots apart.
-    fn context_salt(&mut self, half: usize, variant: Variant, table: u64) -> u64 {
-        let id = u64::from(self.variant_id(variant).0);
+    fn context_salt(&mut self, half: usize, variant: VariantId, table: u64) -> u64 {
+        let id = u64::from(variant.0);
         let owner = table ^ (half as u64) ^ id << 6;
         let salt = self.salt_owners.iter().position(|known| *known == owner);
         salt.unwrap_or_else(|| {
@@ -278,9 +291,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// generation, so that neither names a context the other's frame
     /// forgot.
     pub(super) fn contexts(&mut self, el: u8, variant: Variant) -> [u64; 2] {
+        let id = self.variant_id(variant);
         loop {
             let generation = self.translation_generation;
-            let contexts = [0, 1].map(|half| self.context(el, variant, half));
+            let contexts = [0, 1].map(|half| self.numbered_context(el, variant, id, half));
             if self.translation_generation == generation {
                 return contexts;
             }

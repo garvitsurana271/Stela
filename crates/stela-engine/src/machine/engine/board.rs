@@ -279,8 +279,17 @@ pub(super) enum PagePhase {
 /// What [`Block::part`] holds for code outside the board's arena.
 pub(super) const NO_PART: u8 = u8::MAX;
 
-/// The parts an [`Arena`] is cut into: what one retirement takes away.
-const ARENA_PARTS: usize = 32;
+/// The parts an [`Arena`] is cut into: what one retirement takes away. The
+/// ring keeps a part open per generation, one going and its newest quarter
+/// turn settling, none of which a choice takes, and young code at least
+/// [`ring::NURSERY_SHARE`]'s share: smaller parts leave that
+/// room to code the guest keeps running. A 16 GiB laptop's Finder window
+/// held its hot code twice over at two slides of the shared cache, about
+/// the window's size, and the ring took most of it from its tenured parts
+/// (`replay.rs`, with young code a sixteenth: a pool the window's size
+/// installs 37-40% fewer blocks again at 64 parts than at 32 with an
+/// eighth, one a seventh smaller 21-25% fewer, one a tenth larger 28-30%). [`Ring`]'s part words hold 64 at most.
+const ARENA_PARTS: usize = 64;
 
 /// The board's code arena: a host's whole [`CodeWindow`] cut into [`Ring`]
 /// parts, written through its writable view and run through its executable

@@ -127,7 +127,7 @@ impl Model {
         let id = identity(block);
         let promoted = self
             .churn
-            .promotes(id, self.ring.generation(), PARTS as u32);
+            .promotes(id, self.ring.generation(), self.ring.parts);
         let stream = if promoted || tenure { TENURED } else { YOUNG };
         let place = loop {
             match self.ring.take(stream, BLOCK_BYTES, 16) {
@@ -146,7 +146,7 @@ impl Model {
             0,
             self.ring.generation(),
             None,
-            PARTS as u32,
+            self.ring.parts,
         );
         self.ring.installed(place.part as usize);
         self.part_of[block] = Some(place.part);
@@ -234,15 +234,26 @@ fn per_beat(outcome: Outcome) -> Outcome {
 /// Replay `guest` on a window of `blocks` blocks whose young code keeps a
 /// `nursery`th of the parts, under `policy`: per beat, after the warm-up.
 pub(super) fn replay(guest: Guest, blocks: usize, nursery: u32, policy: Policy) -> Outcome {
-    let per_part = blocks / PARTS;
+    replay_in(guest, blocks, PARTS, nursery, policy)
+}
+
+/// [`replay`] on a ring of `parts` parts.
+pub(super) fn replay_in(
+    guest: Guest,
+    blocks: usize,
+    parts: usize,
+    nursery: u32,
+    policy: Policy,
+) -> Outcome {
+    let per_part = blocks / parts;
     let total = total(guest);
     let mut model = Model {
-        ring: Ring::with_nursery(PARTS, per_part * BLOCK_BYTES, nursery),
+        ring: Ring::with_nursery(parts, per_part * BLOCK_BYTES, nursery),
         grace: Grace::new(1),
         churn: Churn::new(1 << 20),
         counts: ChurnCounts::default(),
         part_of: vec![None; total],
-        blocks_of: vec![Vec::new(); PARTS],
+        blocks_of: vec![Vec::new(); parts],
         seen: vec![false; total],
         outcome: Outcome::default(),
         counting: false,
@@ -368,6 +379,68 @@ fn sign_in_replay_on_the_real_ring() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// The ring at the Finder window of a 16 GiB laptop: hot code about the
+/// window's size (both slides of the shared cache) and 120 thousand new
+/// blocks a heartbeat, scaled a hundredfold. Parts of a 64th and young code
+/// a 16th of them install at least 30% fewer blocks again than parts of a
+/// 32nd with young code an eighth; a block-by-block window installs fewer
+/// still, the room left to no policy of whole parts.
+#[test]
+fn finer_parts_and_a_smaller_nursery_keep_a_window_sized_pool() {
+    let guest = Guest {
+        hot: 26_000,
+        least: 0.25,
+        new: 1_200,
+        turnover: 300,
+    };
+    let before = replay_in(guest, 27_000, 32, 8, Policy::Ring);
+    let after = replay_in(guest, 27_000, 64, super::ring::NURSERY_SHARE, Policy::Ring);
+    let bound = least_recent(guest, 27_000);
+    assert!(after.again * 10 <= before.again * 7, "{before:?} {after:?}");
+    assert!(bound.again < after.again, "{bound:?} {after:?}");
+    // A pool the window holds installs no more again either way.
+    let fits = Guest {
+        hot: 16_000,
+        ..guest
+    };
+    let (before, after) = (
+        replay_in(fits, 27_000, 32, 8, Policy::Ring),
+        replay_in(fits, 27_000, 64, super::ring::NURSERY_SHARE, Policy::Ring),
+    );
+    assert!(after.again <= before.again, "{before:?} {after:?}");
+}
+
+/// The table behind it: pools about the window's size under part counts
+/// and nursery shares, beside the block-by-block bound. Manual: `cargo test
+/// -p stela-engine --release --lib finder_window_replay -- --ignored
+/// --nocapture`.
+#[test]
+#[ignore = "manual: opt-in"]
+fn finder_window_replay_by_parts_and_nursery() {
+    for hot in [20_000, 23_000, 26_000, 29_000, 32_000] {
+        for new in [600, 1_200, 2_000] {
+            let guest = Guest {
+                hot,
+                least: 0.25,
+                new,
+                turnover: 300,
+            };
+            let mut line = std::format!(
+                "REPLAY hot={hot}00 new={new}00 lru_again={}",
+                least_recent(guest, 27_000).again
+            );
+            for (parts, share) in [(32, 8), (32, 16), (64, 8), (64, 16), (64, 32)] {
+                let outcome = replay_in(guest, 27_000, parts, share, Policy::Ring);
+                line.push_str(&std::format!(
+                    " parts={parts}/young=1/{share}:{}",
+                    outcome.again
+                ));
+            }
+            std::println!("{line} (again per beat, x100 for the laptop)");
         }
     }
 }

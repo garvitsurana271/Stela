@@ -62,8 +62,11 @@ const TENURE_PARTS: usize = 8;
 /// dies there without taking tenured room: on a replay of sign-in
 /// (`replay.rs`, 1.3 million hot blocks, 90 thousand new a heartbeat) a
 /// window that holds the hot code installs 63 thousand blocks again a
-/// heartbeat with an eighth young, 219 thousand with a quarter.
-pub(in crate::machine::engine) const NURSERY_SHARE: u32 = 8;
+/// heartbeat with an eighth young, 219 thousand with a quarter. Where the
+/// hot code is about the window's size, as at the Finder window of a
+/// 16 GiB laptop, a sixteenth installs 7-27% fewer again than an eighth,
+/// and the same where it fits.
+pub(in crate::machine::engine) const NURSERY_SHARE: u32 = 16;
 /// Turns of the ring a tenured part lives at most.
 pub(in crate::machine::engine) const AGE_TURNS: u32 = 4;
 /// A part whose blocks left the index for at least this share (in

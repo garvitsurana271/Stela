@@ -256,6 +256,7 @@ impl ParseState<'_> {
             "--development-restore" => options.development_restore = true,
             "--idle-skip" => options.idle_skip = true,
             NO_IBPB => options.no_ibpb = true,
+            FAST_PAC => options.fast_pac = true,
             TIMER_DELAY => {
                 if options.timer_delay.is_some() {
                     return Err(Error::DuplicateTimerDelay);

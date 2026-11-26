@@ -845,3 +845,186 @@ fn canonical_pointers_take_the_layout_native_code_selects_by_bit_55() {
         }
     }
 }
+
+/// A context of the fast mix (`--fast-pac`) under TCR `tcr` and `version`.
+fn mixed(keys: Keys, version: Version, tcr: u64) -> Context {
+    Context::new_with_version(0, keys, version)
+        .with_translation_regime(tcr)
+        .with_implementation_defined_cipher_of(true)
+}
+
+/// Distinct keys for the four address keys and the generic one.
+fn distinct_keys(seed: u64) -> Keys {
+    let key = |index: u64| {
+        [
+            (seed + index).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            (seed ^ index).rotate_left(29) ^ 0x0bad_c0de,
+        ]
+    };
+    Keys::from_words(key(1), key(2), key(3), key(4)).with_generic_words(key(5))
+}
+
+/// The fast mix signs and authenticates as the rounds do in every layout:
+/// a signing authenticates back to its pointer with its key and modifier,
+/// for kernel, user and tagged pointers, 39- and 47-bit ranges, TBI on and
+/// off; another key or modifier, or a corrupted PAC bit, fails (FPAC's
+/// fault where the version raises one, the poisoned pointer otherwise);
+/// the PAC lies only in the layout's field, and a stripped signing is its
+/// pointer.
+#[test]
+fn the_fast_mix_round_trips_and_fails_as_architected() -> Result<()> {
+    let tcrs = [
+        25 | 25 << 16 | 1 << 37,
+        17 | 17 << 16 | 1 << 37 | 1 << 51,
+        17 | 25 << 16 | 1 << 37 | 1 << 38,
+        25 | 25 << 16,
+    ];
+    let pointers = [
+        0x0000_0001_0000_8000_u64,
+        0x0000_007f_ffff_f000,
+        0xffff_fe00_1234_5678,
+        0xffff_ff80_0012_3450,
+        0x5a00_0001_0000_8000,
+    ];
+    let mut fields = 0u64;
+    for tcr in tcrs {
+        for version in [
+            Version::Classic,
+            Version::Enhanced,
+            Version::FaultingCombined,
+        ] {
+            let context = mixed(distinct_keys(7), version, tcr);
+            let other = mixed(distinct_keys(8), version, tcr);
+            assert!(context.mixes());
+            for key in [Key::Ia, Key::Ib, Key::Da, Key::Db] {
+                for (step, &pointer) in pointers.iter().enumerate() {
+                    let modifier = 0xffff_fe10_0000_8000 ^ (step as u64) << 4;
+                    let canonical = context.strip(key, pointer) == pointer;
+                    let signed = context.sign(key, pointer, modifier)?;
+                    if !canonical {
+                        continue;
+                    }
+                    // The PAC is in the field alone; the address bits stay.
+                    let extension = context
+                        .layout(key_domain(key), pointer, false)
+                        .extension_mask();
+                    assert_eq!(
+                        signed & !extension,
+                        pointer & !extension,
+                        "{tcr:#x} {key:?}"
+                    );
+                    assert_eq!(context.strip(key, signed), pointer);
+                    fields |= signed ^ pointer;
+                    for combined in [false, true] {
+                        let authentic =
+                            context.authenticate_operation(key, signed, modifier, combined)?;
+                        assert_eq!(
+                            authentic,
+                            AuthResult {
+                                pointer,
+                                authenticated: true
+                            }
+                        );
+                        let faults = version == Version::FaultingCombined;
+                        let forged = [
+                            context.authenticate_operation(key, signed, modifier ^ 0x40, combined),
+                            other.authenticate_operation(key, signed, modifier, combined),
+                            context.authenticate_operation(
+                                key,
+                                signed ^ 1 << 50,
+                                modifier,
+                                combined,
+                            ),
+                        ];
+                        for result in forged {
+                            match result {
+                                Err(AuthenticationError::Failure { code }) => {
+                                    assert!(faults);
+                                    assert_eq!(
+                                        code,
+                                        u8::from(key.is_data()) << 1 | u8::from(key.is_b())
+                                    );
+                                }
+                                Ok(result) => {
+                                    assert!(!faults && !result.authenticated, "{tcr:#x} {key:?}");
+                                    assert_ne!(result.pointer, pointer);
+                                }
+                                Err(error) => panic!("{error}"),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Every field bit of some layout took part of a PAC.
+    assert_eq!(fields & 0x0000_007f_ffff_ffff, 0);
+    assert_ne!(fields & 0xff80_0000_0000_0000, 0);
+    Ok(())
+}
+
+/// Distinct keys, as each process's IB key, give distinct PACs of one
+/// pointer and modifier, so a pointer signed in one process fails in
+/// another; so do distinct modifiers (stack pointers a frame apart) and
+/// pointers. The mix is not the rounds, and PACGA keeps its low half zero.
+#[test]
+fn the_fast_mix_keeps_keys_modifiers_and_pointers_apart() -> Result<()> {
+    use alloc::collections::BTreeSet;
+    let tcr = 17 | 17 << 16 | 1 << 37 | 1 << 51;
+    let pointer = 0x0000_0001_0000_4000;
+    let modifier = 0x0000_0001_6fdf_f000;
+    let mut by_key = BTreeSet::new();
+    for process in 0..512 {
+        let context = mixed(distinct_keys(process), Version::Classic, tcr);
+        by_key.insert(context.sign(Key::Ib, pointer, modifier)?);
+    }
+    // 16 PAC bits for 512 keys: few collide, as for any keyed MAC.
+    assert!(by_key.len() > 500, "{}", by_key.len());
+    let context = mixed(distinct_keys(1), Version::Classic, tcr);
+    let by_modifier: BTreeSet<_> = (0..512u64)
+        .map(|frame| context.sign(Key::Ib, pointer, modifier - frame * 0x60))
+        .collect::<Result<_, _>>()?;
+    assert!(by_modifier.len() > 500, "{}", by_modifier.len());
+    let by_pointer: BTreeSet<_> = (0..512u64)
+        .map(|call| {
+            context
+                .sign(Key::Ib, pointer + call * 4, modifier)
+                .map(|signed| signed >> 47)
+        })
+        .collect::<Result<_, _>>()?;
+    assert!(by_pointer.len() > 500, "{}", by_pointer.len());
+    let rounds = Context::new_with_version(0, distinct_keys(1), Version::Classic)
+        .with_translation_regime(tcr)
+        .with_implementation_defined_cipher();
+    assert!(!rounds.mixes());
+    assert_ne!(
+        rounds.sign(Key::Ib, pointer, modifier)?,
+        context.sign(Key::Ib, pointer, modifier)?
+    );
+    let code = context.generic_code(pointer, modifier)?;
+    assert_eq!(code & 0xffff_ffff, 0);
+    assert_ne!(
+        code,
+        mixed(distinct_keys(2), Version::Classic, tcr).generic_code(pointer, modifier)?
+    );
+    Ok(())
+}
+
+/// The schedule native code runs the mix from holds the key's multipliers
+/// on any host, and the context's PACs are that mix.
+#[test]
+fn the_fast_mix_schedule_is_the_keys_multipliers() {
+    let context = mixed(distinct_keys(3), Version::Enhanced, 25 | 25 << 16);
+    for (index, key) in [Key::Ia, Key::Ib, Key::Da, Key::Db].into_iter().enumerate() {
+        let words = context.words(key).unwrap();
+        assert_eq!(
+            context.native_schedule(index),
+            Some(keyed::mix::schedule(words))
+        );
+        assert_eq!(
+            context.cipher(0x1234, 0x5678, words),
+            keyed::mix::compute(0x1234, 0x5678, words)
+        );
+    }
+    assert!(context.native_schedule(4).is_some());
+}

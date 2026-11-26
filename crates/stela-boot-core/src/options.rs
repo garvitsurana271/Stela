@@ -47,6 +47,9 @@ pub const CODE_WINDOW: &str = "--code-window";
 /// Issue no indirect branch prediction barrier at guest context switches
 /// (`--no-ibpb`): see [`System::no_ibpb`].
 pub const NO_IBPB: &str = "--no-ibpb";
+/// Compute pointer authentication codes with a fast keyed multiply mix in
+/// place of the AES-round cipher (`--fast-pac`): see [`System::fast_pac`].
+pub const FAST_PAC: &str = "--fast-pac";
 /// The latest a busy PE's timer interrupt comes, in microseconds
 /// (`--timer-delay-us N`): see [`System::timer_delay`].
 pub const TIMER_DELAY: &str = "--timer-delay-us";
@@ -718,6 +721,19 @@ pub struct System {
     /// translation regimes, for the time each barrier and the predictions
     /// it discards cost; a measurement option, off unless asked for.
     pub no_ibpb: bool,
+    /// Sign and authenticate the guest's pointers with a fast keyed
+    /// multiply mix of key, modifier and pointer ([`FAST_PAC`]) in place of
+    /// six AES rounds: PAC instructions take about a fifth fewer host
+    /// instructions and a quarter of their code bytes. WEAKER than Apple's
+    /// QARMA-class cipher: the mix is not a pseudorandom function, so code
+    /// already running in the guest that sees a few signed pointers can
+    /// recover the multipliers and forge PACs, defeating macOS's pointer
+    /// authentication (its return-address and vtable protection) as an
+    /// exploit mitigation. PACs stay distinct per key (each process's own),
+    /// modifier and pointer, and a failed authentication faults as before,
+    /// so software behaves the same; only a deliberate forgery gets past.
+    /// A speed option, off unless asked for.
+    pub fast_pac: bool,
     /// The latest a busy PE's timer interrupt comes after its previous one,
     /// in microseconds ([`TIMER_DELAY`]), in place of the engine's 10 ms: a
     /// PE that has not waited since its last timer interrupt takes the next
@@ -910,6 +926,7 @@ impl Default for System {
             guest_pes: None,
             code_window: None,
             no_ibpb: false,
+            fast_pac: false,
             timer_delay: None,
             display_size: None,
             native_bootstrap_check: false,
@@ -1517,6 +1534,7 @@ impl fmt::Display for System {
         line.value(GUEST_PES, self.guest_pes)?;
         line.value(CODE_WINDOW, self.code_window)?;
         line.flag(NO_IBPB, self.no_ibpb)?;
+        line.flag(FAST_PAC, self.fast_pac)?;
         line.value(TIMER_DELAY, self.timer_delay)?;
         line.value(
             DISPLAY_SIZE,

@@ -1759,7 +1759,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     GuestAddress(pc),
                     TAGS,
                     SERVICE as usize as u64,
-                    pointer::native_cipher(self.target),
+                    pointer::native_cipher(self.target, self.pointer.mix),
                 )
             }
         };

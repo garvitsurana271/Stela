@@ -109,6 +109,11 @@ extern "sysv64" fn authenticated(_: *mut u8, _: u32, value: u64, _: u64) -> Pair
     Pair(1, value)
 }
 
+/// Whether `PAC=mix` asks for the fast PAC cipher (`--fast-pac`).
+fn fast_pac() -> bool {
+    std::env::var("PAC").is_ok_and(|cipher| cipher == "mix")
+}
+
 fn options() -> Options {
     // As the engine's blocks; `REGIONS=0` compiles blocks alone.
     options_with(std::env::var("REGIONS").map_or(true, |regions| regions != "0"))
@@ -123,10 +128,10 @@ fn options_with(regions: bool) -> Options {
             tags: 0x40,
             strips: 0x80,
             routine: 0x1c0,
-            // As the engine's blocks on an AES-NI host: the cipher inline.
-            cipher: TargetCpu::detect()
-                .supports(TargetCpu::Aes)
-                .then_some(CIPHER),
+            // As the engine's blocks on an AES-NI host: the cipher inline;
+            // `PAC=mix` as with `--fast-pac`, the fast mix on any host.
+            cipher: (fast_pac() || TargetCpu::detect().supports(TargetCpu::Aes)).then_some(CIPHER),
+            mix: fast_pac(),
         }),
         self_loops: true,
         regions,

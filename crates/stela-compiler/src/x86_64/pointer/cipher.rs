@@ -12,6 +12,11 @@
 //! (the whitening key and six round keys) and, for each domain, the PAC
 //! field of each range ([`Range`]).
 //!
+//! With `--fast-pac` the engine's cipher is a keyed multiply mix instead
+//! (`pauth::keyed::mix`), which native code runs on any host in six
+//! general-register instructions ([`Native::mix`]) where the rounds take
+//! eleven: each schedule then holds the key's three multipliers.
+//!
 //! Native code completes canonical pointers only, whose extension bits all
 //! equal bit 55. For them Arm `AddPAC` and `Auth` take one layout, the one
 //! bit 55 selects (a signing that selects by bit 63 sees the same bit
@@ -119,6 +124,39 @@ fn sse(asm: &mut Asm, opcode: &[u8], rm: impl Into<Rm>) {
     asm.sse(Some(0x66), opcode, 0, rm);
 }
 
+/// Where native code finds the engine's [`Cipher`] and which cipher it
+/// holds the schedules of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Native {
+    pub place: Place,
+    /// The fast mix (`pauth::keyed::mix`, `--fast-pac`): each schedule's
+    /// first three words are its multipliers `k1`, `k2`, `k3`. Else the
+    /// AES rounds.
+    pub mix: bool,
+}
+
+impl From<Place> for Native {
+    /// The AES rounds' cipher at `place`.
+    fn from(place: Place) -> Self {
+        Self { place, mix: false }
+    }
+}
+
+/// The fast mix of `data` and `modifier` under the multipliers at R8 +
+/// `schedule` into `result`, as `pauth::keyed::mix::with` computes it:
+/// `bswap((modifier * k2 ^ data) * k1) * k3`. Six instructions; clobbers
+/// only `result` and flags.
+fn mix(asm: &mut Asm, result: Gpr, data: Gpr, modifier: Gpr, schedule: i32) {
+    debug_assert!(result != data && result != modifier && result != Gpr::R8);
+    let word = |index: i32| Mem::base(Gpr::R8, schedule + 8 * index);
+    asm.mov(Size::Qword, result, modifier);
+    asm.imul(Size::Qword, result, word(1));
+    asm.alu(Alu::Xor, Size::Qword, result, data);
+    asm.imul(Size::Qword, result, word(0));
+    asm.bswap(Size::Qword, result);
+    asm.imul(Size::Qword, result, word(2));
+}
+
 /// The cipher of `data` and `modifier` under the schedule at R8 +
 /// `schedule` into XMM0, whose low half is the PAC: the whitening key and
 /// the six AES rounds of `pauth::keyed`. Clobbers XMM1.
@@ -144,14 +182,20 @@ fn range_index(asm: &mut Asm) {
     asm.alu_imm8(Alu::And, Size::Dword, R11, RANGE_BYTES as i8);
 }
 
-/// The result of `form` on its operands, computed from the [`Cipher`] at
-/// `cipher` under the tag words at `tags` (one anchor): RAX the result, the
-/// misses' jumps with RAX the pointer and the modifier in its register, as
-/// [`super::lookup`] leaves them, and the jump taken while the key is not
-/// open.
-pub(super) fn compute(asm: &mut Asm, form: super::Form, tags: Place, cipher: Place) -> Lookup {
+/// The result of `form` on its operands, computed from the [`Cipher`]
+/// `cipher` names under the tag words at `tags` (one anchor): RAX the
+/// result, the misses' jumps with RAX the pointer and the modifier in its
+/// register, as [`super::lookup`] leaves them, and the jump taken while the
+/// key is not open.
+pub(super) fn compute(
+    asm: &mut Asm,
+    form: super::Form,
+    tags: Place,
+    cipher: impl Into<Native>,
+) -> Lookup {
     use Gpr::{R8, R9, R10, R11, Rax};
     use Size::Qword;
+    let Native { place: cipher, mix } = cipher.into();
     assert_eq!(
         tags.anchor, cipher.anchor,
         "the tag words and cipher share an anchor"
@@ -168,8 +212,13 @@ pub(super) fn compute(asm: &mut Asm, form: super::Form, tags: Place, cipher: Pla
     let schedule = at(SCHEDULES + usize::from(form.key) * SCHEDULE * 16);
     if form.key == GENERIC_KEY {
         // The generic key is never disabled: a closed one misses.
-        rounds(asm, Rax, modifier, schedule);
-        asm.movq_from_xmm(Rax, 0);
+        if mix {
+            self::mix(asm, R9, Rax, modifier, schedule);
+            asm.mov(Qword, Rax, R9);
+        } else {
+            rounds(asm, Rax, modifier, schedule);
+            asm.movq_from_xmm(Rax, 0);
+        }
         asm.shift_imm(ShiftOp::Shr, Qword, Rax, 32);
         asm.shift_imm(ShiftOp::Shl, Qword, Rax, 32);
         return Lookup {
@@ -183,15 +232,22 @@ pub(super) fn compute(asm: &mut Asm, form: super::Form, tags: Place, cipher: Pla
     let range = |field: usize| Mem::indexed(R8, R11, 1, at(domain + field));
     let mut misses = Vec::new();
     if form.kind != super::AUTHENTICATED {
-        // The cipher of the pointer itself, a canonical one's input.
-        rounds(asm, Rax, modifier, schedule);
+        // The cipher of the pointer itself, a canonical one's input: the
+        // mix's into R9, the rounds' moved there past the check.
+        if mix {
+            self::mix(asm, R9, Rax, modifier, schedule);
+        } else {
+            rounds(asm, Rax, modifier, schedule);
+        }
         range_index(asm);
         asm.mov(Qword, R10, Rax);
         asm.alu_load(Alu::And, Qword, R10, range(EXTENSION));
         asm.alu_load(Alu::Cmp, Qword, R10, range(CANONICAL));
         misses.push(asm.jcc(Cond::Ne));
+        if !mix {
+            asm.movq_from_xmm(R9, 0);
+        }
         // p ^ (pac & M) ^ signed.
-        asm.movq_from_xmm(R9, 0);
         asm.alu_load(Alu::And, Qword, R9, range(FIELD));
         asm.alu_load(Alu::Xor, Qword, R9, range(SIGNED));
         asm.alu(Alu::Xor, Qword, Rax, R9);
@@ -201,9 +257,13 @@ pub(super) fn compute(asm: &mut Asm, form: super::Form, tags: Place, cipher: Pla
         asm.mov(Qword, R9, Rax);
         asm.alu_load(Alu::And, Qword, R9, range(KEPT));
         asm.alu_load(Alu::Or, Qword, R9, range(CANONICAL));
-        rounds(asm, R9, modifier, schedule);
+        if mix {
+            self::mix(asm, R10, R9, modifier, schedule);
+        } else {
+            rounds(asm, R9, modifier, schedule);
+            asm.movq_from_xmm(R10, 0);
+        }
         // Authentic when (p ^ pac) & M is the range's `authenticated`.
-        asm.movq_from_xmm(R10, 0);
         asm.alu(Alu::Xor, Qword, R10, Rax);
         asm.alu_load(Alu::And, Qword, R10, range(FIELD));
         asm.alu_load(Alu::Cmp, Qword, R10, range(AUTHENTICATED));

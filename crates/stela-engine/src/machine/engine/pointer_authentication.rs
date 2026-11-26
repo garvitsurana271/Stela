@@ -92,7 +92,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         Ok(
             pauth::Context::new_with_version(0, keys, self.pointer_version()?)
                 .with_translation_regime(self.cpu.regime_tcr())
-                .with_implementation_defined_cipher(),
+                .with_implementation_defined_cipher_of(self.pointer.mix),
         )
     }
 

@@ -74,15 +74,25 @@ impl Drop for Mapped {
     }
 }
 
-/// The cipher's place, or `None` on a host without AES-NI, whose tests
-/// then have nothing to compare.
-fn cipher() -> Option<Place> {
-    let place = native_cipher(TargetCpu::detect());
-    if place.is_none() {
+/// The ciphers native code runs on this host: the AES rounds where it has
+/// AES-NI, then the fast mix (`--fast-pac`), which every host runs.
+fn ciphers() -> Vec<pointer::cipher::Native> {
+    let rounds = native_cipher(TargetCpu::detect(), false);
+    if rounds.is_none() {
         extern crate std;
-        std::eprintln!("no AES-NI: the native cipher is not used on this host");
+        std::eprintln!("no AES-NI: the native AES rounds are not used on this host");
     }
-    place
+    rounds
+        .into_iter()
+        .chain(native_cipher(TargetCpu::detect(), true))
+        .collect()
+}
+
+/// A service whose cipher is `cipher`'s.
+fn service(cipher: pointer::cipher::Native) -> PointerService {
+    let mut service = PointerService::new();
+    service.mix = cipher.mix;
+    service
 }
 
 /// TCRs of the regimes the engine runs: EL1&0 with 39- and 47-bit ranges,
@@ -178,7 +188,10 @@ const PC: u64 = 0x4000;
 /// non-canonical signings through it, as before.
 #[test]
 fn thunks_compute_what_the_engine_computes() {
-    let Some(cipher) = cipher() else { return };
+    ciphers().into_iter().for_each(thunks_compute_with);
+}
+
+fn thunks_compute_with(cipher: pointer::cipher::Native) {
     let mut thunks = Vec::new();
     for kind in [Kind::Sign, Kind::Authenticate, Kind::Branch] {
         for key in KEYS {
@@ -207,8 +220,8 @@ fn thunks_compute_what_the_engine_computes() {
     for tcr in TCRS {
         for version in VERSIONS {
             let inputs = super::tests::inputs(version, tcr);
-            let mut native = Box::new(PointerService::new());
-            let mut engine = PointerService::new();
+            let mut native = Box::new(service(cipher));
+            let mut engine = service(cipher);
             native.open(inputs);
             engine.open(inputs);
             let mut state = GuestState::default();
@@ -306,8 +319,11 @@ fn thunks_compute_what_the_engine_computes() {
 /// a process whose keys are disabled at EL0 got signed pointers.
 #[test]
 fn tag_words_switched_natively_keep_each_levels_enables() {
+    ciphers().into_iter().for_each(tag_words_switched_with);
+}
+
+fn tag_words_switched_with(cipher: pointer::cipher::Native) {
     use stela_contracts::pauth::Key;
-    let Some(cipher) = cipher() else { return };
     let mut thunks = Vec::new();
     for kind in [Kind::Sign, Kind::Authenticate, Kind::Branch] {
         for key in KEYS {
@@ -325,8 +341,8 @@ fn tag_words_switched_natively_keep_each_levels_enables() {
     for tcr in TCRS {
         for version in VERSIONS {
             let inputs = super::tests::inputs(version, tcr);
-            let mut native = Box::new(PointerService::new());
-            let mut engine = PointerService::new();
+            let mut native = Box::new(service(cipher));
+            let mut engine = service(cipher);
             native.open(inputs);
             engine.open(inputs);
             // The kernel's level: every key enabled. The process's: IA and
@@ -457,8 +473,11 @@ fn native_completes(
 /// complete, its result unwritten.
 #[test]
 fn blocks_compute_what_the_engine_computes() {
+    ciphers().into_iter().for_each(blocks_compute_with);
+}
+
+fn blocks_compute_with(cipher: pointer::cipher::Native) {
     use stela_contracts::pauth::Key;
-    let Some(cipher) = cipher() else { return };
     // PACIA X0, X1; AUTDB X2, X3; PACGA X4, X5, X6; PACDB X7, X8;
     // AUTIB X9, X10; ADD X11, X11, #1.
     const WORDS: [u32; 6] = [
@@ -475,12 +494,12 @@ fn blocks_compute_what_the_engine_computes() {
         TargetCpu::detect(),
     )
     .with_native_system(NativeSystem {
-        pointer: Some(cells(TargetCpu::detect())),
+        pointer: Some(cells(TargetCpu::detect(), cipher.mix)),
         ..NativeSystem::NONE
     });
     assert_eq!(
-        cells(TargetCpu::detect()).cipher,
-        Some(cipher.offset as u32)
+        cells(TargetCpu::detect(), cipher.mix).cipher,
+        Some(cipher.place.offset as u32)
     );
     let block = CompilationPlan::new(&source, GuestAddress(PC), &options)
         .unwrap()
@@ -491,8 +510,8 @@ fn blocks_compute_what_the_engine_computes() {
     for tcr in TCRS {
         for version in VERSIONS {
             let inputs = super::tests::inputs(version, tcr);
-            let mut native = Box::new(PointerService::new());
-            let mut engine = PointerService::new();
+            let mut native = Box::new(service(cipher));
+            let mut engine = service(cipher);
             native.open(inputs);
             engine.open(inputs);
             for key in [Key::Ia, Key::Ib, Key::Da, Key::Db] {
@@ -614,10 +633,12 @@ fn blocks_complete_branch_forms_as_the_engine_does() {
         (0xd73f_0bc5, Key::Ia, 30, Some(5), ExitKind::Call), // blraa x30, x5
         (0xd73f_087e, Key::Ia, 3, Some(30), ExitKind::Call), // blraa x3, x30
     ];
-    let host = cells(TargetCpu::detect());
-    // Through the cipher where the host has it, and through the memo.
+    let host = cells(TargetCpu::detect(), false);
+    // Through the AES rounds where the host has them, the fast mix, and
+    // the memo.
     let paths: Vec<_> = [
         host.cipher.map(|_| host),
+        Some(cells(TargetCpu::detect(), true)),
         Some(Cells {
             cipher: None,
             ..host
@@ -656,6 +677,7 @@ fn blocks_complete_branch_forms_as_the_engine_does() {
                     let inputs = super::tests::inputs(version, tcr);
                     let mut native = Box::new(PointerService::new());
                     let mut engine = PointerService::new();
+                    (native.mix, engine.mix) = (cells.mix, cells.mix);
                     native.open(inputs);
                     engine.open(inputs);
                     for enable in [Enable::Enabled, Enable::Disabled, Enable::Closed] {
@@ -702,8 +724,8 @@ fn blocks_complete_branch_forms_as_the_engine_does() {
                                 let before = state.x;
                                 let exit = code.run(&mut state);
                                 let what = format!(
-                                    "{word:#x} {version:?} tcr={tcr:#x} {enable:?} {operand:#x} cipher={:?}",
-                                    cells.cipher
+                                    "{word:#x} {version:?} tcr={tcr:#x} {enable:?} {operand:#x} cipher={:?} mix={}",
+                                    cells.cipher, cells.mix
                                 );
                                 let mut after = before;
                                 match expected {
@@ -740,10 +762,11 @@ fn blocks_complete_branch_forms_as_the_engine_does() {
 /// The schedule native code runs gives what the engine's cipher gives.
 #[test]
 fn schedules_follow_the_keys_words() {
-    if cipher().is_none() {
+    if native_cipher(TargetCpu::detect(), false).is_none() {
         return;
     }
     let mut service = PointerService::new();
+    service.mix = false;
     let inputs = super::tests::inputs(pauth::Version::Enhanced, TCRS[0]);
     service.open(inputs);
     let context = service.context.as_ref().unwrap();
@@ -790,9 +813,14 @@ fn native_cipher_timing() {
     extern crate std;
     use std::time::Instant;
     const RUNS: u64 = 1 << 20;
-    let Some(cipher) = cipher() else { return };
+    // `PAC=mix` times the fast mix (`--fast-pac`), else the AES rounds.
+    let mix = std::env::var("PAC").is_ok_and(|cipher| cipher == "mix");
+    let Some(cipher) = native_cipher(TargetCpu::detect(), mix) else {
+        return;
+    };
     let tcr = 25 | 25 << 16 | 1 << 37;
     let mut service = Box::new(PointerService::new());
+    service.mix = mix;
     service.open(super::tests::inputs(pauth::Version::Classic, tcr));
     service.reopen(stela_contracts::pauth::Key::Ib, true, false);
     let (anchor, memo) = service.anchors();
@@ -827,7 +855,7 @@ fn native_cipher_timing() {
         TargetCpu::detect(),
     )
     .with_native_system(NativeSystem {
-        pointer: Some(cells(TargetCpu::detect())),
+        pointer: Some(cells(TargetCpu::detect(), mix)),
         ..NativeSystem::NONE
     });
     let empty = CompilationPlan::new(&add, GuestAddress(PC), &options)

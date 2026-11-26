@@ -149,6 +149,11 @@ pub(super) struct PointerService {
     /// enable or trap: native transitions switch the tag words between
     /// levels of one generation without the service.
     pub(super) cipher: pointer::cipher::Cipher,
+    /// Whether the cipher is the fast mix (`--fast-pac`,
+    /// `pauth::keyed::mix`) rather than the AES rounds: chosen at boot for
+    /// every PE ([`pauth::fast::select`]) and fixed for the service's life,
+    /// as blocks compiled for it compute it themselves ([`cells`]).
+    pub(super) mix: bool,
 }
 
 /// The routine a thunk calls on a memo miss.
@@ -160,6 +165,7 @@ pub(super) const CELLS: pointer::inline::Cells = pointer::inline::Cells {
     strips: offset_of!(PointerService, strips) as u32,
     routine: offset_of!(PointerService, routine) as u32,
     cipher: None,
+    mix: false,
 };
 
 /// Where native code finds the service's tag words.
@@ -169,18 +175,26 @@ pub(super) const TAGS: Place = Place::new(Anchor::Pointer, offset_of!(PointerSer
 const CIPHER: Place = Place::new(Anchor::Pointer, offset_of!(PointerService, cipher));
 
 /// Whether native code for `target` computes PAC results itself
-/// (`x86_64::pointer::cipher`): the target has AES-NI and the engine's
-/// cipher is the AES rounds, which it is exactly where the host has AES-NI.
-/// Otherwise it looks them up in the memo and calls the service on a miss.
-pub(super) fn native_cipher(target: stela_compiler::TargetCpu) -> Option<Place> {
-    (target.supports(stela_compiler::TargetCpu::Aes) && pauth::keyed::native()).then_some(CIPHER)
+/// (`x86_64::pointer::cipher`), and which cipher: always where the engine's
+/// cipher is the fast mix (`mix`, `--fast-pac`), which any host runs; else
+/// where the target has AES-NI and the engine's cipher is the AES rounds,
+/// which it is exactly where the host has AES-NI. Otherwise it looks them
+/// up in the memo and calls the service on a miss.
+pub(super) fn native_cipher(
+    target: stela_compiler::TargetCpu,
+    mix: bool,
+) -> Option<pointer::cipher::Native> {
+    let rounds = target.supports(stela_compiler::TargetCpu::Aes) && pauth::keyed::native();
+    (mix || rounds).then_some(pointer::cipher::Native { place: CIPHER, mix })
 }
 
-/// [`CELLS`] for blocks compiled for `target`, with the cipher where
-/// [`native_cipher`] takes it.
-pub(super) fn cells(target: stela_compiler::TargetCpu) -> pointer::inline::Cells {
+/// [`CELLS`] for blocks compiled for `target` under the cipher `mix`
+/// chooses, with the cipher where [`native_cipher`] takes it.
+pub(super) fn cells(target: stela_compiler::TargetCpu, mix: bool) -> pointer::inline::Cells {
+    let native = native_cipher(target, mix);
     pointer::inline::Cells {
-        cipher: native_cipher(target).map(|place| place.offset as u32),
+        cipher: native.map(|native| native.place.offset as u32),
+        mix: native.is_some_and(|native| native.mix),
         ..CELLS
     }
 }
@@ -211,6 +225,7 @@ impl PointerService {
             fills: 0,
             census: None,
             cipher: pointer::cipher::Cipher::default(),
+            mix: pauth::fast::selected(),
         }
     }
 
@@ -357,7 +372,7 @@ impl PointerService {
         };
         let context = pauth::Context::new_with_version(0, keys, inputs.version)
             .with_layouts(layouts)
-            .with_implementation_defined_cipher();
+            .with_implementation_defined_cipher_of(self.mix);
         for (index, schedule) in self.cipher.schedules.iter_mut().enumerate() {
             *schedule = context.native_schedule(index).unwrap_or_default();
         }

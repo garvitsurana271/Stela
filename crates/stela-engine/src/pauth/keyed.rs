@@ -78,6 +78,88 @@ pub(super) fn compute(data: u64, modifier: u64, key: &[u64; 2]) -> u64 {
     qarma::compute(data, modifier, key)
 }
 
+/// The fast PAC cipher (`--fast-pac`), a keyed multiply mix in place of the
+/// AES rounds: `bswap((modifier * k2 ^ data) * k1) * k3`, all wrapping,
+/// whose odd multipliers the 128-bit key gives ([`mix::words`]). Native
+/// code runs it in six host instructions where the rounds take eleven
+/// (`x86_64::pointer::cipher`), on any host, AES-NI or not.
+///
+/// It is not a pseudorandom function: each step is linear over the
+/// integers or over bits, so a guest that sees a few signed pointers and
+/// their operands can solve for the multipliers and then forge PACs for
+/// any pointer. Every bit of the result still depends on every bit of the
+/// pointer, the modifier and the key, so codes stay distinct per key (each
+/// process's own IB and DB keys), per modifier and per pointer, and a
+/// pointer signed under one of them fails under another as ever; only a
+/// deliberate forgery by code that already runs in the guest gets past
+/// it. Opt-in, for speed over macOS's control-flow integrity.
+pub mod mix {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    /// Whether the engine's PAC cipher is the mix, for every PE: chosen
+    /// once at boot ([`select`]), before any PE signs a pointer, as all of
+    /// them must sign and authenticate alike.
+    static SELECTED: AtomicBool = AtomicBool::new(false);
+
+    /// Choose the mix (`true`) or the default cipher for every PE made
+    /// from now on.
+    pub fn select(mix: bool) {
+        SELECTED.store(mix, Ordering::Relaxed);
+    }
+
+    /// Whether [`select`] chose the mix.
+    pub fn selected() -> bool {
+        SELECTED.load(Ordering::Relaxed)
+    }
+
+    /// The SplitMix64 finalizer: a bijection, so distinct key words give
+    /// distinct multipliers before their low bit is set.
+    const fn finalize(mut word: u64) -> u64 {
+        word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        word ^ (word >> 31)
+    }
+
+    /// The multipliers `[k1, k2, k3]` of `key` (low word first), each odd so
+    /// that its product is a bijection: native code reads them in this
+    /// order from the key's schedule.
+    pub const fn words(key: &[u64; 2]) -> [u64; 3] {
+        let [low, high] = *key;
+        [
+            finalize(low ^ 0x243f_6a88_85a3_08d3) | 1,
+            finalize(high ^ 0x1319_8a2e_0370_7344) | 1,
+            finalize(low ^ high.rotate_left(32) ^ 0xa409_3822_299f_31d0) | 1,
+        ]
+    }
+
+    /// The mix of `data` and `modifier` under the multipliers `words`.
+    #[inline]
+    pub const fn with(data: u64, modifier: u64, words: &[u64; 3]) -> u64 {
+        let [k1, k2, k3] = *words;
+        (modifier.wrapping_mul(k2) ^ data)
+            .wrapping_mul(k1)
+            .swap_bytes()
+            .wrapping_mul(k3)
+    }
+
+    /// The mix of `data` and `modifier` under `key`.
+    #[inline]
+    pub fn compute(data: u64, modifier: u64, key: &[u64; 2]) -> u64 {
+        with(data, modifier, &words(key))
+    }
+
+    /// The schedule native code reads the mix's multipliers from, in the
+    /// AES schedule's place: `k1` and `k2` in its first word, `k3` low in
+    /// its second, the rest zero.
+    pub(crate) fn schedule(key: &[u64; 2]) -> [[u64; 2]; super::SCHEDULE] {
+        let [k1, k2, k3] = words(key);
+        let mut schedule = [[0; 2]; super::SCHEDULE];
+        schedule[0] = [k1, k2];
+        schedule[1][0] = k3;
+        schedule
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub(super) mod aes {
     use core::sync::atomic::{AtomicU8, Ordering};
@@ -164,5 +246,61 @@ mod tests {
         }
         let flips = 3 * 64;
         assert!((flips * 28..flips * 36).contains(&moved), "{moved}");
+    }
+
+    /// The fast mix moves about half of the bits PAC fields take (bit 25
+    /// up, the widest field) for every input and key bit flipped, so each
+    /// gives a code of its own: weaker than the rounds, never blind to an
+    /// operand.
+    #[test]
+    fn each_input_moves_the_mixed_code() {
+        use super::mix;
+        const KEY: [u64; 2] = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
+        const FIELD: u64 = !((1 << 25) - 1);
+        let (data, modifier) = (0xffff_fe00_1234_5678u64, 0xffff_fe10_0000_8000u64);
+        let base = mix::compute(data, modifier, &KEY);
+        assert_eq!(base, mix::compute(data, modifier, &KEY));
+        let mut least = u32::MAX;
+        let mut moved = 0;
+        for bit in 0..64 {
+            let mut key = KEY;
+            key[bit % 2] ^= 1 << bit;
+            for other in [
+                mix::compute(data ^ 1 << bit, modifier, &KEY),
+                mix::compute(data, modifier ^ 1 << bit, &KEY),
+                mix::compute(data, modifier, &key),
+            ] {
+                let flipped = ((base ^ other) & FIELD).count_ones();
+                least = least.min(flipped);
+                moved += flipped;
+            }
+        }
+        // 39 bits from bit 25: about 19.5 of them on average.
+        let flips = 3 * 64;
+        assert!(least >= 4, "{least}");
+        assert!((flips * 16..flips * 23).contains(&moved), "{moved}");
+    }
+
+    /// The mix's multipliers are odd and their schedule is laid out as
+    /// native code reads it; distinct keys give distinct multipliers.
+    #[test]
+    fn mixed_schedules_hold_odd_multipliers() {
+        use super::mix;
+        let mut seen = alloc::collections::BTreeSet::new();
+        for index in 0..256u64 {
+            let key = [index.wrapping_mul(0x9e37_79b9_7f4a_7c15), index << 7];
+            let words = mix::words(&key);
+            assert!(words.iter().all(|word| word & 1 == 1));
+            assert!(seen.insert(words), "{key:x?}");
+            let schedule = mix::schedule(&key);
+            assert_eq!(schedule[0], [words[0], words[1]]);
+            assert_eq!(schedule[1], [words[2], 0]);
+            assert!(schedule[2..].iter().all(|word| *word == [0, 0]));
+            assert_eq!(
+                mix::compute(5, 7, &key),
+                mix::with(5, 7, &words),
+                "{key:x?}"
+            );
+        }
     }
 }

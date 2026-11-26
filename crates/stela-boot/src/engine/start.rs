@@ -948,6 +948,16 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         native_processors,
     } = boot;
     let target = target(options.parallel);
+    // Before any PE is made: every one signs and authenticates alike.
+    stela_engine::pauth::fast::select(options.fast_pac);
+    if options.fast_pac {
+        output::arguments(format_args!(
+            "PAC CIPHER fast mix (--fast-pac): pointer authentication codes come from a keyed \
+             multiply mix, not AES rounds; WEAKER than the hardware's: guest code that sees \
+             signed pointers can forge them, so macOS's pointer authentication no longer \
+             stops exploits inside this guest\n"
+        ));
+    }
     let speculation = speculation::probe(!options.no_ibpb);
     if options.no_ibpb {
         output::arguments(format_args!(

@@ -96,6 +96,9 @@ pub struct Context {
     regime: Option<u64>,
     /// Whether PACs come from [`keyed`], not QARMA5.
     keyed: bool,
+    /// Whether those PACs come from the fast mix ([`keyed::mix`]) instead
+    /// of the AES rounds.
+    mix: bool,
     /// The regime's layouts worked out ahead ([`Self::with_layouts`]).
     layouts: Option<Layouts>,
 }
@@ -239,6 +242,7 @@ impl Context {
             version,
             regime: None,
             keyed: false,
+            mix: false,
             layouts: None,
         }
     }
@@ -267,12 +271,26 @@ impl Context {
         self
     }
 
+    /// [`Self::with_implementation_defined_cipher`], that cipher the fast
+    /// mix ([`keyed::mix`], `--fast-pac`) where `mix`, else the AES rounds.
+    pub fn with_implementation_defined_cipher_of(mut self, mix: bool) -> Self {
+        self.keyed = true;
+        self.mix = mix;
+        self
+    }
+
+    /// Whether the context's PACs come from the fast mix.
+    pub fn mixes(&self) -> bool {
+        self.keyed && self.mix
+    }
+
     /// The PAC of `data` and `modifier` under `key`.
     #[inline]
     fn cipher(&self, data: u64, modifier: u64, key: &[u64; 2]) -> u64 {
-        match self.keyed {
-            true => keyed::compute(data, modifier, key),
-            false => qarma5(data, modifier, key),
+        match (self.keyed, self.mix) {
+            (true, true) => keyed::mix::compute(data, modifier, key),
+            (true, false) => keyed::compute(data, modifier, key),
+            (false, _) => qarma5(data, modifier, key),
         }
     }
 
@@ -329,19 +347,24 @@ impl Context {
         )
     }
 
-    /// The AES schedule native code computes PACs of the key at tag word
+    /// The schedule native code computes PACs of the key at tag word
     /// `index` with (`x86_64::pointer::cipher`): IA, IB, DA, DB, then the
-    /// generic key. `None` when the context lacks the key or its cipher is
-    /// not the AES rounds native code runs ([`keyed::native`]).
+    /// generic key. The fast mix's multipliers ([`keyed::mix::schedule`])
+    /// on any host, else the AES schedule. `None` when the context lacks
+    /// the key or its cipher is neither the mix nor the AES rounds native
+    /// code runs ([`keyed::native`]).
     pub(crate) fn native_schedule(&self, index: usize) -> Option<[[u64; 2]; keyed::SCHEDULE]> {
-        if !self.keyed || !keyed::native() {
+        if !self.keyed || !self.mix && !keyed::native() {
             return None;
         }
         let words = match index {
             4 => self.keys.generic.as_ref(),
             index => self.keys.words.get(index)?.as_ref(),
         }?;
-        Some(keyed::schedule(words))
+        Some(match self.mix {
+            true => keyed::mix::schedule(words),
+            false => keyed::schedule(words),
+        })
     }
 
     /// The words of `key`, when the context has it.
@@ -465,6 +488,8 @@ const MIN_TNSZ: u64 = 16;
 const MAX_TNSZ: u64 = 39;
 
 pub(crate) mod keyed;
+/// The fast PAC cipher a boot chooses with `--fast-pac`.
+pub use keyed::mix as fast;
 mod qarma;
 use qarma::compute as qarma5;
 

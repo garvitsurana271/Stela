@@ -45,6 +45,20 @@ pub struct Cells {
     /// the engine keeps one; else they look them up in the memo.
     #[serde(default)]
     pub cipher: Option<u32>,
+    /// Whether that cipher is the fast mix (`--fast-pac`,
+    /// [`super::cipher::Native::mix`]) rather than the AES rounds.
+    #[serde(default)]
+    pub mix: bool,
+}
+
+impl Cells {
+    /// The cipher blocks compute PAC results from, if any.
+    pub fn native_cipher(&self) -> Option<super::cipher::Native> {
+        self.cipher.map(|offset| super::cipher::Native {
+            place: Place::new(Anchor::Pointer, offset as usize),
+            mix: self.mix,
+        })
+    }
 }
 
 /// Whether a block completes `operation` inside itself.
@@ -85,11 +99,8 @@ pub(crate) fn authenticate_transfer(
         .expect("a branch form");
     let mut asm = code.asm();
     let tags = Place::new(Anchor::Pointer, cells.tags as usize);
-    let computed = match cells.cipher {
-        Some(cipher) => {
-            let cipher = Place::new(Anchor::Pointer, cipher as usize);
-            super::cipher::compute(&mut asm, form, tags, cipher)
-        }
+    let computed = match cells.native_cipher() {
+        Some(cipher) => super::cipher::compute(&mut asm, form, tags, cipher),
         None => lookup(&mut asm, form, tags),
     };
     let complete = asm.jmp();
@@ -141,11 +152,8 @@ pub(crate) fn emit(code: &mut Code, operation: Operation, pc: GuestAddress, cell
         .filter(|form| form.completion == Finish::Register)
         .expect("a form that completes into its register");
     let tags = Place::new(Anchor::Pointer, cells.tags as usize);
-    let computed = match cells.cipher {
-        Some(cipher) => {
-            let cipher = Place::new(Anchor::Pointer, cipher as usize);
-            super::cipher::compute(&mut asm, form, tags, cipher)
-        }
+    let computed = match cells.native_cipher() {
+        Some(cipher) => super::cipher::compute(&mut asm, form, tags, cipher),
         None => lookup(&mut asm, form, tags),
     };
     let complete = asm.len();
@@ -215,6 +223,7 @@ mod tests {
         strips: core::mem::offset_of!(Service, strips) as u32,
         routine: core::mem::offset_of!(Service, routine) as u32,
         cipher: None,
+        mix: false,
     };
 
     fn compile(words: &[u32], cells: Option<Cells>) -> crate::block::CompiledBlock {

@@ -265,7 +265,7 @@ pub(super) fn variants() -> [Options; 4] {
         zero_block: Some(64),
         cache_clean: cache_clean::Operations::ALL,
         exclusive: true,
-        pointer: Some(super::super::pointer::cells(target)),
+        pointer: Some(super::super::pointer::cells(target, false)),
         mirrored: super::super::regime_state::inline_mirrored_reads(),
         amx: false,
         self_loops: true,

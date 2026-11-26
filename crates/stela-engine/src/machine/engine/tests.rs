@@ -7793,7 +7793,7 @@ fn what_follows_a_pac_return_keeps_its_dynamic_site() {
             GuestAddress(last),
             TAGS,
             SERVICE as usize as u64,
-            pointer::native_cipher(machine.target),
+            pointer::native_cipher(machine.target, machine.pointer.mix),
         );
         assert!(!machine.host.installed.contains(&thunk.code), "{words:x?}");
         let block = &machine.code.blocks[0];

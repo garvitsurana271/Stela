@@ -511,7 +511,7 @@ pub fn thunk(
     pc: GuestAddress,
     tags: Place,
     service: u64,
-    cipher: Option<Place>,
+    cipher: Option<cipher::Native>,
 ) -> Thunk {
     use Gpr::{Rax, Rcx};
     use Size::Qword;

@@ -775,6 +775,19 @@ fn prediction_isolation_stays_on_unless_no_ibpb_is_given() {
     assert_eq!(options.to_string(), "--system --no-ibpb");
 }
 
+/// `--fast-pac` swaps the PAC cipher for the fast mix; a boot without it
+/// keeps the exact AES-round cipher.
+#[test]
+fn the_fast_pac_cipher_is_off_unless_asked_for() {
+    assert!(!System::default().fast_pac);
+    assert!(!System::parse("--system").unwrap().fast_pac);
+    let options = round_trip("--system --fast-pac");
+    assert!(options.fast_pac);
+    assert_eq!(options.to_string(), "--system --fast-pac");
+    let both = round_trip("--system --no-ibpb --fast-pac");
+    assert!(both.fast_pac && both.no_ibpb);
+}
+
 /// `--code-window` names the board's code window in MiB: whole 16 MiB
 /// steps from 64 MiB to 2 GiB, the window's own bounds, once.
 #[test]

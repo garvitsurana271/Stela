@@ -81,7 +81,7 @@ fn block(words: &[u32]) -> Mapped {
         TargetCpu::detect(),
     )
     .with_native_system(NativeSystem {
-        pointer: Some(cells(TargetCpu::detect())),
+        pointer: Some(cells(TargetCpu::detect(), false)),
         ..NativeSystem::NONE
     });
     let block = CompilationPlan::new(&source, GuestAddress(PC), &options)
@@ -289,7 +289,7 @@ fn pac_costs() {
                 GuestAddress(PC),
                 TAGS,
                 SERVICE as usize as u64,
-                native_cipher(TargetCpu::detect()),
+                native_cipher(TargetCpu::detect(), false),
             );
             code = Mapped::new(&thunk.code);
             through = "thunk";

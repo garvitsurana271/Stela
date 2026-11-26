@@ -77,9 +77,13 @@ pub(super) fn grow_table(
 impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn fetch_block(&mut self, pc: u64, single: bool) -> Result<Fetched, Stop> {
         self.linked_at_install = None;
-        let context = self.current_variant(single, false);
+        let (context, context_id) = self.fetch_variant(single);
+        // The numbers of the fetch's variant in either page guard, for every
+        // page the fetch takes ([`Self::numbered_page_variant`]).
+        let mut numbers: PageNumbers = [None; 2];
+        numbers[usize::from(context.guarded_page)] = Some(context_id);
         let el = self.cpu.pstate.el | u8::from(self.cpu.pstate.guarded) << 4;
-        let contexts = self.contexts(el, context);
+        let contexts = self.numbered_contexts(el, context, context_id);
         self.chain.set_contexts(contexts);
         if !self.dropped_refills.is_empty() || !self.refills.is_empty() {
             let refilling = self.host.counter();
@@ -87,7 +91,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 self.refill_dropped(contexts);
             }
             if !self.refills.is_empty() {
-                self.refill_pages(el, context);
+                self.refill_pages(el, context, &mut numbers);
             }
             self.statistics.refill_ticks += self.host.counter().wrapping_sub(refilling);
         }
@@ -148,19 +152,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // non-global fetch): the page is recorded, and dispatchers look
         // up, in their successors.
         if self.translation_generation != generation {
-            let contexts = self.contexts(el, context);
+            let contexts = self.numbered_contexts(el, context, context_id);
             self.chain.set_contexts(contexts);
         }
         let current = Variant {
             guarded_page: self.fetch_guarded(pc),
             ..context
         };
-        let variant = self.page_variant(current, physical);
+        let (variant, variant_id) = self.numbered_page_variant(current, physical, &mut numbers);
         // The block another context, address space or fetch of the frame
         // recorded: what a TLBI ALL or a process switch leaves.
-        if !single && let Some(id) = self.known_variant(variant) {
+        if !single && let Some(id) = variant_id {
             let key = self.block_key(physical, id);
-            self.translate_leaf(pc, key, physical, current);
+            self.numbered_leaf(pc, key, physical, current, &mut numbers);
             let table = &self.code.table;
             let target = table.find(table.slot(pc, key), pc, key);
             // Every release of a block forgets its entries; the block is
@@ -191,8 +195,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.entered(entry.block);
             return Ok(Fetched::Block(entry.block));
         }
-        let indexed = self
-            .known_variant(variant)
+        let indexed = variant_id
+            .or_else(|| self.known_variant(variant))
             .and_then(|id| self.code.find(pc, physical, id));
         self.statistics.fetches[if indexed.is_some() { 3 } else { 4 }] += 1;
         let index = match indexed {
@@ -227,7 +231,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         });
         if !single {
             let key = self.block_key(physical, self.code.blocks[index].variant);
-            self.translate_leaf(pc, key, physical, current);
+            self.numbered_leaf(pc, key, physical, current, &mut numbers);
         }
         self.remember_or_link(pc, index);
         self.entered(index);
@@ -316,12 +320,59 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// `physical` in `current` (its variant before the page's own:
     /// `page_variant`), then the other pages of its leaf
     /// ([`Self::take_leaf_pages`]).
+    #[cfg(test)]
     pub(super) fn translate_leaf(&mut self, pc: u64, key: u64, physical: u64, current: Variant) {
+        self.numbered_leaf(pc, key, physical, current, &mut [None; 2]);
+    }
+
+    /// `translate_leaf` with what the fetch numbered of its variant
+    /// (`numbers`, [`Self::numbered_page_variant`]).
+    fn numbered_leaf(
+        &mut self,
+        pc: u64,
+        key: u64,
+        physical: u64,
+        current: Variant,
+        numbers: &mut PageNumbers,
+    ) {
         self.translate_page(pc, key);
         if let Some(walk) = self.cached_fetch(pc) {
             let record = self.fetch_record(pc);
-            self.take_leaf_pages(pc, physical, walk.size, current, walk.global, record);
+            let leaf = Leaf {
+                size: walk.size,
+                global: walk.global,
+                record,
+            };
+            self.take_leaf_pages(pc, physical, leaf, current, numbers);
         }
+    }
+
+    /// `page_variant(current, physical)` and its number, through `numbers`:
+    /// those of `current` in an unguarded and a guarded page, as far as
+    /// known, which every page the page's sets leave alone shares. A fetch
+    /// numbers its variant once, and each page it and its refills take only
+    /// where a set gives the page a variant of its own. `numbers` hold for
+    /// the one variant `current` is in either guard.
+    pub(super) fn numbered_page_variant(
+        &self,
+        current: Variant,
+        physical: u64,
+        numbers: &mut PageNumbers,
+    ) -> (Variant, Option<VariantId>) {
+        let (variant, touched) = self.page_variant_of(current, physical);
+        if touched {
+            return (variant, self.known_variant(variant));
+        }
+        let number = &mut numbers[usize::from(variant.guarded_page)];
+        if number.is_none() {
+            *number = self.known_variant(variant);
+        }
+        debug_assert_eq!(
+            *number,
+            self.known_variant(variant),
+            "numbers of another variant"
+        );
+        (variant, *number)
     }
 
     /// Give the ITLB the other 4 KiB pages of the [`LEAF_FILL`] granule
@@ -340,10 +391,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
         &mut self,
         pc: u64,
         physical: u64,
-        size: u64,
+        Leaf {
+            size,
+            global,
+            record,
+        }: Leaf,
         current: Variant,
-        global: bool,
-        record: Option<tlbi_keep::WalkRecord>,
+        numbers: &mut PageNumbers,
     ) {
         let span = size.min(LEAF_FILL);
         if span <= FETCH_PAGE {
@@ -360,8 +414,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 continue;
             }
             let other_frame = frame.wrapping_add(other).wrapping_sub(page);
-            let variant = self.page_variant(current, other_frame);
-            let Some(id) = self.known_variant(variant) else {
+            let (_, Some(id)) = self.numbered_page_variant(current, other_frame, numbers) else {
                 continue;
             };
             let key = self.block_key(other_frame, id);
@@ -729,7 +782,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// page, as a walk cache lets hardware walk ([`mmu::WalkMemo`]). Nothing
     /// in the batch runs guest code or changes the controls, and the walks
     /// make no descriptor updates; the table is dropped with the batch.
-    pub(super) fn refill_pages(&mut self, el: u8, context: Variant) {
+    pub(super) fn refill_pages(&mut self, el: u8, context: Variant, numbers: &mut PageNumbers) {
         let generation = self.translation_generation;
         let mut quiet = QuietWalk::new(&self.cpu);
         for pc in core::mem::take(&mut self.refills) {
@@ -749,8 +802,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 guarded_page: walk.guarded,
                 ..context
             };
-            let variant = self.page_variant(current, walk.physical);
-            if let Some(id) = self.known_variant(variant) {
+            if let (_, Some(id)) = self.numbered_page_variant(current, walk.physical, numbers) {
                 let key = self.block_key(walk.physical, id);
                 self.take_page(
                     pc,
@@ -761,14 +813,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     walk.record,
                 );
             }
-            self.take_leaf_pages(
-                pc,
-                walk.physical,
-                walk.size,
-                current,
-                walk.global,
-                walk.record,
-            );
+            let leaf = Leaf {
+                size: walk.size,
+                global: walk.global,
+                record: walk.record,
+            };
+            self.take_leaf_pages(pc, walk.physical, leaf, current, numbers);
         }
     }
 
@@ -1172,20 +1222,108 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
     }
 
+    /// [`Self::current_variant`] of a fetch (`single` or not, in no guarded
+    /// page) and its number, kept while what they derive from holds: the
+    /// memory checks and native System features as derived last (a change
+    /// of either derives them anew, which moves `derived_version`), FP's
+    /// trap, SVCR.SM, the timing tier and the registry.
+    pub(super) fn fetch_variant(&mut self, single: bool) -> (Variant, VariantId) {
+        let fp = self.floating_point_enabled();
+        if self.memory_checks.is_none() {
+            self.memory_checks();
+        }
+        if self.native_system.is_none() {
+            self.native_system();
+        }
+        let inputs = FetchInputs {
+            version: self.derived_version,
+            registry: Arc::as_ptr(&self.variants) as usize,
+            fp,
+            single,
+            scalable: self
+                .cpu
+                .scalable
+                .is_some()
+                .then(|| self.cpu.svcr() & 1 != 0),
+            timing: self.cpu.pstate.dit && self.timing_target().is_some(),
+        };
+        if let Some((held, variant, id)) = self.fetch_variant
+            && held == inputs
+        {
+            debug_assert_eq!(variant, self.current_variant(single, false));
+            return (variant, id);
+        }
+        let variant = self.current_variant(single, false);
+        let id = self.variant_id(variant);
+        self.fetch_variant = Some((inputs, variant, id));
+        (variant, id)
+    }
+
     /// `variant`'s id, added to [`Self::variants`] the first time by
     /// whichever machine of the board meets it first.
     pub(super) fn variant_id(&mut self, variant: Variant) -> VariantId {
-        let id = self
-            .variants
-            .find_or_add(variant, || true)
-            .expect("a bounded set of variants");
-        VariantId(id as u32)
+        if let Some(id) = self.remembered_variant(&variant) {
+            return id;
+        }
+        let id = VariantId(
+            self.variants
+                .find_or_add(variant, || true)
+                .expect("a bounded set of variants") as u32,
+        );
+        self.remember_variant(variant, id);
+        id
     }
 
     /// `variant`'s id, once [`Self::variant_id`] gave it one: for a block
     /// compiled in it, or a context made in it ([`Self::context_salt`]).
     pub(super) fn known_variant(&self, variant: Variant) -> Option<VariantId> {
-        self.variants.find(&variant).map(|at| VariantId(at as u32))
+        if let Some(id) = self.remembered_variant(&variant) {
+            return Some(id);
+        }
+        let id = VariantId(self.variants.find(&variant)? as u32);
+        self.remember_variant(variant, id);
+        Some(id)
+    }
+
+    /// `variant`'s id if [`Machine::variant_memo`] holds it. The fields
+    /// that tell a fetch's variants apart are compared before the whole,
+    /// in place: an entry is a few hundred bytes.
+    fn remembered_variant(&self, variant: &Variant) -> Option<VariantId> {
+        let memo = &self.variant_memo;
+        // Numbers are a registry's: a machine given another (a test's board
+        // sharing one) forgets those of the one before.
+        let current = Arc::as_ptr(&self.variants) as usize;
+        if memo.registry.get() != current {
+            memo.registry.set(current);
+            for held in &memo.entries {
+                held.set(None);
+            }
+            return None;
+        }
+        memo.entries.iter().find_map(|held| {
+            // SAFETY: the memo is this machine's alone (a `Cell` is not
+            // `Sync`), and nothing sets it while this reference lives.
+            let (held, id) = unsafe { &*held.as_ptr() }.as_ref()?;
+            (held.guarded_page == variant.guarded_page
+                && held.translated == variant.translated
+                && held.single == variant.single
+                && held.fp == variant.fp
+                && held.checks == variant.checks
+                && held == variant)
+                .then_some(*id)
+        })
+    }
+
+    /// Remember that `variant` is numbered `id`, in place of the entry the
+    /// memo took longest ago.
+    fn remember_variant(&self, variant: Variant, id: VariantId) {
+        let memo = &self.variant_memo;
+        if memo.registry.get() != Arc::as_ptr(&self.variants) as usize {
+            return;
+        }
+        let next = memo.next.get();
+        memo.entries[next].set(Some((variant, id)));
+        memo.next.set((next + 1) % VARIANT_MEMO);
     }
 
     /// What block `index` was compiled for.
@@ -2411,6 +2549,18 @@ enum Taken {
 /// ITLB, when its leaf maps them all ([`Machine::take_leaf_pages`]): a
 /// 16 KiB page, the granule XNU maps code with, in 4 KiB ITLB pages.
 const LEAF_FILL: u64 = 1 << 14;
+
+/// The numbers of one variant in an unguarded page (0) and a guarded one
+/// (1), as far as known ([`Machine::numbered_page_variant`]).
+pub(super) type PageNumbers = [Option<VariantId>; 2];
+
+/// What [`Machine::take_leaf_pages`] takes of the walk of a leaf: the bytes
+/// it maps, its global bit and its record.
+struct Leaf {
+    size: u64,
+    global: bool,
+    record: Option<tlbi_keep::WalkRecord>,
+}
 
 /// The most pages one forgotten context leaves to walk again
 /// ([`Machine::refill_after`]). At 512 the cap bound: after each local TLBI

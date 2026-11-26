@@ -232,3 +232,92 @@ fn tlbi_keep_cost() {
         );
     }
 }
+
+/// Host timing of the engine's fetch of blocks the table holds, on the same
+/// PE shape as [`tlbi_keep_cost`], in boot 35's steady state: the busy
+/// address spaces take turns, each fetching a run of its working set and
+/// of the shared region, with a TLBI of everything every `PATH_EVERY`
+/// rounds (boot 35's Finder window: about one per 800 fetches a PE). Prints
+/// nanoseconds per fetch and the fetch paths taken. Manual:
+/// `cargo test -p stela-engine --features test-support,std --release --lib
+/// fetch_path_cost -- --ignored --nocapture` (`PATH_ROUNDS`, default 4000;
+/// `PATH_EVERY`, default 10, 0 for none; `PATH_KEEP`, 1 for `--tlbi-keep`;
+/// `PATH_VARIANTS`, the variants numbered before the fetches', default 16).
+#[test]
+#[ignore = "a host timing, run by hand"]
+fn fetch_path_cost() {
+    let rounds = number("PATH_ROUNDS", 4000) as u64;
+    let every = number("PATH_EVERY", 10) as u64;
+    let keep = number("PATH_KEEP", 0) != 0;
+    let (busy, idle) = (27, 1270);
+    let bytes = (TABLES_AT + (busy + idle) * TABLES_BYTES) as usize;
+    let mut machine = machine(&[]);
+    machine.host.ram.resize(bytes, 0);
+    for frame in 0..PRIVATE_FRAMES + SHARED_FRAMES {
+        let at = (FRAMES_AT + frame * 0x1000) as usize;
+        machine.host.ram[at..at + 4].copy_from_slice(&RET.to_le_bytes());
+    }
+    machine.set_tlbi_keep(keep, false);
+    normal_memory(&mut machine, false);
+    // A boot numbers its variants as it meets them, the busy processes'
+    // after the kernel's: these come before the fetches' own.
+    let variants = number("PATH_VARIANTS", 16) as u16;
+    let base = machine.current_variant(false, false);
+    for n in 0..variants {
+        let system = stela_compiler::x86_64::NativeSystem {
+            zero_block: Some(0x7000 + n),
+            ..base.system
+        };
+        machine.variant_id(Variant { system, ..base });
+    }
+    for space in 0..busy + idle {
+        let pages = if space < busy { BUSY_PAGES } else { IDLE_PAGES };
+        build(&mut machine, space, pages);
+    }
+    for space in (0..busy + idle).rev() {
+        select(&mut machine, space);
+        let pages = if space < busy { BUSY_PAGES } else { IDLE_PAGES };
+        for page in 0..pages {
+            run(&mut machine, page);
+        }
+        for page in 0..SHARED_PAGES.min(if space < busy { SHARED_PAGES } else { 4 }) {
+            run(&mut machine, SHARED_PAGE + page);
+        }
+    }
+    let mut draws = 0x9e37_79b9_7f4a_7c15u64;
+    let mut draw = |below: u64| {
+        draws ^= draws << 13;
+        draws ^= draws >> 7;
+        draws ^= draws << 17;
+        draws % below
+    };
+    let paths = machine.statistics.fetch_paths;
+    let fetches: u64 = machine.statistics.fetches.iter().sum();
+    let mut ns = 0u128;
+    for round in 0..rounds {
+        if every != 0 && round % every == 0 {
+            all(&mut machine);
+        }
+        let space = draw(busy);
+        let first = draw(BUSY_PAGES - BUSY_RUNS);
+        let shared = draw(SHARED_PAGES - SHARED_RUNS);
+        let started = Instant::now();
+        select(&mut machine, space);
+        for page in first..first + BUSY_RUNS {
+            run(&mut machine, page);
+        }
+        for page in shared..shared + SHARED_RUNS {
+            run(&mut machine, SHARED_PAGE + page);
+        }
+        ns += started.elapsed().as_nanos();
+    }
+    let fetched = machine.statistics.fetches.iter().sum::<u64>() - fetches;
+    let taken: Vec<u64> = (0..paths.len())
+        .map(|path| machine.statistics.fetch_paths[path] - paths[path])
+        .collect();
+    println!(
+        "bench path keep={keep} rounds={rounds} every={every}: ns_per_fetch={:.1} fetches={fetched} \
+         fast/fast_btype/itlb_miss/table_miss/btype_refused/single={taken:?}",
+        ns as f64 / fetched.max(1) as f64,
+    );
+}

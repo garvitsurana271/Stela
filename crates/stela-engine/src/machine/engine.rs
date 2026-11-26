@@ -674,14 +674,40 @@ struct JumpEntry {
     incarnation: u32,
 }
 
-/// A half's recent context number, with the EL, variant and fetch epoch it
-/// was found for.
+/// A half's recent context number, with the EL, variant (by its number,
+/// which names one variant for good) and fetch epoch it was found for.
 #[derive(Debug, Clone, Copy)]
 struct Recent {
     el: u8,
-    variant: Variant,
+    variant: VariantId,
     epoch: FetchEpoch,
     number: u64,
+}
+
+/// The variants a PE numbered last ([`Machine::variant_memo`]): the fetch's
+/// own, the guarded page's beside it, and a translated or tagged page's.
+const VARIANT_MEMO: usize = 4;
+
+/// [`Machine::variant_memo`]: variants with their numbers in the registry
+/// at `registry`, the oldest at `next`.
+/// What a fetch's variant derives from besides the memory checks and the
+/// native System features, which `version` (`Machine::derived_version`)
+/// stands for, and the registry its number is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FetchInputs {
+    version: u64,
+    registry: usize,
+    fp: bool,
+    single: bool,
+    scalable: Option<bool>,
+    timing: bool,
+}
+
+#[derive(Default)]
+struct VariantMemo {
+    entries: [core::cell::Cell<Option<(Variant, VariantId)>>; VARIANT_MEMO],
+    registry: core::cell::Cell<usize>,
+    next: core::cell::Cell<usize>,
 }
 
 /// `T` on cache lines of its own: a shared word that PEs read on every
@@ -947,6 +973,13 @@ pub struct Machine<H: Host, D: Devices> {
     context_frames: Vec<(mmu::Controls, u64)>,
     /// Each half's recent contexts, most recent first.
     recent: [[Option<Recent>; RECENT]; 2],
+    /// The variants this PE numbered last: a fetch and each page it takes
+    /// number their variant ([`Machine::known_variant`],
+    /// [`Machine::variant_id`]), which [`Self::variants`] finds only by
+    /// comparing it with every variant before its own, each a few hundred
+    /// bytes. A registry's number names its variant for good, so an entry
+    /// goes stale only with the registry, whose address the memo keeps.
+    variant_memo: VariantMemo,
     /// The leaf sizes a fetch of each half translated through since its
     /// contexts were last forgotten, a bit per power of two, and whether one
     /// was non-global: what a TLBI by VA or ASID reaches of its lookup entries.
@@ -1036,6 +1069,12 @@ pub struct Machine<H: Host, D: Devices> {
     memory_checks: Option<MemoryChecks>,
     /// [`Variant::system`] for the current EL, while valid.
     native_system: Option<NativeSystem>,
+    /// How many times `memory_checks` and `native_system` were derived
+    /// anew, which every change of either follows.
+    derived_version: u64,
+    /// A fetch's variant and its number, with what they were derived from
+    /// ([`Machine::fetch_variant`]).
+    fetch_variant: Option<(FetchInputs, Variant, VariantId)>,
     /// Whether blocks that branch back to their own start run their
     /// iterations inside themselves (`NativeSystem::self_loops`): on, but
     /// for tests that compare both forms.
@@ -1497,6 +1536,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             ],
             context_frames: Vec::new(),
             recent: [[None; RECENT]; 2],
+            variant_memo: Default::default(),
             fetched_sizes: [0; 2],
             private_fetches: [false; 2],
             lower_globals: NO_GLOBALS,
@@ -1529,6 +1569,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             floating_point: None,
             memory_checks: None,
             native_system: None,
+            derived_version: 0,
+            fetch_variant: None,
             self_loops: true,
             regions: true,
             event_sample: None,

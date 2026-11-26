@@ -123,7 +123,10 @@ pub fn test_low_byte(code: &mut Code, register: HostGpr, immediate: u8) {
 
 /// The frame slot of guest register `slot`.
 fn frame_slot(slot: usize) -> Mem {
-    displaced(FRAME, (slot * GPR_BYTES) as i32)
+    displaced(
+        FRAME,
+        (core::mem::offset_of!(crate::GuestState, x) + slot * GPR_BYTES) as i32,
+    )
 }
 
 pub fn load(code: &mut Code, destination: HostGpr, slot: usize) {
@@ -139,7 +142,7 @@ pub fn store(code: &mut Code, source: HostGpr, slot: usize) {
 /// The guest NZCV word.
 fn nzcv() -> Mem {
     const NZCV_OFFSET: i32 = core::mem::offset_of!(crate::GuestState, nzcv) as i32;
-    Mem::base_disp32(FRAME.gpr(), NZCV_OFFSET)
+    displaced(FRAME, NZCV_OFFSET)
 }
 
 pub fn load_nzcv(code: &mut Code, destination: HostGpr) {

@@ -446,7 +446,9 @@ impl Run {
 pub(in crate::x86_64) fn write_back(code: &mut Code, dirty: Dirty) {
     let mut asm = code.asm();
     for (index, host) in dirty.into_iter().flatten() {
-        let slot = Mem::base(Gpr::Rdi, i32::from(index) * 8);
+        let slot = super::super::offset(crate::aarch64::Register::X(index))
+            .expect("a local's register has a frame slot");
+        let slot = Mem::base(Gpr::Rdi, slot as i32);
         asm.mov_store(Size::Qword, slot, host);
     }
 }

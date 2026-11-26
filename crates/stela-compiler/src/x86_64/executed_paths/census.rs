@@ -127,34 +127,27 @@ enum Field {
 }
 
 fn field(displacement: usize) -> Field {
-    let range = |start: usize, end: usize| (start..end).contains(&displacement);
-    if displacement < offset_of!(GuestState, nzcv) {
+    use core::mem::size_of;
+    let within = |start: usize, bytes: usize| (start..start + bytes).contains(&displacement);
+    let word = size_of::<u64>();
+    if within(offset_of!(GuestState, x), size_of::<[u64; 31]>())
+        || within(offset_of!(GuestState, sp), word)
+    {
         Field::Gpr
-    } else if range(
-        offset_of!(GuestState, nzcv),
-        offset_of!(GuestState, exclusive_bytes),
-    ) {
+    } else if within(offset_of!(GuestState, nzcv), size_of::<u32>()) {
         Field::Nzcv
-    } else if range(offset_of!(GuestState, v), offset_of!(GuestState, fpcr)) {
+    } else if within(offset_of!(GuestState, v), size_of::<[[u64; 2]; 32]>()) {
         Field::Vector
-    } else if range(
-        offset_of!(GuestState, fpcr),
-        offset_of!(GuestState, exclusive_address),
-    ) {
+    } else if within(offset_of!(GuestState, fpcr), 2 * size_of::<u32>()) {
         Field::FpStatus
-    } else if range(
-        offset_of!(GuestState, unreachable),
-        offset_of!(GuestState, pan),
-    ) || range(
-        offset_of!(GuestState, lower_limit),
-        offset_of!(GuestState, loop_retired),
-    ) {
+    } else if within(offset_of!(GuestState, unreachable), word)
+        || within(offset_of!(GuestState, lower_limit), word)
+    {
         Field::Check
-    } else if displacement >= offset_of!(GuestState, anchors)
-        && !range(
-            offset_of!(GuestState, lower_limit),
-            offset_of!(GuestState, loop_retired),
-        )
+    } else if within(offset_of!(GuestState, anchors), size_of::<crate::Anchors>())
+        || within(offset_of!(GuestState, loop_retired), word)
+        || within(offset_of!(GuestState, exit_rsp), word)
+        || within(offset_of!(GuestState, account), word)
     {
         Field::Chain
     } else {
@@ -389,6 +382,7 @@ mod tests {
         let nzcv = offset_of!(GuestState, nzcv);
         let limit = offset_of!(GuestState, lower_limit);
         let anchors = offset_of!(GuestState, anchors);
+        let limit_compare = format!("cmp rax,QWORD PTR [rdi+{limit:#x}]");
         let cases = [
             (
                 format!("mov rax,QWORD PTR [rdi+{x23:#x}]"),
@@ -407,7 +401,7 @@ mod tests {
             (
                 "jae 0x6e".into(),
                 ldr,
-                "cmp rax,QWORD PTR [rdi+0x378]",
+                limit_compare.as_str(),
                 false,
                 Cause::Check,
             ),

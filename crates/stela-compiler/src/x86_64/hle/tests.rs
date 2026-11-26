@@ -31,7 +31,10 @@ fn names_round_trip() {
 #[test]
 fn the_layout_the_fast_paths_assume_holds() {
     // X2's frame slot, which a fast path loads n from.
-    assert_eq!(super::super::offset(Register::X(2)), Some(16));
+    assert_eq!(
+        super::super::offset(Register::X(2)),
+        Some(core::mem::offset_of!(crate::GuestState, x) as u32 + 16)
+    );
     // A success exit ahead in the page keeps a link slot, unpolled.
     let slot = chain::link_slot(Some(0x1000), GuestAddress(0x1010), ExitKind::Direct);
     assert_eq!(slot, chain::LINK_BYTES);

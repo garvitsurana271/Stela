@@ -331,24 +331,39 @@ mod tests {
     /// exits use.
     #[test]
     fn decodes_the_flag_forms_and_exits() {
-        // cmp rsi,rax; cmc; lahf; seto al; mov [rdi+0x100],ax;
-        // movzx eax,word [rdi+0x100]; add al,0x7f; sahf; jl +0; jmp +0;
-        // test byte [rdi+0x101],0x40; ret
-        let code = [
-            0x48, 0x39, 0xc6, 0xf5, 0x9f, 0x0f, 0x90, 0xc0, 0x66, 0x89, 0x87, 0x00, 0x01, 0x00,
-            0x00, 0x0f, 0xb7, 0x87, 0x00, 0x01, 0x00, 0x00, 0x04, 0x7f, 0x9e, 0x0f, 0x8c, 0x00,
-            0x00, 0x00, 0x00, 0xe9, 0x00, 0x00, 0x00, 0x00, 0xf6, 0x87, 0x01, 0x01, 0x00, 0x00,
-            0x40, 0xc3,
-        ];
-        let cost = fallthrough(&code, &[]);
-        assert_eq!(
-            cost,
-            Cost {
-                instructions: 12,
-                memory: 3,
-                flags: 8,
-                branches: 2,
-            }
-        );
+        // cmp rsi,rax; cmc; lahf; seto al; mov [rdi+nzcv],ax;
+        // movzx eax,word [rdi+nzcv]; add al,0x7f; sahf; jl +0; jmp +0;
+        // test byte [rdi+nzcv+1],0x40; ret: the word's operands with the
+        // frame's displacement and with a 32-bit one.
+        const NZCV: u32 = core::mem::offset_of!(crate::GuestState, nzcv) as u32;
+        for long in [false, true] {
+            let operand = |offset: u32| match long {
+                true => [&[0x87][..], &offset.to_le_bytes()[..]].concat(),
+                false => crate::x86_64::frame_modrm(0, offset),
+            };
+            let code = [
+                &[0x48, 0x39, 0xc6, 0xf5, 0x9f, 0x0f, 0x90, 0xc0, 0x66, 0x89][..],
+                &operand(NZCV)[..],
+                &[0x0f, 0xb7][..],
+                &operand(NZCV)[..],
+                &[
+                    0x04, 0x7f, 0x9e, 0x0f, 0x8c, 0x00, 0x00, 0x00, 0x00, 0xe9, 0x00, 0x00, 0x00,
+                    0x00, 0xf6,
+                ][..],
+                &operand(NZCV + 1)[..],
+                &[0x40, 0xc3][..],
+            ]
+            .concat();
+            let cost = fallthrough(&code, &[]);
+            assert_eq!(
+                cost,
+                Cost {
+                    instructions: 12,
+                    memory: 3,
+                    flags: 8,
+                    branches: 2,
+                }
+            );
+        }
     }
 }

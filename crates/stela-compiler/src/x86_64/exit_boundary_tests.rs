@@ -34,21 +34,21 @@ stela_test_enter_block:
     and ecx, {word_mask}
     mov [rdi + {nzcv}], ecx
     mov rbx, [rdi + {sp}]
-    mov rsi, [rdi + 64]
-    mov r14, [rdi + 152]
-    mov r15, [rdi + 0]
-    mov rbp, [rdi + 8]
-    mov r12, [rdi + 128]
+    mov rsi, [rdi + {x8}]
+    mov r14, [rdi + {x19}]
+    mov r15, [rdi + {x0}]
+    mov rbp, [rdi + {x1}]
+    mov r12, [rdi + {x16}]
     mov r13, [rdi + {account}]
     lea r11, [rsp - 8]
     mov [rdi + {exit_rsp}], r11
     call rax
     mov [rdi + {sp}], rbx
-    mov [rdi + 64], rsi
-    mov [rdi + 152], r14
-    mov [rdi + 0], r15
-    mov [rdi + 8], rbp
-    mov [rdi + 128], r12
+    mov [rdi + {x8}], rsi
+    mov [rdi + {x19}], r14
+    mov [rdi + {x0}], r15
+    mov [rdi + {x1}], rbp
+    mov [rdi + {x16}], r12
     mov [rdi + {account}], r13
     mov ecx, [rdi + {nzcv}]
     and ecx, {word_mask}
@@ -69,6 +69,11 @@ stela_test_enter_block:
     ud2
 "#,
     sp = const core::mem::offset_of!(GuestState, sp),
+    x0 = const core::mem::offset_of!(GuestState, x),
+    x1 = const core::mem::offset_of!(GuestState, x) + 8,
+    x8 = const core::mem::offset_of!(GuestState, x) + 8 * 8,
+    x16 = const core::mem::offset_of!(GuestState, x) + 8 * 16,
+    x19 = const core::mem::offset_of!(GuestState, x) + 8 * 19,
     account = const core::mem::offset_of!(GuestState, account),
     exit_rsp = const core::mem::offset_of!(GuestState, exit_rsp),
     nzcv = const core::mem::offset_of!(GuestState, nzcv),

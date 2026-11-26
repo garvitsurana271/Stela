@@ -76,15 +76,36 @@ impl Place {
 /// Arithmetic preserves unrelated FPCR/FPSR bits, and register accesses apply
 /// the declared field masks; saturating integer SIMD sets QC and floating-point
 /// arithmetic accumulates exception flags.
+///
+/// The words native code reads or writes most that are not registers come
+/// first, then X0 to X30: a field in the first 128 bytes takes an 8-bit
+/// displacement from RDI, 3 bytes fewer than the 32-bit one after it. A
+/// range check reads the lower limit and the unreachable address, nearly
+/// every flag-setting instruction writes NZCV and a self-loop counts in
+/// `loop_retired`: in the census's sampled hot blocks these were 0.6
+/// executed accesses per guest instruction, against 0.1 for X12 to X15,
+/// which the move takes past the 128 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestState {
-    pub x: [u64; 31],
-    pub sp: u64,
     pub nzcv: u32,
     /// The width of the exclusive load native code recorded, or 0 for none
     /// (`x86_64::native_exclusive`).
     pub exclusive_bytes: u32,
+    /// The end of the guest's native lower range on the host's placement
+    /// (`x86_64::RangeCheck::lower_limit`), which an EL0 block's one-sided
+    /// check compares access addresses with. Set by the engine as it
+    /// enters native code; zero fails every such check.
+    pub lower_limit: Limit,
+    /// [`Self::UNREACHABLE`], which a guest check that fails in system-mode
+    /// code moves into the access's address (`x86_64::RangeCheck`).
+    pub unreachable: u64,
+    /// The instructions a native self-loop (`x86_64::block`'s loop mode)
+    /// has retired in the iterations before the one it runs, which its exits
+    /// move to the chain's count and a fault's settlement adds: 0 outside one.
+    pub loop_retired: u64,
+    pub x: [u64; 31],
+    pub sp: u64,
     pub v: [[u64; 2]; 32],
     pub fpcr: u32,
     pub fpsr: u32,
@@ -97,23 +118,11 @@ pub struct GuestState {
     /// The masks of interrupts waiting when native code was entered: clearing
     /// one is the engine's.
     pub pending: u32,
-    /// [`Self::UNREACHABLE`], which a guest check that fails in system-mode
-    /// code moves into the access's address (`x86_64::RangeCheck`).
-    pub unreachable: u64,
     /// PSTATE.PAN while native code runs, which completes MSR PAN when the
     /// host keeps it in RFLAGS.AC (`x86_64::register_read::pan_thunk`).
     pub pan: u64,
     /// Set by the engine as it enters native code.
     pub anchors: Anchors,
-    /// The end of the guest's native lower range on the host's placement
-    /// (`x86_64::RangeCheck::lower_limit`), which an EL0 block's one-sided
-    /// check compares access addresses with. Set by the engine as it
-    /// enters native code; zero fails every such check.
-    pub lower_limit: Limit,
-    /// The instructions a native self-loop (`x86_64::block`'s loop mode)
-    /// has retired in the iterations before the one it runs, which its exits
-    /// move to the chain's count and a fault's settlement adds: 0 outside one.
-    pub loop_retired: u64,
     /// The host stack pointer at native code's entry, pointing at the
     /// entry's return address: every exit to the engine reloads RSP from it
     /// before its `ret` ([`crate::x86_64::chain::EXIT_RETURN`]), so words
@@ -203,22 +212,23 @@ mod tests {
     #[test]
     fn layout_matches_native_abi() {
         for profile in [BlockProfile::ORDINARY, BlockProfile::new(Features::LEAF)] {
-            assert!(profile.abi().starts_with("x86_64-sysv-guest-state-v15-"));
+            assert!(profile.abi().starts_with("x86_64-sysv-guest-state-v16-"));
         }
         assert_eq!(size_of::<GuestState>(), 920);
         assert_eq!(align_of::<GuestState>(), 8);
-        assert_eq!(offset_of!(GuestState, x), 0);
-        assert_eq!(offset_of!(GuestState, sp), 248);
-        assert_eq!(offset_of!(GuestState, nzcv), 256);
-        assert_eq!(offset_of!(GuestState, exclusive_bytes), 260);
-        assert_eq!(offset_of!(GuestState, v), 264);
+        assert_eq!(offset_of!(GuestState, nzcv), 0);
+        assert_eq!(offset_of!(GuestState, exclusive_bytes), 4);
+        assert_eq!(offset_of!(GuestState, lower_limit), 8);
+        assert_eq!(offset_of!(GuestState, unreachable), 16);
+        assert_eq!(offset_of!(GuestState, loop_retired), 24);
+        assert_eq!(offset_of!(GuestState, x), 32);
+        assert_eq!(offset_of!(GuestState, sp), 280);
+        assert_eq!(offset_of!(GuestState, v), 288);
         assert_eq!(size_of::<[[u64; 2]; 32]>(), 512);
-        assert_eq!(offset_of!(GuestState, fpcr), 776);
-        assert_eq!(offset_of!(GuestState, fpsr), 780);
-        assert_eq!(offset_of!(GuestState, unreachable), 808);
-        assert_eq!(offset_of!(GuestState, pan), 816);
-        assert_eq!(offset_of!(GuestState, lower_limit), 888);
-        assert_eq!(offset_of!(GuestState, loop_retired), 896);
+        assert_eq!(offset_of!(GuestState, fpcr), 800);
+        assert_eq!(offset_of!(GuestState, fpsr), 804);
+        assert_eq!(offset_of!(GuestState, pan), 832);
+        assert_eq!(offset_of!(GuestState, anchors), 840);
         assert_eq!(offset_of!(GuestState, exit_rsp), 904);
         assert_eq!(offset_of!(GuestState, account), 912);
     }

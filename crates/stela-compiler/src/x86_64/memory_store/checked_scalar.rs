@@ -411,7 +411,7 @@ mod tests {
             );
         }
         // The aliased index is a read memory operand of ADD, not another MOV.
-        let index_read = [0x48, 0x03, 0x87, 0, 0, 0, 0];
+        let index_read = crate::x86_64::frame_access(&[0x48, 0x03], 0, crate::x86_64::x_slot(0));
         assert_eq!(
             code.windows(index_read.len())
                 .filter(|window| *window == index_read)

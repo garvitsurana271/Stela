@@ -441,7 +441,9 @@ mod tests {
                 assert!(code.ends_with(&[0x48, 0x89, 0x0a]));
             } else {
                 // mov rax,[rdx], then the commit to X1.
-                assert!(code.ends_with(&[0x48, 0x8b, 0x02, 0x48, 0x89, 0x87, 8, 0, 0, 0]));
+                let commit =
+                    crate::x86_64::frame_access(&[0x48, 0x89], 0, crate::x86_64::x_slot(1));
+                assert!(code.ends_with(&[&[0x48, 0x8b, 0x02][..], &commit[..]].concat()));
             }
         }
     }

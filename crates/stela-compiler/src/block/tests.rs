@@ -548,9 +548,10 @@ fn system_mode_blocks_check_sctlr_a_and_the_ordered_granule_when_asked() {
             .x86_64_code
     };
     // test al,unit-1; cmovne rax,[rdi+unreachable] for each element size.
-    let check = |unit: u8| [0xa8, unit - 1, 0x48, 0x0f, 0x45, 0x87, 0x28, 0x03, 0, 0];
+    let unreachable = core::mem::offset_of!(crate::GuestState, unreachable) as u8;
+    let check = |unit: u8| [0xa8, unit - 1, 0x48, 0x0f, 0x45, 0x47, unreachable];
     let count = |code: &[u8], unit: u8| {
-        code.windows(10)
+        code.windows(7)
             .filter(|bytes| *bytes == check(unit))
             .count()
     };
@@ -674,11 +675,9 @@ fn a_pinned_runs_side_exits_are_where_its_successors_say() {
     )
     .unwrap();
     let code = &compiled.native.x86_64_code;
-    // MOV [RDI+0x18], R9: the run stores X3 from its local.
-    assert!(
-        code.windows(4)
-            .any(|bytes| bytes == [0x4c, 0x89, 0x4f, 0x18])
-    );
+    // MOV [RDI+X3], R9: the run stores X3 from its local.
+    let x3 = (core::mem::offset_of!(crate::GuestState, x) + 3 * 8) as u8;
+    assert!(code.windows(4).any(|bytes| bytes == [0x4c, 0x89, 0x4f, x3]));
     let exits: Vec<_> = compiled
         .direct_exits
         .iter()

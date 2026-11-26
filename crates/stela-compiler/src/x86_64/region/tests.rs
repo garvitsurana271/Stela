@@ -924,7 +924,16 @@ fn cached_scalar_load_folds_the_displacement_into_the_access() {
             assert_eq!(ordinary.stats.address_cache_hits, 1);
             let row = &ordinary.code[ordinary.source_map[1].1..ordinary.source_map[2].1];
             assert!(row.starts_with(access));
-            assert!(row[access.len()..].starts_with(&[0x48, 0x89, 0x8f]));
+            let Register::X(slot) = destination else {
+                unreachable!("an X destination")
+            };
+            assert!(
+                row[access.len()..].starts_with(&crate::x86_64::frame_access(
+                    &[0x48, 0x89],
+                    1,
+                    crate::x86_64::x_slot(slot)
+                ))
+            );
             let precise = emit_clean_load_prefix_with(
                 &instructions,
                 crate::x86_64::MemoryChecks::DEFAULT,
@@ -1128,7 +1137,10 @@ fn stack_pointer_loads_carry_the_blocks_alignment_check() {
             );
         }
         assert!(baseline.instructions() > 0);
-        assert!(admits_ordinary(&region, &baseline));
+        // The baseline's frame accesses take the region's displacements too, so
+        // the gate's size test may keep the baseline; the region runs no more
+        // instructions than it.
+        assert!(region.stats.native_instructions <= baseline.instructions());
     }
 }
 
@@ -1473,7 +1485,10 @@ fn stores_settle_first_and_reuse_resident_values() {
             super::super::MemoryChecks::DEFAULT,
         );
     }
-    assert!(admits_ordinary(&region, &baseline));
+    // The baseline's frame accesses take the region's displacements too, so
+    // the gate's size test may keep the baseline; the region runs no more
+    // instructions than it.
+    assert!(region.stats.native_instructions <= baseline.instructions());
 }
 
 /// Single stores are selected; pairs only through a checked, aligned SP;

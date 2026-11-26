@@ -299,11 +299,11 @@ mod tests {
 
     #[test]
     fn z_storage_segments_cover_each_register_without_overlap() {
-        assert_eq!(core::mem::offset_of!(GuestState, v), 264);
+        let v = core::mem::offset_of!(GuestState, v) as u32;
         for bytes in LENGTHS {
             let length = VectorLength::from_bytes(bytes).unwrap();
             for register in 0..32 {
-                assert_eq!(vector_offset(register), 264 + u32::from(register) * 16);
+                assert_eq!(vector_offset(register), v + u32::from(register) * 16);
                 for chunk in 1..length.chunks() {
                     assert_eq!(
                         upper_offset(register, chunk, length) as usize,

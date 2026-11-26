@@ -79,11 +79,9 @@ fn the_one_sided_check_is_a_frame_compare_and_the_mask() {
     let limit = core::mem::offset_of!(GuestState, lower_limit) as u32;
     let unreachable = core::mem::offset_of!(GuestState, unreachable) as u32;
     // cmp rax,[rdi+limit]
-    let mut compare = alloc::vec![0x48, 0x3b, 0x87];
-    compare.extend(limit.to_le_bytes());
+    let compare = super::frame_access(&[0x48, 0x3b], 0, limit);
     // cmovae rax,[rdi+unreachable]
-    let mut mask = alloc::vec![0x48, 0x0f, 0x43, 0x87];
-    mask.extend(unreachable.to_le_bytes());
+    let mask = super::frame_access(&[0x48, 0x0f, 0x43], 0, unreachable);
     for check in PLACEMENTS {
         let one_sided = check.one_sided(true);
         let mut pinned = Code::new();

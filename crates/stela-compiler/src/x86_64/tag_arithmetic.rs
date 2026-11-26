@@ -19,7 +19,7 @@ const C_SHIFT: u8 = 29;
 
 /// The guest state field at `offset` from RDI.
 const fn state(offset: u32) -> Mem {
-    Mem::base_disp32(Gpr::Rdi, offset as i32)
+    Mem::base(Gpr::Rdi, offset as i32)
 }
 
 pub(super) fn emit(code: &mut Code, operand: &Operand) {

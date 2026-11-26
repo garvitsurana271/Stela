@@ -427,8 +427,15 @@ mod tests {
         assert_eq!(code.vector_home(0), Some(FIRST_HOST));
         let host = code.allocate_vector(20);
         assert_eq!(host, FIRST_HOST + 1);
-        // movdqu [rdi+0x118],xmm9: V1 stored before its home is reused.
-        assert_eq!(&code[..], [0xf3, 0x44, 0x0f, 0x7f, 0x8f, 0x18, 0x01, 0, 0]);
+        // movdqu [rdi+V1],xmm9: V1 stored before its home is reused.
+        assert_eq!(
+            &code[..],
+            crate::x86_64::frame_access(
+                &[0xf3, 0x44, 0x0f, 0x7f],
+                1,
+                core::mem::offset_of!(crate::GuestState, v) as u32 + 16
+            )
+        );
         assert_eq!(code.vector_home(1), None);
         assert!(!code.vector_cache().is_dirty(1));
         let stored = code.len();

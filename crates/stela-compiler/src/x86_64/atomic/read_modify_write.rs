@@ -204,8 +204,8 @@ mod tests {
             (DWORD_BYTES, &[0x44, 0x89, 0x02]),
             (QWORD_BYTES, &[0x4c, 0x89, 0x02]),
         ];
-        // mov [rdi+16],rax: the old value's commit to X2.
-        let commit = [0x48, 0x89, 0x87, 16, 0, 0, 0];
+        // mov [rdi+X2],rax: the old value's commit to X2.
+        let commit = crate::x86_64::frame_access(&[0x48, 0x89], 0, crate::x86_64::x_slot(2));
         let position = |code: &[u8], bytes: &[u8]| {
             code.windows(bytes.len()).position(|window| window == bytes)
         };
@@ -213,8 +213,8 @@ mod tests {
             for operation in OPERATIONS {
                 let mut code = Code::new();
                 plain(&mut code, bytes, operation, Register::X(1), Register::X(2));
-                // X1 and X2 sit at frame offsets 8 and 16, so no other byte
-                // is a LOCK prefix or a conditional jump.
+                // X1's and X2's frame offsets are no LOCK prefix or
+                // conditional jump, so no other byte is either.
                 assert!(!code.contains(&LOCK), "{operation:?} {bytes}");
                 assert!(!code.iter().any(|byte| (0x70..0x80).contains(byte)));
                 let loaded = position(&code, load).expect("the load");

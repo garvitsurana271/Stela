@@ -107,10 +107,10 @@ const PAGE: u64 = 4096;
 /// What pads a fast path: INT3, which no path reaches.
 const INT3: u8 = 0xcc;
 
-// A fast path reads X0 in R15 and X1 in RBP, and X2 at the frame's byte
-// 16 (the frame's X array first): an upstream change to the pinned map or
-// the frame breaks the build. `link_slot` and `offset` are not `const`, so
-// the forward link slot and X2's slot are pinned by tests.
+// A fast path reads X0 in R15 and X1 in RBP, and X2 at its frame slot: an
+// upstream change to the pinned map breaks the build. `link_slot` and
+// `offset` are not `const`, so the forward link slot and X2's slot are
+// pinned by tests.
 const fn pins(guest: u8, host: Gpr) -> bool {
     let mut at = 0;
     while at < PINNED.len() {
@@ -125,11 +125,10 @@ const fn pins(guest: u8, host: Gpr) -> bool {
     false
 }
 const _: () = assert!(pins(0, Gpr::R15) && pins(1, Gpr::Rbp));
-const _: () = assert!(core::mem::offset_of!(crate::GuestState, x) == 0);
 
 /// X2's frame slot, where a fast path reads its third argument.
 fn x2() -> super::asm::Mem {
-    super::frame(2 * 8)
+    super::frame(core::mem::offset_of!(crate::GuestState, x) as u32 + 2 * 8)
 }
 
 /// The composite [`compose`] lays out: which routine, at which function

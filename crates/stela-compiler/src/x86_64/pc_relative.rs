@@ -41,7 +41,10 @@ mod tests {
         );
         assert_eq!(&code[..2], &[0x48, 0xb8]);
         assert_eq!(&code[2..10], &0xfedcba9876543210u64.to_le_bytes());
-        assert_eq!(&code[10..], &[0x48, 0x89, 0x87, 240, 0, 0, 0]);
+        assert_eq!(
+            &code[10..],
+            &crate::x86_64::frame_access(&[0x48, 0x89], 0, crate::x86_64::x_slot(30))[..]
+        );
         let source: Vec<_> = [0x1000001fu32, 0xd65f03c0]
             .into_iter()
             .flat_map(u32::to_le_bytes)

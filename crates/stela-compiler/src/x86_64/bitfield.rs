@@ -169,6 +169,21 @@ mod tests {
 
     use alloc::vec::Vec;
 
+    /// What [`code`]'s emissions start with: X1 into RAX.
+    fn load() -> Vec<u8> {
+        crate::x86_64::frame_access(&[0x48, 0x8b], 0, crate::x86_64::x_slot(1))
+    }
+
+    /// What they end with: RAX into X2.
+    fn store() -> Vec<u8> {
+        crate::x86_64::frame_access(&[0x48, 0x89], 0, crate::x86_64::x_slot(2))
+    }
+
+    /// The operation between them in `emitted`.
+    fn between(emitted: &[u8]) -> &[u8] {
+        &emitted[load().len()..emitted.len() - store().len()]
+    }
+
     fn code(width: Width, kind: Kind, rotation: u8, mask_end: u8) -> Vec<u8> {
         let mut result = Code::new();
         emit(
@@ -199,10 +214,20 @@ mod tests {
                 code.set_constant_time(dit);
                 emit(&mut code, &operand);
                 if pinned {
-                    // X17's slot takes X1's low half: mov [rdi + 136], ebp.
-                    assert_eq!(code, [0x89, 0xaf, 136, 0, 0, 0]);
+                    // X17's slot takes X1's low half: mov [rdi + X17], ebp.
+                    assert_eq!(
+                        code,
+                        crate::x86_64::frame_access(&[0x89], 5, crate::x86_64::x_slot(17))
+                    );
                 } else {
-                    assert_eq!(code, [0x8b, 0x87, 8, 0, 0, 0, 0x89, 0x87, 136, 0, 0, 0]);
+                    assert_eq!(
+                        code,
+                        [
+                            crate::x86_64::frame_access(&[0x8b], 0, crate::x86_64::x_slot(1)),
+                            crate::x86_64::frame_access(&[0x89], 0, crate::x86_64::x_slot(17))
+                        ]
+                        .concat()
+                    );
                 }
                 assert_eq!(
                     rax_after(&Operation::Bitfield(operand), &code, MemoryChecks::DEFAULT),
@@ -233,8 +258,15 @@ mod tests {
                         ..operand
                     },
                 );
-                // X17's slot, pinned code or not: mov dword [rdi + 136], 0.
-                assert_eq!(code, [0xc7, 0x87, 136, 0, 0, 0, 0, 0, 0, 0]);
+                // X17's slot, pinned code or not: mov dword [rdi + X17], 0.
+                assert_eq!(
+                    code,
+                    [
+                        crate::x86_64::frame_access(&[0xc7], 0, crate::x86_64::x_slot(17)),
+                        alloc::vec![0; 4]
+                    ]
+                    .concat()
+                );
             }
         }
     }
@@ -251,25 +283,28 @@ mod tests {
         let pc = GuestAddress(0xffff_fe00_3a24_52bc);
         let options = Options::new(BlockProfile::ORDINARY, TargetCpu::Baseline);
         let block = crate::compile(&source, pc, &options).unwrap();
+        let insert = crate::x86_64::frame_access(&[0x8b], 0, crate::x86_64::x_slot(1)).len()
+            + crate::x86_64::frame_access(&[0x89], 0, crate::x86_64::x_slot(17)).len();
         assert_eq!(
             block.native.source_map,
-            [(pc, 0), (GuestAddress(pc.0 + 4), 12)]
+            [(pc, 0), (GuestAddress(pc.0 + 4), insert)]
         );
-        assert!(block.native.x86_64_code[12..].starts_with(&[0x48, 0x8b, 0x87, 136, 0, 0, 0]));
+        assert!(
+            block.native.x86_64_code[insert..].starts_with(&crate::x86_64::frame_access(
+                &[0x48, 0x8b],
+                0,
+                crate::x86_64::x_slot(17)
+            ))
+        );
     }
 
     #[test]
     fn full_width_extract_avoids_masked_x86_shifts_and_clears_w_upper_bits() {
         for kind in [Kind::Signed, Kind::Unsigned] {
-            assert_eq!(
-                code(Width::X64, kind, 0, 63),
-                [0x48, 0x8b, 0x87, 8, 0, 0, 0, 0x48, 0x89, 0x87, 16, 0, 0, 0]
-            );
+            assert_eq!(code(Width::X64, kind, 0, 63), [load(), store()].concat());
             assert_eq!(
                 code(Width::W32, kind, 0, 31),
-                [
-                    0x48, 0x8b, 0x87, 8, 0, 0, 0, 0x89, 0xc0, 0x48, 0x89, 0x87, 16, 0, 0, 0,
-                ]
+                [load(), alloc::vec![0x89, 0xc0], store()].concat()
             );
         }
     }
@@ -278,19 +313,19 @@ mod tests {
     fn wrapping_signed_field_extends_before_placing_the_low_zero_bits() {
         let signed = code(Width::X64, Kind::Signed, 63, 0);
         assert_eq!(
-            &signed[7..signed.len() - 7],
+            between(&signed),
             [
                 0x48, 0xc1, 0xe0, 63, 0x48, 0xc1, 0xf8, 63, 0x48, 0xc1, 0xe0, 1
             ]
         );
         let unsigned = code(Width::W32, Kind::Unsigned, 31, 0);
         assert_eq!(
-            &unsigned[7..unsigned.len() - 7],
+            between(&unsigned),
             [0xc1, 0xe0, 31, 0xc1, 0xe8, 31, 0xc1, 0xe0, 1]
         );
         let extraction = code(Width::X64, Kind::Unsigned, 8, 15);
         assert_eq!(
-            &extraction[7..extraction.len() - 7],
+            between(&extraction),
             [0x48, 0xc1, 0xe0, 48, 0x48, 0xc1, 0xe8, 56]
         );
     }
@@ -309,7 +344,7 @@ mod tests {
             (Width::W32, Kind::Signed, 27, 26, &[0xc1, 0xe0, 5]),
         ] {
             let emitted = code(width, kind, rotation, mask_end);
-            assert_eq!(&emitted[7..emitted.len() - 7], expected);
+            assert_eq!(between(&emitted), expected);
         }
     }
 
@@ -414,13 +449,13 @@ mod tests {
                 mask_end: 7,
             },
         );
-        assert_eq!(&emitted[..7], [0x48, 0x8b, 0x87, 240, 0, 0, 0]);
-        let destination_load = [0x48, 0x8b, 0x8f, 240, 0, 0, 0];
+        let source_load = crate::x86_64::frame_access(&[0x48, 0x8b], 0, crate::x86_64::x_slot(30));
+        assert_eq!(&emitted[..source_load.len()], source_load);
+        let destination_load =
+            crate::x86_64::frame_access(&[0x48, 0x8b], 1, crate::x86_64::x_slot(30));
         assert!(emitted.windows(7).any(|bytes| bytes == destination_load));
-        assert_eq!(
-            &emitted[emitted.len() - 7..],
-            [0x48, 0x89, 0x87, 240, 0, 0, 0]
-        );
+        let commit = crate::x86_64::frame_access(&[0x48, 0x89], 0, crate::x86_64::x_slot(30));
+        assert_eq!(&emitted[emitted.len() - commit.len()..], commit);
         assert_eq!(
             emitted
                 .windows(3)

@@ -1384,10 +1384,17 @@ mod tests {
             },
         );
         assert_eq!(&code[7..13], &[0xa8, 15, 0x74, 2, 0x0f, 0x0b]);
+        // movdqu xmm0,[rax]; movdqu [V31],xmm0; mov [SP],rdx.
         let suffix = [
-            0xf3, 0x0f, 0x6f, 0x00, 0xf3, 0x0f, 0x7f, 0x87, 0xf8, 2, 0, 0, 0x48, 0x89, 0x97, 248,
-            0, 0, 0,
-        ];
+            alloc::vec![0xf3, 0x0f, 0x6f, 0x00],
+            crate::x86_64::frame_access(&[0xf3, 0x0f, 0x7f], 0, vector_offset(31)),
+            crate::x86_64::frame_access(
+                &[0x48, 0x89],
+                2,
+                core::mem::offset_of!(crate::GuestState, sp) as u32,
+            ),
+        ]
+        .concat();
         assert!(code.ends_with(&suffix));
     }
 
@@ -1421,8 +1428,15 @@ mod tests {
                     },
                 );
                 if load {
-                    assert!(code[7..].starts_with(&load_bytes));
-                    assert!(code.ends_with(&[0xf3, 0x0f, 0x7f, 0x87, 8, 1, 0, 0]));
+                    let base =
+                        crate::x86_64::frame_access(&[0x48, 0x8b], 0, crate::x86_64::x_slot(0))
+                            .len();
+                    assert!(code[base..].starts_with(&load_bytes));
+                    assert!(code.ends_with(&crate::x86_64::frame_access(
+                        &[0xf3, 0x0f, 0x7f],
+                        0,
+                        vector_offset(0)
+                    )));
                 } else {
                     assert!(code.ends_with(&store_bytes));
                 }
@@ -1448,7 +1462,11 @@ mod tests {
             if two_lanes {
                 assert_eq!(&code[15..19], &[0x66, 0x0f, 0x6c, 0xc0]);
             }
-            assert!(code.ends_with(&[0xf3, 0x0f, 0x7f, 0x87, 0xf8, 2, 0, 0]));
+            assert!(code.ends_with(&crate::x86_64::frame_access(
+                &[0xf3, 0x0f, 0x7f],
+                0,
+                vector_offset(31)
+            )));
         }
     }
 
@@ -1466,7 +1484,11 @@ mod tests {
             );
             assert_eq!(
                 code,
-                [0x66, 0x0f, 0xef, 0xc0, 0xf3, 0x0f, 0x7f, 0x87, 8, 1, 0, 0]
+                [
+                    alloc::vec![0x66, 0x0f, 0xef, 0xc0],
+                    crate::x86_64::frame_access(&[0xf3, 0x0f, 0x7f], 0, vector_offset(0)),
+                ]
+                .concat()
             );
         }
     }
@@ -1486,13 +1508,20 @@ mod tests {
                     mode: AddressMode::PreIndex,
                 },
             );
+            // After X0's load into RAX and the address's 7 bytes.
+            let at =
+                crate::x86_64::frame_access(&[0x48, 0x8b], 0, crate::x86_64::x_slot(0)).len() + 7;
             assert_eq!(
-                &code[14..23],
+                &code[at..at + 9],
                 &[prefix, 0x0f, opcode, 0, prefix, 0x0f, opcode, 0x48, bytes]
             );
-            assert_eq!(&code[23..31], &[0xf3, 0x0f, 0x7f, 0x87, 8, 1, 0, 0]);
-            assert_eq!(&code[31..39], &[0xf3, 0x0f, 0x7f, 0x8f, 0xf8, 2, 0, 0]);
-            assert_eq!(&code[39..], &[0x48, 0x89, 0x97, 0, 0, 0, 0]);
+            let commits = [
+                crate::x86_64::frame_access(&[0xf3, 0x0f, 0x7f], 0, vector_offset(0)),
+                crate::x86_64::frame_access(&[0xf3, 0x0f, 0x7f], 1, vector_offset(31)),
+                crate::x86_64::frame_access(&[0x48, 0x89], 2, crate::x86_64::x_slot(0)),
+            ]
+            .concat();
+            assert_eq!(&code[at + 9..], &commits[..]);
         }
     }
 
@@ -1512,13 +1541,26 @@ mod tests {
                 },
             );
             assert_eq!(&code[7..13], &[0xa8, 15, 0x74, 2, 0x0f, 0x0b]);
-            assert_eq!(&code[17..25], &[0xf3, 0x0f, 0x6f, 0x87, 0xf8, 2, 0, 0]);
-            assert_eq!(&code[25..33], &[0xf3, 0x0f, 0x6f, 0x8f, 0xf8, 2, 0, 0]);
+            assert_eq!(
+                &code[17..25],
+                &crate::x86_64::frame_access(&[0xf3, 0x0f, 0x6f], 0, vector_offset(31))[..]
+            );
+            assert_eq!(
+                &code[25..33],
+                &crate::x86_64::frame_access(&[0xf3, 0x0f, 0x6f], 1, vector_offset(31))[..]
+            );
             assert_eq!(
                 &code[33..42],
                 &[prefix, 0x0f, opcode, 0, prefix, 0x0f, opcode, 0x48, bytes]
             );
-            assert_eq!(&code[42..], &[0x48, 0x89, 0x97, 248, 0, 0, 0]);
+            assert_eq!(
+                &code[42..],
+                &crate::x86_64::frame_access(
+                    &[0x48, 0x89],
+                    2,
+                    core::mem::offset_of!(crate::GuestState, sp) as u32
+                )[..]
+            );
         }
     }
 

@@ -104,7 +104,10 @@ mod tests {
                 .position(|window| window == expected)
                 .unwrap_or_else(|| panic!("{bytes}: {code:02x?}"));
             // Then only the commit of the old value to X1.
-            assert_eq!(&code[at + expected.len()..], [0x48, 0x89, 0x87, 8, 0, 0, 0]);
+            assert_eq!(
+                &code[at + expected.len()..],
+                crate::x86_64::frame_access(&[0x48, 0x89], 0, crate::x86_64::x_slot(1))
+            );
             let mut locked = Code::new();
             emit(&mut locked, &operand, false);
             assert!(locked.contains(&0xf0) && !code.contains(&0xf0));

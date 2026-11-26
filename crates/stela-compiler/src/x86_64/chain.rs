@@ -5146,7 +5146,7 @@ mod tests {
         let code = thunk(0x1000, 7, 3, 0x2000, 0x800, LinkGate::Jrcxz).unwrap();
         // mov rdx, [rdi + control]
         let mut expected = vec![0x48, 0x8b, 0x97];
-        expected.extend(824u32.to_le_bytes());
+        expected.extend((core::mem::offset_of!(crate::GuestState, anchors) as u32).to_le_bytes());
         // The gate without the flags: mov ecx, [rdx], the quiet word, whose
         // JRCXZ goes to the jump back.
         expected.extend([0x8b, 0x0a, 0xe3, 26]);
@@ -5177,7 +5177,7 @@ mod tests {
         let code = thunk(0x1000, 7, 3, 0x2000, 0x800, LinkGate::Pext).unwrap();
         let body = LINK_BODY_BYTES + 1;
         let mut expected = vec![0x48, 0x8b, 0x97];
-        expected.extend(824u32.to_le_bytes());
+        expected.extend((core::mem::offset_of!(crate::GuestState, anchors) as u32).to_le_bytes());
         expected.extend([0xc4, 0xe2, 0x12, 0xf5, 0x0a, 0xe3, 20]);
         expected.extend([0x4d, 0x8d, 0xad, 0xff, 0xff, 0x06, 0x00]);
         expected.extend([0x48, 0xc7, 0x42, 0x08, 3, 0, 0, 0, 0xe9]);

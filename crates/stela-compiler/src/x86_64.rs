@@ -249,15 +249,50 @@ impl NativeSystem {
 
 fn offset(register: Register) -> Option<u32> {
     match register {
-        Register::X(index) => Some(u32::from(index) * 8),
-        Register::Sp => Some(248),
+        Register::X(index) => {
+            Some(core::mem::offset_of!(crate::GuestState, x) as u32 + u32::from(index) * 8)
+        }
+        Register::Sp => Some(core::mem::offset_of!(crate::GuestState, sp) as u32),
         Register::Zero => None,
     }
 }
 
-/// `[rdi+offset]` with a 32-bit displacement: a field of the guest frame.
+/// `[rdi+offset]`, a field of the guest frame, with the shortest
+/// displacement: 8 bits for the first 128 bytes, where `GuestState` keeps
+/// the fields native code reaches most.
 fn frame(offset: u32) -> asm::Mem {
-    asm::Mem::base_disp32(asm::Gpr::Rdi, offset as i32)
+    asm::Mem::base(asm::Gpr::Rdi, offset as i32)
+}
+
+/// X`index`'s frame slot ([`offset`]), for tests that look for frame
+/// accesses in emitted code.
+#[cfg(test)]
+pub(crate) fn x_slot(index: u8) -> u32 {
+    offset(Register::X(index)).expect("an X register has a frame slot")
+}
+
+/// The ModRM and displacement of [`frame`]`(offset)` with `reg` in the
+/// ModRM's reg field: an 8-bit displacement in the first 128 bytes.
+#[cfg(test)]
+pub(crate) fn frame_modrm(reg: u8, offset: u32) -> alloc::vec::Vec<u8> {
+    let reg = (reg & 7) << 3;
+    match i8::try_from(offset) {
+        Ok(0) => alloc::vec![reg | 7],
+        Ok(short) => alloc::vec![0x40 | reg | 7, short as u8],
+        Err(_) => {
+            let mut bytes = alloc::vec![0x80 | reg | 7];
+            bytes.extend(offset.to_le_bytes());
+            bytes
+        }
+    }
+}
+
+/// `prefix` then [`frame_modrm`]: a whole frame access's bytes.
+#[cfg(test)]
+pub(crate) fn frame_access(prefix: &[u8], reg: u8, offset: u32) -> alloc::vec::Vec<u8> {
+    let mut bytes = prefix.to_vec();
+    bytes.extend(frame_modrm(reg, offset));
+    bytes
 }
 
 /// The frame's end of the native lower range ([`RangeCheck::one_sided`]).

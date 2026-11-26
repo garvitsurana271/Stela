@@ -43,10 +43,10 @@ fn divide_remainder_emits_two_rows_and_one_remainder_store() {
         TargetCpu::X86_64_V3,
     ] {
         for (wide, signed, old_bytes, new_bytes, old_count, new_count) in [
-            (true, false, 80, 52, 16, 11),
-            (false, false, 77, 51, 17, 12),
-            (true, true, 98, 72, 20, 16),
-            (false, true, 92, 68, 21, 17),
+            (true, false, 74, 49, 16, 11),
+            (false, false, 71, 48, 17, 12),
+            (true, true, 92, 69, 20, 16),
+            (false, true, 86, 65, 21, 17),
         ] {
             let words = [
                 OPENSSL[0] & !(1 << 31) | (u32::from(wide) << 31) | (u32::from(signed) << 10),
@@ -71,7 +71,10 @@ fn divide_remainder_emits_two_rows_and_one_remainder_store() {
                 (grouped.len(), grouped.instructions()),
                 (new_bytes, new_count)
             );
-            assert_eq!(&grouped[map[1].1..], &[0x48, 0x89, 0x97, 0xa0, 0, 0, 0]);
+            assert_eq!(
+                &grouped[map[1].1..],
+                &crate::x86_64::frame_access(&[0x48, 0x89], 2, crate::x86_64::x_slot(20))[..]
+            );
             let block = compile(&words, PC, target);
             assert_eq!(block.native.source_map, map);
             assert!(block.native.x86_64_code.starts_with(&grouped));
@@ -172,7 +175,7 @@ fn pinned_divide_remainder_shortens_the_installed_desktop_pair() {
     let mut map = Vec::new();
     let instructions = lift(words);
     assert!(emit_divide_remainder(&mut group, &mut map, &instructions));
-    assert_eq!((group.len(), group.instructions()), (37, 12));
+    assert_eq!((group.len(), group.instructions()), (40, 12));
     assert_eq!(&group[map[1].1..], &[0x48, 0x89, 0xd6]); // mov rsi,rdx
     let actual = compile_profile(&words, pc, target, system);
     assert_eq!(
@@ -188,7 +191,7 @@ fn pinned_divide_remainder_shortens_the_installed_desktop_pair() {
         };
         emit(&mut separate, &operand, target);
     }
-    assert_eq!((separate.len(), separate.instructions()), (53, 17));
+    assert_eq!((separate.len(), separate.instructions()), (59, 17));
 }
 
 #[cfg(all(target_arch = "x86_64", any(target_os = "linux", target_os = "macos")))]

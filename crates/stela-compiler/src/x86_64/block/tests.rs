@@ -38,23 +38,23 @@ fn ordinary_scaled_add_uses_a_settled_right_operand() {
                         grouped.source_map,
                         [(pc, 0), (GuestAddress(pc.0 + 4), second.1)]
                     );
-                    assert!(
-                        grouped.x86_64_code[..second.1]
-                            .ends_with(&[0x48, 0x89, 0x87, 0x70, 0, 0, 0])
-                    );
+                    assert!(grouped.x86_64_code[..second.1].ends_with(
+                        &super::super::frame_access(&[0x48, 0x89], 0, super::super::x_slot(14))
+                    ));
                     let row = &grouped.x86_64_code[second.1..];
                     let lea = [0x8d, 0x04, 1 | ((amount as u8) << 6)];
-                    let load_size = if size_bit == 0 { 6 } else { 8 };
+                    // MOV ECX or RCX from X2's slot, and LEA's REX.W.
+                    let load_size = 1
+                        + super::super::frame_modrm(1, super::super::x_slot(2)).len()
+                        + if size_bit == 0 { 0 } else { 2 };
                     assert_eq!(&row[load_size..load_size + lea.len()], &lea);
-                    assert!(row[load_size + lea.len()..].starts_with(&[
-                        0x48,
-                        0x89,
-                        0x87,
-                        (destination * 8) as u8,
-                        0,
-                        0,
-                        0
-                    ]));
+                    assert!(
+                        row[load_size + lea.len()..].starts_with(&super::super::frame_access(
+                            &[0x48, 0x89],
+                            0,
+                            super::super::x_slot(destination as u8)
+                        ))
+                    );
                 }
             }
         }
@@ -66,8 +66,14 @@ fn ordinary_scaled_add_uses_a_settled_right_operand() {
         GuestAddress(0x100026f8c),
         target,
     );
+    // MOV RCX from a frame slot, then LEA RAX,[RCX+RAX*4] from what RAX holds.
     let uses_held = |row: &[u8]| {
-        row.starts_with(&[0x48, 0x8b, 0x8f]) && row[7..].starts_with(&[0x48, 0x8d, 0x04, 0x81])
+        let load = match row {
+            [0x48, 0x8b, modrm, ..] if modrm & 0x3f == 0x0f && modrm >> 6 == 1 => 4,
+            [0x48, 0x8b, modrm, ..] if modrm & 0x3f == 0x0f && modrm >> 6 == 2 => 7,
+            _ => return false,
+        };
+        row[load..].starts_with(&[0x48, 0x8d, 0x04, 0x81])
     };
     assert!(uses_held(
         &from_load.x86_64_code[from_load.source_map[1].1..]
@@ -195,9 +201,20 @@ fn adjacent_vector_pairs_forward_both_sources_and_keep_each_access() {
     let target = TargetCpu::Baseline;
     let checks = MemoryChecks::DEFAULT;
     let next = GuestAddress(pc.0 + 4);
+    // MOVDQU XMM0,[V0]; MOVDQU XMM1,[V1].
     let reload = [
-        0xf3, 0x0f, 0x6f, 0x87, 0x08, 0x01, 0, 0, 0xf3, 0x0f, 0x6f, 0x8f, 0x18, 0x01, 0, 0,
-    ];
+        super::super::frame_access(
+            &[0xf3, 0x0f, 0x6f],
+            0,
+            core::mem::offset_of!(crate::GuestState, v) as u32,
+        ),
+        super::super::frame_access(
+            &[0xf3, 0x0f, 0x6f],
+            1,
+            core::mem::offset_of!(crate::GuestState, v) as u32 + 16,
+        ),
+    ]
+    .concat();
     let has_reload = |native: &NativeBlock| {
         native
             .x86_64_code
@@ -453,8 +470,8 @@ fn vector_pair_store_forwards_its_offset_address_to_the_next_base_add() {
         &grouped.native.x86_64_code[..row],
         &fallback.native.x86_64_code[..row]
     );
-    let frame_load = [0x48, 0x8b, 0x87, 0x50, 0, 0, 0];
-    let commit = [0x48, 0x89, 0x87, 0x50, 0, 0, 0];
+    let frame_load = super::super::frame_access(&[0x48, 0x8b], 0, super::super::x_slot(10));
+    let commit = super::super::frame_access(&[0x48, 0x89], 0, super::super::x_slot(10));
     let forwarded = [0x48, 0x8d, 0x40, 0x30];
     assert!(grouped.native.x86_64_code[row..].starts_with(&forwarded));
     assert!(fallback.native.x86_64_code[row..].starts_with(&frame_load));
@@ -550,7 +567,13 @@ fn ordinary_compare_reads_both_settled_load_results() {
         &old.x86_64_code[..compare_at],
         &live.x86_64_code[..compare_at]
     );
-    assert!(live.x86_64_code[compare_at..branch_at].ends_with(&[0x89, 0x87, 0, 1, 0, 0]));
+    assert!(
+        live.x86_64_code[compare_at..branch_at].ends_with(&super::super::frame_access(
+            &[0x89],
+            0,
+            core::mem::offset_of!(crate::GuestState, nzcv) as u32
+        ))
+    );
     assert!(live.x86_64_code[branch_at..].starts_with(&[0x0f, 0x85]));
     let extract = |code: &[u8]| {
         code.windows(5)
@@ -581,8 +604,18 @@ fn ordinary_compare_reads_both_settled_load_results() {
             ]
         );
         let code = &grouped.x86_64_code;
-        assert!(code[..map[1].1].ends_with(&[0x48, 0x89, 0x8f, 0x30, 0, 0, 0]));
-        assert!(code[map[1].1..map[2].1].ends_with(&[0x48, 0x89, 0x87, 0x38, 0, 0, 0]));
+        assert!(code[..map[1].1].ends_with(&super::super::frame_access(
+            &[0x48, 0x89],
+            1,
+            super::super::x_slot(6)
+        )));
+        assert!(
+            code[map[1].1..map[2].1].ends_with(&super::super::frame_access(
+                &[0x48, 0x89],
+                0,
+                super::super::x_slot(7)
+            ))
+        );
         assert!(code[map[2].1..].starts_with(&[0x39, 0xc1]));
         let independent = compile(&words[1..], map[1].0, target);
         assert!(!independent.x86_64_code[independent.source_map[1].1..].starts_with(&[0x39, 0xc1]));
@@ -634,18 +667,28 @@ fn ordinary_pair_compare_reuses_both_committed_load_results() {
         let code = &grouped.x86_64_code;
         let pair = compile(&words[..1], pc, ordinary, target).native;
         assert_eq!(&code[..compare], &pair.x86_64_code[..compare]);
-        assert!(code[..compare].ends_with(&[0x4c, 0x89, 0x87, 0x50, 0, 0, 0])); // Commit X10.
+        assert!(code[..compare].ends_with(&super::super::frame_access(
+            &[0x4c, 0x89],
+            0,
+            super::super::x_slot(10)
+        ))); // Commit X10.
         assert!(code[compare..branch].starts_with(&staged));
         if target == fast {
             assert!(code[branch..].starts_with(&[0x0f, 0x84])); // JE.
         }
         let independent = compile(&words[1..], map[1].0, ordinary, target).native;
         assert_eq!(independent.source_map[0], (map[1].0, 0));
-        assert!(independent.x86_64_code.starts_with(&[
-            0x48, 0x8b, 0x87, 0x50, 0, 0, 0, // MOV RAX,[frame+X10].
-            0x48, 0x3b, 0x87, 0x40, 0, 0, 0, // CMP RAX,[frame+X8].
-        ]));
-        assert_eq!(independent.source_map[1].1, branch - compare + 11);
+        // MOV RAX,[frame+X10]; CMP RAX,[frame+X8].
+        let loads = [
+            super::super::frame_access(&[0x48, 0x8b], 0, super::super::x_slot(10)),
+            super::super::frame_access(&[0x48, 0x3b], 0, super::super::x_slot(8)),
+        ]
+        .concat();
+        assert!(independent.x86_64_code.starts_with(&loads));
+        assert_eq!(
+            independent.source_map[1].1,
+            branch - compare + loads.len() - staged.len()
+        );
         let branch_entry = compile(&words[2..], map[2].0, ordinary, target).native;
         assert_eq!(branch_entry.source_map[0], (map[2].0, 0));
         assert_eq!(branch_entry.x86_64_code[0], 0xf6); // Frame NZCV.
@@ -712,21 +755,19 @@ fn extended_compare_reads_its_left_operand_in_place() {
     let suffix = |native: &NativeBlock| native.source_map[1].1;
     let has = |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|row| row == needle);
     for profile in [BlockProfile::ORDINARY, system] {
-        let (left_load, direct_cmp, staged_right, direct_wcmp) = if profile == system {
-            (
-                &[0x48, 0x8b, 0x47, 0x48][..],
-                &[0x48, 0x39, 0x4f, 0x48][..],
-                &[0x0f, 0xb6, 0x4f, 0x50][..],
-                &[0x39, 0x4f, 0x50][..],
-            )
-        } else {
-            (
-                &[0x48, 0x8b, 0x87, 0x48, 0, 0, 0][..],
-                &[0x48, 0x39, 0x8f, 0x48, 0, 0, 0][..],
-                &[0x0f, 0xb6, 0x8f, 0x50, 0, 0, 0][..],
-                &[0x39, 0x8f, 0x50, 0, 0, 0][..],
-            )
-        };
+        // Every profile reaches X9 and X10 with the same frame operands.
+        let (left_load, direct_cmp, staged_right, direct_wcmp) = (
+            super::super::frame_access(&[0x48, 0x8b], 0, super::super::x_slot(9)),
+            super::super::frame_access(&[0x48, 0x39], 1, super::super::x_slot(9)),
+            super::super::frame_access(&[0x0f, 0xb6], 1, super::super::x_slot(10)),
+            super::super::frame_access(&[0x39], 1, super::super::x_slot(10)),
+        );
+        let (left_load, direct_cmp, staged_right, direct_wcmp) = (
+            &left_load[..],
+            &direct_cmp[..],
+            &staged_right[..],
+            &direct_wcmp[..],
+        );
         let block = compile(&[compare, branch], pc, profile, target);
         let branch_pc = GuestAddress(pc.0 + 4);
         assert_eq!(
@@ -977,9 +1018,9 @@ fn settled_x_index_is_reused_by_single_and_shared_accesses() {
         .compile()
         .unwrap()
     };
-    let frame_add = [0x48, 0x03, 0x87, 0x40, 0, 0, 0];
+    let frame_add = super::super::frame_access(&[0x48, 0x03], 0, super::super::x_slot(8));
     let pinned_add = [0x48, 0x03, 0xc6];
-    let committed = [0x48, 0x89, 0x87, 0xb8, 0, 0, 0];
+    let committed = super::super::frame_access(&[0x48, 0x89], 0, super::super::x_slot(23));
     for profile in [BlockProfile::ORDINARY, system] {
         let add = if profile == system {
             &pinned_add[..]
@@ -1053,8 +1094,20 @@ fn settled_x_index_is_reused_by_single_and_shared_accesses() {
     let desktop = [0xd37d_0149, 0xf869_6989];
     let block = compile(&desktop, GuestAddress(0x18f5_a17ec), system, target, direct);
     let row = block.native.source_map[1].1;
-    assert!(block.native.x86_64_code[..row].ends_with(&[0x48, 0x89, 0x47, 0x48]));
-    assert!(block.native.x86_64_code[row..].starts_with(&[0x48, 0x03, 0x47, 0x60]));
+    assert!(
+        block.native.x86_64_code[..row].ends_with(&super::super::frame_access(
+            &[0x48, 0x89],
+            0,
+            super::super::x_slot(9)
+        ))
+    );
+    assert!(
+        block.native.x86_64_code[row..].starts_with(&super::super::frame_access(
+            &[0x48, 0x03],
+            0,
+            super::super::x_slot(12)
+        ))
+    );
 }
 
 #[test]
@@ -1201,16 +1254,19 @@ fn indexed_load_store_pair_shares_checked_address_with_distinct_fault_rows() {
     let fallback = compile(&alias, pc, ordinary, dit, direct);
     let (store_pc, start) = grouped.native.source_map[1];
     let separate = compile(&alias[1..], store_pc, ordinary, target, direct);
-    let add_base = [0x48, 0x03, 0x87, 0x40, 0, 0, 0];
-    let load_base = [0x48, 0x8b, 0x87, 0x40, 0, 0, 0];
-    let commit_index = [0x48, 0x89, 0x87, 0xb8, 0, 0, 0];
+    let add_base = super::super::frame_access(&[0x48, 0x03], 0, super::super::x_slot(8));
+    let load_base = super::super::frame_access(&[0x48, 0x8b], 0, super::super::x_slot(8));
+    let commit_index = super::super::frame_access(&[0x48, 0x89], 0, super::super::x_slot(23));
     assert_eq!(store_pc, GuestAddress(pc.0 + 4));
     assert!(grouped.native.x86_64_code[..start].ends_with(&commit_index));
     assert!(grouped.native.x86_64_code[start..].starts_with(&add_base));
     assert!(fallback.native.x86_64_code[fallback.native.source_map[1].1..].starts_with(&load_base));
     assert!(separate.native.x86_64_code.starts_with(&load_base));
+    // The fallback loads the base and adds the index from its slot where
+    // the group adds the base to the index it holds.
+    let add_index = super::super::frame_access(&[0x48, 0x03], 0, super::super::x_slot(23));
     assert_eq!(
-        grouped.native.x86_64_code.len() + load_base.len(),
+        grouped.native.x86_64_code.len() + load_base.len() + add_index.len() - add_base.len(),
         fallback.native.x86_64_code.len()
     );
     for checks in [
@@ -1654,9 +1710,14 @@ fn vector_store_reuses_load_across_integer_rows_and_keeps_recovery() {
             .source_map
             .get(index + 1)
             .map_or(block.x86_64_code.len(), |row| row.1);
-        block.x86_64_code[offset..end]
-            .windows(8)
-            .any(|bytes| bytes == [0xf3, 0x0f, 0x6f, 0x87, 8, 1, 0, 0])
+        block.x86_64_code[offset..end].windows(8).any(|bytes| {
+            bytes
+                == super::super::frame_access(
+                    &[0xf3, 0x0f, 0x6f],
+                    0,
+                    core::mem::offset_of!(crate::GuestState, v) as u32,
+                )
+        })
     };
     let baseline = TargetCpu::Baseline;
     for profile in [
@@ -1830,11 +1891,27 @@ fn hosted_result_chain_keeps_both_zlib_compare_inputs() {
     for (index, (pc, _)) in native.source_map.iter().enumerate() {
         assert_eq!(*pc, GuestAddress(entry + index as u64 * 4));
     }
-    assert!(bytes[native.source_map[1].1..].starts_with(&[0x48, 0x03, 0x87, 0x40]));
+    assert!(
+        bytes[native.source_map[1].1..].starts_with(&super::super::frame_access(
+            &[0x48, 0x03],
+            0,
+            super::super::x_slot(8)
+        ))
+    );
     assert!(bytes[native.source_map[3].1..].starts_with(&[0x0f, 0xb6, 0x00]));
-    assert!(bytes[native.source_map[4].1..].starts_with(&[0x3b, 0x87, 0x18]));
+    assert!(
+        bytes[native.source_map[4].1..].starts_with(&super::super::frame_access(
+            &[0x3b],
+            0,
+            super::super::x_slot(3)
+        ))
+    );
     let compare = compile(&address[4..], entry + 16, TargetCpu::Baseline);
-    assert!(compare.x86_64_code.starts_with(&[0x48, 0x8b, 0x87, 0x38]));
+    assert!(compare.x86_64_code.starts_with(&super::super::frame_access(
+        &[0x48, 0x8b],
+        0,
+        super::super::x_slot(7)
+    )));
 
     // AND W1,W1,W14; LDRH W1,[X9,W1,UXTW #1]; CMP W13,W1; B.HS.
     let indexed = [0x0a0e_0021, 0x7861_5921, 0x6b01_01bf, 0x5400_0062];
@@ -1846,7 +1923,7 @@ fn hosted_result_chain_keeps_both_zlib_compare_inputs() {
         TargetCpu::Baseline.with_data_independent_timing(),
     );
     assert_eq!(native.source_map.len(), indexed.len());
-    let held_compare = [0x39, 0x87, 0x68]; // CMP [frame+X13],EAX.
+    let held_compare = super::super::frame_access(&[0x39], 0, super::super::x_slot(13)); // CMP [frame+X13],EAX.
     assert!(native.x86_64_code[native.source_map[2].1..].starts_with(&held_compare));
     assert!(!dit.x86_64_code[dit.source_map[2].1..].starts_with(&held_compare));
 }
@@ -2401,8 +2478,12 @@ fn hosted_trailing_zero_pair_matches_both_scalar_widths_and_aliases() {
 #[test]
 fn values_left_in_rax_are_not_reloaded() {
     use crate::{Lifter, aarch64::Decoder};
-    const LOAD_X10: [u8; 7] = [0x48, 0x8b, 0x87, 0x50, 0, 0, 0];
-    const LOAD_NZCV: [u8; 6] = [0x8b, 0x87, 0, 1, 0, 0];
+    let load_x10 = super::super::frame_access(&[0x48, 0x8b], 0, super::super::x_slot(10));
+    let load_nzcv = super::super::frame_access(
+        &[0x8b],
+        0,
+        core::mem::offset_of!(crate::GuestState, nzcv) as u32,
+    );
     let pc = GuestAddress(0x1000);
     let instructions: Vec<_> = [0x9100_114a_u32, 0xf118_015f]
         .into_iter()
@@ -2428,8 +2509,8 @@ fn values_left_in_rax_are_not_reloaded() {
             .filter(|w| *w == pattern)
             .count()
     };
-    assert_eq!(count(&LOAD_X10), 1);
-    assert_eq!(count(&LOAD_NZCV), 0);
+    assert_eq!(count(&load_x10), 1);
+    assert_eq!(count(&load_nzcv), 0);
     let compare = native.source_map[1].1;
     assert_eq!(&code[compare..compare + 3], &[0x48, 0x81, 0xf8]); // CMP RAX,imm32.
 }
@@ -2479,7 +2560,7 @@ fn pinned_compare_reuses_the_preceding_unshifted_right_operand() {
             let cmp = if left == 1 {
                 &[0x39, 0xc5][..] // CMP EBP/RBP,EAX/RAX.
             } else {
-                &[0x39, 0x47, 72][..] // CMP [frame+X9],EAX/RAX.
+                &super::super::frame_access(&[0x39], 0, super::super::x_slot(9))[..] // CMP [frame+X9],EAX/RAX.
             };
             assert_eq!(&code[opcode..opcode + cmp.len()], cmp);
             assert!(
@@ -2552,33 +2633,43 @@ fn ordinary_integer_operations_read_frame_operands_directly() {
     let native = emit(&instructions, None, GuestAddress(0x1014));
     let code = &native.x86_64_code;
     let map = &native.source_map;
+    let slice = |code: &[u8], at: usize, bytes: &[u8]| code[at..at + bytes.len()].to_vec();
     assert_eq!(
         &code[..map[1].1],
-        &[0x8b, 0x87, 8, 0, 0, 0, 0x48, 0x89, 0x87, 40, 0, 0, 0],
-    ); // MOV EAX,[RDI+8]; MOV [RDI+40],RAX.
-    assert_eq!(
-        &code[map[1].1 + 7..map[1].1 + 13],
-        &[0x23, 0x87, 112, 0, 0, 0]
-    );
-    // CMP [RDI+104],EAX using the preceding AND result.
-    assert_eq!(&code[map[2].1..map[2].1 + 6], &[0x39, 0x87, 104, 0, 0, 0]);
+        &[
+            super::super::frame_access(&[0x8b], 0, super::super::x_slot(1)),
+            super::super::frame_access(&[0x48, 0x89], 0, super::super::x_slot(5))
+        ]
+        .concat()[..],
+    ); // MOV EAX,[X1]; MOV [X5],RAX.
+    // MOV RAX,[X1]; AND EAX,[X14].
+    let and = super::super::frame_access(&[0x23], 0, super::super::x_slot(14));
+    let skip = super::super::frame_access(&[0x48, 0x8b], 0, super::super::x_slot(1)).len();
+    assert_eq!(slice(code, map[1].1 + skip, &and), and);
+    // CMP [X13],EAX using the preceding AND result.
+    let compare = super::super::frame_access(&[0x39], 0, super::super::x_slot(13));
+    assert_eq!(slice(code, map[2].1, &compare), compare);
     let standalone = emit(&instructions[2..3], None, GuestAddress(0x100c));
-    // CMP EAX,[RDI+8] without a producer.
-    assert_eq!(&standalone.x86_64_code[7..13], &[0x3b, 0x87, 8, 0, 0, 0]);
-    assert_eq!(
-        &code[map[3].1..map[3].1 + 7],
-        &[0x83, 0xbf, 104, 0, 0, 0, 7]
-    );
-    assert_eq!(
-        &code[map[4].1 + 7..map[4].1 + 14],
-        &[0x48, 0x63, 0x8f, 96, 0, 0, 0],
-    ); // MOVSXD RCX,[RDI+96].
+    // MOV RAX,[X13]; CMP EAX,[X1] without a producer.
+    let skip = super::super::frame_access(&[0x48, 0x8b], 0, super::super::x_slot(13)).len();
+    let compare = super::super::frame_access(&[0x3b], 0, super::super::x_slot(1));
+    assert_eq!(slice(&standalone.x86_64_code, skip, &compare), compare);
+    let immediate = [
+        super::super::frame_access(&[0x83], 7, super::super::x_slot(13)),
+        alloc::vec![7],
+    ]
+    .concat();
+    assert_eq!(slice(code, map[3].1, &immediate), immediate);
+    // MOV RAX,[X4]; MOVSXD RCX,[X12].
+    let skip = super::super::frame_access(&[0x48, 0x8b], 0, super::super::x_slot(4)).len();
+    let extend = super::super::frame_access(&[0x48, 0x63], 1, super::super::x_slot(12));
+    assert_eq!(slice(code, map[4].1 + skip, &extend), extend);
 }
 
 #[test]
 fn pinned_scalar_loads_forward_through_the_block() {
     use crate::{Lifter, aarch64::Decoder, block::RecoverySiteKind};
-    const FRAME_LOAD: [u8; 4] = [0x48, 0x8b, 0x47, 0x50];
+    let frame_load = super::super::frame_access(&[0x48, 0x8b], 0, super::super::x_slot(10));
     let pc = GuestAddress(0x1000);
     let second = GuestAddress(0x1004);
     let branch = GuestAddress(0x1008);
@@ -2612,8 +2703,8 @@ fn pinned_scalar_loads_forward_through_the_block() {
     assert_eq!([*pc1, *pc2, *pc3], [pc, second, branch]);
     assert!(at1 < at2 && at2 < at3);
     assert_eq!(
-        code.windows(FRAME_LOAD.len())
-            .filter(|w| *w == FRAME_LOAD)
+        code.windows(frame_load.len())
+            .filter(|w| *w == frame_load)
             .count(),
         1
     );
@@ -3328,7 +3419,11 @@ fn frame_compare_and_test_branches_do_not_load_a_scratch_register() {
                 width: Width::W32,
                 nonzero: false,
             },
-            &[0x83, 0xbf, 160, 0, 0, 0, 0][..],
+            &[
+                super::super::frame_access(&[0x83], 7, super::super::x_slot(20)),
+                alloc::vec![0],
+            ]
+            .concat()[..],
             Cond::E,
         ),
         (
@@ -3338,7 +3433,11 @@ fn frame_compare_and_test_branches_do_not_load_a_scratch_register() {
                 width: Width::X64,
                 nonzero: true,
             },
-            &[0x48, 0x83, 0xbf, 160, 0, 0, 0, 0][..],
+            &[
+                super::super::frame_access(&[0x48, 0x83], 7, super::super::x_slot(20)),
+                alloc::vec![0],
+            ]
+            .concat()[..],
             Cond::Ne,
         ),
         (
@@ -3348,7 +3447,11 @@ fn frame_compare_and_test_branches_do_not_load_a_scratch_register() {
                 bit: 63,
                 nonzero: true,
             },
-            &[0xf6, 0x87, 167, 0, 0, 0, 0x80][..],
+            &[
+                super::super::frame_access(&[0xf6], 0, super::super::x_slot(20) + 7),
+                alloc::vec![0x80],
+            ]
+            .concat()[..],
             Cond::Ne,
         ),
     ] {
@@ -3419,7 +3522,12 @@ fn pinned_conditional_increment_consumes_the_preceding_compare_flags() {
         (cset, &[0x0f, 0x94, 0xc0][..]), // SETE AL
         (
             csinc,
-            &[0x8b, 0xd6, 0x8d, 0x52, 0x01, 0x8b, 0x77, 0x10, 0x0f, 0x46],
+            &[
+                &[0x8b, 0xd6, 0x8d, 0x52, 0x01][..],
+                &super::super::frame_access(&[0x8b], 6, super::super::x_slot(2))[..],
+                &[0x0f, 0x46][..],
+            ]
+            .concat()[..],
         ), // MOV EDX, LEA, MOV ESI, CMOVBE
     ] {
         let source: Vec<_> = [0xf100_041fu32, select, 0xd65f_03c0]

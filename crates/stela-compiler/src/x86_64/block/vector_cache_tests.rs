@@ -888,7 +888,8 @@ fn dirty_vectors_are_stored_where_the_state_must_be_current() {
     );
     let code = &block.x86_64_code;
     let rows: Vec<usize> = block.source_map.iter().map(|&(_, at)| at).collect();
-    // movdqu [rdi+0x108+16v],xmm8..15: a home stored to V`v`'s slot.
+    // movdqu [rdi+v+16v],xmm8..15: a home stored to V`v`'s slot.
+    let vectors = core::mem::offset_of!(crate::GuestState, v) as u32;
     let stores_of = |range: core::ops::Range<usize>| -> Vec<u8> {
         let bytes = &code[range];
         // From a home (REX.R) or straight from a recipe's register.
@@ -903,14 +904,18 @@ fn dirty_vectors_are_stored_where_the_state_must_be_current() {
             })
             .map(|at| {
                 let offset = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-                ((offset - 0x108) / 16) as u8
+                ((offset - vectors) / 16) as u8
             })
             .collect()
     };
     // Stores come before the row of the instruction that needs them.
     assert!(stores_of(rows[0]..rows[1]).is_empty());
     // The second ADD reads V0 from its home: no load of its slot.
-    let load = [0xf3, 0x0f, 0x6f, 0x87, 0x08, 0x01, 0, 0];
+    let load = super::super::frame_access(
+        &[0xf3, 0x0f, 0x6f],
+        0,
+        core::mem::offset_of!(crate::GuestState, v) as u32,
+    );
     assert!(!code[rows[1]..rows[2]].windows(8).any(|w| w == load));
     // V0 stays dirty across the access, whose fault recovery names it.
     assert!(stores_of(rows[1]..rows[2]).is_empty());

@@ -9,6 +9,8 @@ use crate::x86_64::asm::apx::AluOperands;
 use crate::x86_64::asm::{Alu, Asm, Code, Gpr, Mem, ShiftOp, Size, Unary};
 use alloc::vec::Vec;
 
+/// X0's frame slot: the guest registers' array in the frame.
+const X: i32 = core::mem::offset_of!(crate::GuestState, x) as i32;
 const FRAME: i32 = 0;
 const CONTEXT: i32 = 8;
 const TEMPORARY: i32 = 16;
@@ -401,10 +403,10 @@ pub(in crate::x86_64) fn prefix(
         a.mov_load(
             Size::Qword,
             resident(guest),
-            Mem::base(Gpr::Rdi, i32::from(guest) * 8),
+            Mem::base(Gpr::Rdi, X + i32::from(guest) * 8),
         );
     }
-    a.mov_load(Size::Qword, Gpr::Rdi, Mem::base(Gpr::Rdi, 6 * 8));
+    a.mov_load(Size::Qword, Gpr::Rdi, Mem::base(Gpr::Rdi, X + 6 * 8));
     let mut source_map = Vec::with_capacity(count);
     for input in instructions.iter().take(count) {
         source_map.push((input.pc, a.len()));
@@ -415,12 +417,12 @@ pub(in crate::x86_64) fn prefix(
     for guest in 1..31 {
         a.mov_store(
             Size::Qword,
-            Mem::base(Gpr::Rax, i32::from(guest) * 8),
+            Mem::base(Gpr::Rax, X + i32::from(guest) * 8),
             resident(guest),
         );
     }
     a.mov_load(Size::Qword, Gpr::Rdx, stack(TEMPORARY));
-    a.mov_store(Size::Qword, Mem::base(Gpr::Rax, 0), Gpr::Rdx);
+    a.mov_store(Size::Qword, Mem::base(Gpr::Rax, X), Gpr::Rdx);
     a.mov(Size::Qword, Gpr::Rdi, Gpr::Rax);
     a.mov_load(Size::Qword, Gpr::Rsi, stack(CONTEXT));
     a.release_stack(STACK_BYTES);

@@ -665,7 +665,10 @@ mod tests {
         assert_eq!(&pinned[..], [0x49, 0x8b, 0xc7, 0x48, 0x89, 0xc3]);
         let mut frame = Code::new();
         super::super::load(&mut frame, Register::X(0));
-        assert_eq!(&frame[..], [0x48, 0x8b, 0x87, 0, 0, 0, 0]);
+        assert_eq!(
+            &frame[..],
+            super::super::frame_access(&[0x48, 0x8b], 0, super::super::x_slot(0))
+        );
     }
 
     #[test]
@@ -694,7 +697,9 @@ mod tests {
                 assert!(emit_direct(&mut frame, &operation, TargetCpu::Baseline));
                 let start = usize::from(width == Width::X64);
                 assert_eq!(frame[start], if immediate <= 127 { 0x83 } else { 0x81 });
-                assert_eq!(frame[start + 1], 0xbf); // CMP with a frame displacement.
+                // CMP with a frame displacement, of 8 or 32 bits.
+                assert_eq!(frame[start + 1] & 0x3f, 0x3f);
+                assert!(matches!(frame[start + 1] >> 6, 1 | 2));
 
                 let mut pinned = direct(operation);
                 pinned.asm().ret();
@@ -852,10 +857,14 @@ mod tests {
             code
         };
         let fast = emit(TargetCpu::Bmi1);
-        // mov rcx,[rdi+80]; andn rsi,rcx,[rdi+72].
+        // mov rcx,[rdi+X10]; andn rsi,rcx,[rdi+X9].
         assert_eq!(
             &fast[..],
-            [0x48, 0x8b, 0x4f, 0x50, 0xc4, 0xe2, 0xf0, 0xf2, 0x77, 0x48]
+            [
+                super::super::frame_access(&[0x48, 0x8b], 1, super::super::x_slot(10)),
+                super::super::frame_access(&[0xc4, 0xe2, 0xf0, 0xf2], 6, super::super::x_slot(9)),
+            ]
+            .concat()
         );
         let baseline = emit(TargetCpu::Baseline);
         assert_eq!(baseline.instructions(), 4);

@@ -104,7 +104,9 @@ mod tests {
                 } else {
                     (((hint >> 1) & 3) + 1) << 3
                 };
-                assert_eq!(&code[7..], &[0x0f, 0x18, modrm as u8]);
+                let base =
+                    crate::x86_64::frame_access(&[0x48, 0x8b], 0, crate::x86_64::x_slot(0)).len();
+                assert_eq!(&code[base..], &[0x0f, 0x18, modrm as u8]);
             } else {
                 assert_eq!(code, [0x90]);
             }
@@ -115,7 +117,12 @@ mod tests {
     fn sp_sources_never_add_the_transfer_alignment_trap() {
         for word in [0xf98003e0, 0xf88003e0, 0xf8bf6be0] {
             let code = emitted(word);
-            assert_eq!(&code[..7], &[0x48, 0x8b, 0x87, 248, 0, 0, 0]);
+            let sp = crate::x86_64::frame_access(
+                &[0x48, 0x8b],
+                0,
+                core::mem::offset_of!(crate::GuestState, sp) as u32,
+            );
+            assert_eq!(&code[..sp.len()], sp);
             assert!(!code.windows(2).any(|bytes| bytes == [0x0f, 0x0b]));
         }
     }

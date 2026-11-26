@@ -104,16 +104,19 @@ impl<'a> Asm<'a> {
         }
     }
     /// The storage of `register`, which XZR lacks: its host register in
-    /// pinned code, else its frame slot.
+    /// pinned code, else its frame slot ([`super::frame`]).
     pub(crate) fn guest(&self, register: crate::aarch64::Register) -> Option<Rm> {
-        let slot = super::offset(register)? as i32;
-        Some(if !self.pinned {
-            Mem::base_disp32(Gpr::Rdi, slot).into()
-        } else if let Some(host) = super::pinned::host_or_local(register, self.locals) {
-            host.into()
-        } else {
-            Mem::base(Gpr::Rdi, slot).into()
-        })
+        let slot = super::offset(register)?;
+        Some(
+            match self
+                .pinned
+                .then(|| super::pinned::host_or_local(register, self.locals))
+                .flatten()
+            {
+                Some(host) => host.into(),
+                None => super::frame(slot).into(),
+            },
+        )
     }
     /// Mark exactly one guest memory operand, including its prefixes and
     /// immediate bytes. Frame/staging/address instructions must remain outside.

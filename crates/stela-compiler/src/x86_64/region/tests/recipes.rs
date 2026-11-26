@@ -11,28 +11,39 @@ const REX_B: u8 = 1;
 const MOV_LOAD: u8 = 0x8b;
 const MOV_STORE: u8 = 0x89;
 const TWO_BYTE_OPCODE: u8 = 0x0f;
-const FRAME_STORE_BYTES: usize = 7;
-const GPR_BYTES: usize = core::mem::size_of::<u64>();
 const ECX_FROM_RAX_MEMORY: u8 = 0x08;
 const FRAME_DISP32_FROM_RCX: u8 = 0x8f;
 const FRAME_DISP32_FROM_R8: u8 = 0x87;
 const R8D_FROM_RAX_DISP8: u8 = 0x40;
 
+/// Guest register `guest`'s frame slot (31: SP's, after X30's).
+fn slot(guest: usize) -> Option<u32> {
+    u8::try_from(guest)
+        .ok()
+        .filter(|guest| *guest <= 31)
+        .map(crate::x86_64::x_slot)
+}
+
+/// The frame access of `opcode` (a REX, the opcode and a ModRM whose reg
+/// field it keeps) to `guest`'s slot.
+fn frame_access(opcode: [u8; 3], guest: usize) -> Option<Vec<u8>> {
+    Some(crate::x86_64::frame_access(
+        &opcode[..2],
+        (opcode[2] >> 3) & 7,
+        slot(guest)?,
+    ))
+}
+
 fn ordinary_address_ends(code: &[u8], base: usize, displacement: i32) -> Option<Vec<usize>> {
     use crate::x86_64::{RangeCheck, STACK_ALIGNMENT_CHECK, STACK_ALIGNMENT_CHECK_ENDS};
-    const RAX_FROM_FRAME_DISP32: u8 = 0x87;
-    const BASE_LOAD_BYTES: usize = 7;
+    const RAX_FROM_FRAME: u8 = 0x87;
     const SP: usize = 31;
-    if code.get(0..3)? != [REX | REX_W, MOV_LOAD, RAX_FROM_FRAME_DISP32]
-        || code.get(3..BASE_LOAD_BYTES)?
-            != u32::try_from(base.checked_mul(GPR_BYTES)?)
-                .ok()?
-                .to_le_bytes()
-    {
+    let base_load = frame_access([REX | REX_W, MOV_LOAD, RAX_FROM_FRAME], base)?;
+    if !code.starts_with(&base_load) {
         return None;
     }
-    let mut ends = vec![BASE_LOAD_BYTES];
-    let mut cursor = BASE_LOAD_BYTES;
+    let mut ends = vec![base_load.len()];
+    let mut cursor = base_load.len();
     // SCTLR_ELx.SA checks an SP base before the address addition.
     if base == SP && code[cursor..].starts_with(&STACK_ALIGNMENT_CHECK) {
         ends.extend(STACK_ALIGNMENT_CHECK_ENDS.map(|end| cursor + end));
@@ -60,16 +71,9 @@ fn check_frame_store(code: &[u8], start: usize, guest: usize, rex: u8, modrm: u8
 }
 
 fn check_frame_access(code: &[u8], start: usize, guest: usize, opcode: [u8; 3]) -> Option<usize> {
-    let end = start.checked_add(FRAME_STORE_BYTES)?;
-    if code.get(start..start + 3)? != opcode
-        || code.get(start + 3..end)?
-            != u32::try_from(guest.checked_mul(GPR_BYTES)?)
-                .ok()?
-                .to_le_bytes()
-    {
-        return None;
-    }
-    Some(end)
+    let access = frame_access(opcode, guest)?;
+    let end = start.checked_add(access.len())?;
+    (code.get(start..end)? == access).then_some(end)
 }
 
 /// Inspect the exact shared scalar load, including address, clobbers and commit.
@@ -307,21 +311,15 @@ pub fn ordinary_pair_store_ends(
         && let [Some(first), Some(second)] = data
     {
         // Block code: MOVQ XMM0,[frame]; MOVHPS XMM0,[frame]; MOVDQA [RAX],XMM0.
-        const MOVQ_XMM0_FRAME: [u8; 4] = [0xf3, TWO_BYTE_OPCODE, 0x7e, 0x87];
-        const MOVHPS_XMM0_FRAME: [u8; 3] = [TWO_BYTE_OPCODE, 0x16, 0x87];
+        const MOVQ_XMM0: [u8; 3] = [0xf3, TWO_BYTE_OPCODE, 0x7e];
+        const MOVHPS_XMM0: [u8; 2] = [TWO_BYTE_OPCODE, 0x16];
         const MOVDQA_STORE: [u8; 4] = [0x66, TWO_BYTE_OPCODE, 0x7f, 0x00];
-        let slot = |guest: usize| u32::try_from(guest.checked_mul(GPR_BYTES)?).ok();
-        for (opcode, guest) in [
-            (&MOVQ_XMM0_FRAME[..], first),
-            (&MOVHPS_XMM0_FRAME[..], second),
-        ] {
-            let operand = end + opcode.len();
-            if code.get(end..operand)? != opcode
-                || code.get(operand..operand + 4)? != slot(guest)?.to_le_bytes()
-            {
+        for (opcode, guest) in [(&MOVQ_XMM0[..], first), (&MOVHPS_XMM0[..], second)] {
+            let access = crate::x86_64::frame_access(opcode, 0, slot(guest)?);
+            if code.get(end..end + access.len())? != access {
                 return None;
             }
-            end = operand + 4;
+            end += access.len();
             ends.push(end);
         }
         if code.get(end..end + MOVDQA_STORE.len())? != MOVDQA_STORE {

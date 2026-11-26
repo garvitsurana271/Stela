@@ -43,7 +43,14 @@ fn two_lane_vaes_keeps_source_rows_and_the_next_fault_boundary() {
         assert_eq!(wide.native.source_map, expected);
         assert!(wide.fault_recovery.is_empty());
         let bytes = &wide.native.x86_64_code;
-        assert_eq!(&bytes[..8], &[0xc5, 0xfe, 0x6f, 0x87, 8, 1, 0, 0]);
+        assert_eq!(
+            &bytes[..8],
+            &crate::x86_64::frame_access(
+                &[0xc5, 0xfe, 0x6f],
+                0,
+                core::mem::offset_of!(crate::GuestState, v) as u32
+            )[..]
+        );
         assert_eq!(&bytes[25..30], &VAESENC);
         assert_eq!(&bytes[38..41], &[0xc5, 0xf8, 0x77]);
         let legacy = compile(&OPENSSL, PC, profile, TargetCpu::Aes);

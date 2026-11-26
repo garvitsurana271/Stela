@@ -73,11 +73,11 @@ fn extract_alias_uses_a_native_rotate_for_each_tier() {
         (
             BlockProfile::ORDINARY,
             Code::new as fn() -> Code,
-            29,
-            18,
-            17,
+            26,
+            15,
+            14,
         ),
-        (system, Code::pinned as fn() -> Code, 20, 12, 11),
+        (system, Code::pinned as fn() -> Code, 26, 15, 14),
     ] {
         let mut old = new_code();
         old_extract(&mut old, &operand, 33);

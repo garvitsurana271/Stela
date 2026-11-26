@@ -626,6 +626,14 @@ impl HostNetwork {
         self.stack.close(transfer);
     }
 
+    /// The frames the adapter sent and received since it opened, for a
+    /// wait that hears nothing: a receive path that stopped is told apart
+    /// from a server that is silent.
+    pub fn frames(&mut self) -> (u64, u64) {
+        let frames = &self.stack.link_mut().frames;
+        (frames.sent.get(), frames.received.get())
+    }
+
     /// The adapter's own state line (`Link::diagnostic`), where its driver
     /// keeps one.
     pub fn diagnostic(&mut self) -> Option<String> {

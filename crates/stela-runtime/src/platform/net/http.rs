@@ -309,6 +309,9 @@ pub struct Ranged {
     pub size: Option<u64>,
     /// Body bytes still due.
     pub left: u64,
+    /// The response's HTTP status, once its head arrived: for the log's
+    /// line on the range, whether or not it was the partial range asked.
+    pub status: Option<u16>,
     identity: Option<(String, u64)>,
     failed: bool,
 }
@@ -320,6 +323,7 @@ impl Ranged {
             end,
             head: Some(Vec::new()),
             size: None,
+            status: None,
             left: end
                 .checked_sub(start)
                 .and_then(|n| n.checked_add(1))
@@ -385,8 +389,12 @@ impl Ranged {
                 self.head = Some(so_far);
                 return Ok(false);
             };
+            self.status = Some(head.status);
             if head.status != 206 {
-                return Err(http_error("response is not a partial range"));
+                return Err(NetError::Http(format!(
+                    "response is not a partial range (status {})",
+                    head.status
+                )));
             }
             match head.range {
                 Some((first, last, size))
@@ -529,6 +537,31 @@ mod tests {
                 false
             )
             .is_err()
+        );
+    }
+
+    /// A range keeps its response's status for the log's line on it, and a
+    /// response that is not the partial range names its status, where the
+    /// failure said only "not a partial range".
+    #[test]
+    fn a_range_keeps_its_status_and_a_wrong_one_is_named() {
+        let mut ranged = Ranged::new(10, 19);
+        assert_eq!(ranged.status, None);
+        let reply = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 10-19/100\r\nContent-Length: 10\r\n\r\n01";
+        assert!(!ranged.feed(reply, false, |_| ()).unwrap());
+        assert_eq!(ranged.status, Some(206));
+        let mut ranged = Ranged::new(0, 9);
+        let error = ranged
+            .feed(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+                false,
+                |_| (),
+            )
+            .unwrap_err();
+        assert_eq!(ranged.status, Some(200));
+        assert_eq!(
+            error,
+            NetError::Http(String::from("response is not a partial range (status 200)"))
         );
     }
 

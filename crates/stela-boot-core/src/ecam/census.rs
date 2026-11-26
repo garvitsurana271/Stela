@@ -248,6 +248,11 @@ impl LeftOut {
         Ok(())
     }
 
+    /// Whether the census left nothing out.
+    pub fn is_empty(&self) -> bool {
+        self.functions.is_empty() && self.buses.is_empty()
+    }
+
     /// Whether the census left out the function at `address`, alone or
     /// with its bus.
     pub fn holds(&self, address: Address) -> bool {

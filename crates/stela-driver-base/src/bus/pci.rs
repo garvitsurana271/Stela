@@ -29,6 +29,7 @@ pub mod msi;
 pub mod msix;
 pub mod native;
 pub mod owned;
+pub mod placement;
 pub mod power;
 pub mod regs;
 pub mod requester;

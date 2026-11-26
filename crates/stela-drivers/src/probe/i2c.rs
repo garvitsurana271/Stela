@@ -259,9 +259,11 @@ mod attach {
             gpio,
             i2c::{Bus, DesignWare, Operation},
             lpss,
-            mmio::owned::{CacheAttribute, Mapping, Protection},
+            mmio::owned::{CacheAttribute, Mapping, Protection, Resource as Reserved},
             pci::{
-                Bar,
+                Address, Bar, ConfigSpace, Function,
+                owned::OwnedConfig,
+                placement, regs,
                 requester::{FunctionRole, StoppedRequester},
             },
         },
@@ -842,13 +844,33 @@ mod attach {
             let bars = function.bars().map_err(PlatformError::Config)?;
             Ok((profile, bars))
         })();
-        let (profile, bars) = match inspected {
+        let (profile, mut bars) = match inspected {
             Ok(observed) => observed,
             Err(error) => {
                 owners.push(Box::new(function));
                 return Err(error);
             }
         };
+        // A BAR the firmware left at zero is placed before anything maps
+        // it; the reservations stay for the program, the BAR decoding there,
+        // whether or not the attach goes on.
+        let mut placed = Vec::new();
+        let placing = place_unassigned(
+            services,
+            session,
+            parent,
+            address,
+            &mut function,
+            &mut bars,
+            &mut placed,
+        );
+        for (_, resource) in &placed {
+            owners.push(Box::new(resource.clone()));
+        }
+        if let Err(error) = placing {
+            owners.push(Box::new(function));
+            return Err(error);
+        }
         // SAFETY: the claim keeps this function's Bus Master sealed off, and
         // sizing its BARs with decode off left it stopped.
         let requester = match unsafe {
@@ -870,14 +892,40 @@ mod attach {
                     size: bytes,
                     ..
                 },
-            ) => services
-                .map_bar(address, bar)
-                .map_err(|error| PlatformError::PciBar {
-                    index: 0,
-                    base,
-                    bytes,
-                    error,
-                }),
+            ) => match placed.iter().find(|(index, _)| *index == 0) {
+                // Placed here: mapped through its own reservation, whose
+                // span is the BAR's page.
+                Some((_, resource)) => services
+                    .authority()
+                    .and_then(|authority| {
+                        let span = resource.physical_span().bytes();
+                        let span = usize::try_from(span)
+                            .map_err(|_| ServiceError::Refused("BAR too large"))?;
+                        authority
+                            .map(
+                                resource.clone(),
+                                0,
+                                span,
+                                CacheAttribute::Uncached,
+                                Protection::ReadWrite,
+                            )
+                            .map_err(ServiceError::Mapping)
+                    })
+                    .map_err(|error| PlatformError::PciBar {
+                        index: 0,
+                        base,
+                        bytes,
+                        error,
+                    }),
+                None => services
+                    .map_bar(address, bar)
+                    .map_err(|error| PlatformError::PciBar {
+                        index: 0,
+                        base,
+                        bytes,
+                        error,
+                    }),
+            },
             _ => Err(native(ServiceError::Refused("missing memory BAR"))),
         };
         let mapping = match mapped {
@@ -912,6 +960,203 @@ mod attach {
                 Err(PlatformError::LpssAttach(error))
             }
         }
+    }
+
+    /// Place each memory BAR of the LPSS function at `address` that the
+    /// firmware left at zero, as Linux's `pci_assign_unassigned_resources`
+    /// would before `intel_lpss_pci_probe`: the mount picks and reserves a
+    /// span ([`NativeServices::place_bar`]) and this writes it with memory
+    /// decoding off, checks it reads back, and turns decoding on. `bars`
+    /// then holds the new addresses and `placed` each BAR's reservation.
+    /// The LPSS attach sets the private reset and the remap register from
+    /// the new BAR0 itself, as `intel_lpss_init_dev` does. A function whose
+    /// BARs are all the firmware's is not touched. A refusal leaves the BARs
+    /// and command register as they were.
+    fn place_unassigned(
+        services: &dyn NativeServices,
+        session: &Session,
+        root: Handle<'_>,
+        address: Address,
+        function: &mut Function<OwnedConfig>,
+        bars: &mut [Option<Bar>; 6],
+        placed: &mut Vec<(usize, Reserved)>,
+    ) -> Result<(), PlatformError> {
+        let wanted: Vec<(usize, placement::Request)> = bars
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bar)| {
+                let bar = (*bar).filter(|bar| placement::unassigned(*bar))?;
+                Some((index, placement::Request::of(bar)?))
+            })
+            .collect();
+        let Some(&(first, request)) = wanted.first() else {
+            return Ok(());
+        };
+        let unplaced = |index: usize, bytes: u64, why: String| PlatformError::Unplaced {
+            index: index as u8,
+            bytes,
+            why,
+        };
+        let firmware =
+            firmware_view(session, root).map_err(|why| unplaced(first, request.bytes, why))?;
+        // A D3hot exit that resets the function clears BARs written before
+        // it; Linux's pci_enable_device brings the function to D0 first too.
+        let timer = services.minimum_delay().map_err(native)?;
+        function.power_up(&*timer).map_err(|error| {
+            unplaced(
+                first,
+                request.bytes,
+                format!("bringing the controller to D0 failed: {error:?}"),
+            )
+        })?;
+        let config = function.config();
+        let command = config
+            .read16(regs::COMMAND)
+            .map_err(PlatformError::Config)?;
+        // The BARs written, to set back to zero on a refusal.
+        let mut written: Vec<(u16, bool)> = Vec::new();
+        let result = (|| {
+            // Decoding stays off while a BAR changes, as Linux's
+            // pci_std_update_resource keeps it.
+            config
+                .write16(regs::COMMAND, command & !regs::COMMAND_MEMORY)
+                .map_err(PlatformError::Config)?;
+            for &(index, request) in &wanted {
+                let resource = services
+                    .place_bar(address, index as u8, request, &firmware)
+                    .map_err(|error| unplaced(index, request.bytes, format!("{error}")))?;
+                let base = resource.physical_span().start();
+                placed.push((index, resource));
+                let offset = regs::BASE_ADDRESS_0 + 4 * index as u16;
+                if !request.wide && base >> 32 != 0 {
+                    return Err(unplaced(
+                        index,
+                        request.bytes,
+                        format!("the mount gave a 32-bit BAR {base:#x}, above 4 GiB"),
+                    ));
+                }
+                written.push((offset, request.wide));
+                let low = config.read32(offset).map_err(PlatformError::Config)?;
+                config
+                    .write32(offset, base as u32 | low & 0xf)
+                    .map_err(PlatformError::Config)?;
+                if request.wide {
+                    config
+                        .write32(offset + 4, (base >> 32) as u32)
+                        .map_err(PlatformError::Config)?;
+                }
+                let observed = u64::from(config.read32(offset).map_err(PlatformError::Config)?)
+                    & !0xf
+                    | if request.wide {
+                        u64::from(config.read32(offset + 4).map_err(PlatformError::Config)?) << 32
+                    } else {
+                        0
+                    };
+                if observed != base {
+                    return Err(unplaced(
+                        index,
+                        request.bytes,
+                        format!("the register reads {observed:#x} after {base:#x} was written"),
+                    ));
+                }
+                bars[index] = Some(Bar::Memory {
+                    address: base,
+                    size: request.bytes,
+                    prefetchable: request.prefetchable,
+                    wide: request.wide,
+                });
+            }
+            let enabled = command | regs::COMMAND_MEMORY;
+            config
+                .write16(regs::COMMAND, enabled)
+                .map_err(PlatformError::Config)?;
+            let observed = config
+                .read16(regs::COMMAND)
+                .map_err(PlatformError::Config)?;
+            if observed & regs::COMMAND_MEMORY == 0 {
+                return Err(unplaced(
+                    first,
+                    request.bytes,
+                    format!("memory decoding reads off after it was turned on ({observed:#06x})"),
+                ));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            // As found: each BAR written back to zero, then the command.
+            for &(offset, wide) in &written {
+                let _ = config.write32(offset, 0);
+                if wide {
+                    let _ = config.write32(offset + 4, 0);
+                }
+            }
+            let _ = config.write16(regs::COMMAND, command);
+        }
+        result
+    }
+
+    /// What the namespace and tables say about memory around the root
+    /// bridge `root`: its `_CRS` windows, and as claims every other present
+    /// device's `_CRS` memory (other root bridges' windows included), the
+    /// ranges the remapping, ECAM, interrupt controller and timer tables
+    /// list, and x86's fixed decode. Linux's PNP system driver reserves the
+    /// motherboard resources among those claims. A `_CRS` that cannot be
+    /// read refuses, naming its device: what it holds is unknown.
+    fn firmware_view(session: &Session, root: Handle<'_>) -> Result<placement::Firmware, String> {
+        let name = |device: Handle<'_>| device.path().unwrap_or_else(|_| String::from("a device"));
+        let crs = |device: Handle<'_>| -> Result<Option<Vec<placement::AcpiMemory>>, String> {
+            if device.child("_CRS").is_err() {
+                return Ok(None);
+            }
+            match device.evaluate(Some("_CRS"), &[]) {
+                Ok(Some(Value::Buffer(bytes))) => placement::scan_memory(&bytes)
+                    .map(Some)
+                    .map_err(|error| format!("the _CRS of {}: {error:?}", name(device))),
+                Ok(_) => Err(format!("the _CRS of {} is no buffer", name(device))),
+                Err(error) => Err(format!("the _CRS of {}: {error}", name(device))),
+            }
+        };
+        let mut firmware = placement::Firmware::default();
+        let windows = crs(root)?.ok_or_else(|| format!("{} has no _CRS", name(root)))?;
+        for memory in windows {
+            match memory.window {
+                Some(window) if memory.translation == 0 => firmware.windows.push(window),
+                // A translated window is left unused: its bus addresses
+                // are not the CPU's.
+                Some(_) => {}
+                None => firmware.claimed.extend(memory.claim),
+            }
+        }
+        if firmware.windows.is_empty() {
+            return Err(format!(
+                "{}'s _CRS opens no untranslated memory window",
+                name(root)
+            ));
+        }
+        let devices = session
+            .all_devices()
+            .map_err(|error| format!("the namespace's device walk: {error}"))?;
+        for device in devices {
+            if device == root {
+                continue;
+            }
+            for memory in crs(device)?.into_iter().flatten() {
+                firmware.claimed.extend(memory.claim);
+            }
+        }
+        for signature in [b"DMAR", b"IVRS", b"MCFG", b"APIC", b"HPET"] {
+            let table = session.table(signature).map_err(|error| {
+                format!(
+                    "the {} table: {error}",
+                    core::str::from_utf8(signature).unwrap_or("ACPI")
+                )
+            })?;
+            if let Some(table) = table {
+                firmware.claimed.extend(placement::table_claims(&table));
+            }
+        }
+        firmware.claimed.push(placement::X86_FIXED);
+        Ok(firmware)
     }
 
     /// The GPIO controller at `handle`, attached on first use.

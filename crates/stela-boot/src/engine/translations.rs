@@ -1573,12 +1573,10 @@ pub fn store() -> Option<&'static mut Shared> {
 /// the heap before the budget held them, a quarter for
 /// blocks shared as they are compiled (buffers and cache metadata in the
 /// loader's store or a store for this boot), the rest for stored forms of
-/// blocks the ring took away and the guest runs again, which the board
-/// relocates instead of compiling (`Translations::kept_entry_bytes`). The
-/// shared blocks alone kept compile order, newer than the ring's code, so
-/// a block the ring took away had left them long before (run
-/// 20261116-111302: 447 K hits, 28.6 M misses). Allocator overhead and
-/// shared immutable preparation storage are outside this budget.
+/// blocks of page content the board runs at more than one address, which
+/// it relocates instead of compiling (`Translations::kept_entry_bytes`).
+/// Allocator overhead and shared immutable preparation storage are outside
+/// this budget.
 pub fn share(bound: usize) {
     let decoded = bound / 3;
     let kept = bound - bound / 4 - decoded;

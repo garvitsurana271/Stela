@@ -1068,23 +1068,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
     }
 
-    /// Whether the ring took the block of `pc`, `physical` and `variant`
-    /// away within its tenure age ([`churn::Churn::promotes`]), as
-    /// [`Self::stream_for`] finds, without counting a promotion.
-    pub(super) fn ring_took(&mut self, pc: u64, physical: u64, variant: super::Variant) -> bool {
-        let id = self.variant_id(variant);
-        let Some(arena) = &self.code.arena else {
-            return false;
-        };
-        let ring = &arena.ring;
-        ring.young_parts != 0
-            && self.code.ghosts.promotes(
-                churn::identity(pc, physical, id.0),
-                ring.generation(),
-                ring.parts,
-            )
-    }
-
     /// The ring's current generation and parts, or zeros without a ring.
     fn ring_position(&self) -> (u32, u32) {
         self.code
@@ -1123,6 +1106,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let shared = cache
             .index
             .sharing(blocks, block.pc, block.physical, block.variant);
+        // Its page runs at two addresses: its compiles keep their forms
+        // ([`super::rebase`]).
+        if shared == Some(true) {
+            self.code.rebases.note_shared(block.physical);
+        }
         let identity = churn::identity(block.pc, block.physical, block.variant.0);
         let (generation, parts) = self.ring_position();
         self.code.ghosts.installed(

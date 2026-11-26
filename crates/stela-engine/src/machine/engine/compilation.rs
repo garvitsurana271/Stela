@@ -952,14 +952,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 }
             }
             // The same page content, compiled at another address of this
-            // boot: its kept entry, rebased to this page.
-            // A block the ring took away and the guest runs again: its
-            // form is kept, and its next return relocated from it.
-            let again = self.ring_took(pc, physical, variant);
+            // boot: its kept entry, rebased to this page. A page installed
+            // at two addresses keeps the form of each block compiled there,
+            // for the other address and for its returns.
+            let shared = self.code.rebases.shared(physical);
             match self
                 .code
                 .rebases
-                .look(key, offset as u16, context, pc, again)
+                .look(key, offset as u16, context, pc, shared)
             {
                 super::rebase::Found::Entry(entry, origin) => {
                     if entry.input.len() > available && !whole {

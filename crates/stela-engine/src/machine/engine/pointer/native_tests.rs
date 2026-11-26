@@ -464,7 +464,7 @@ fn native_completes(
         key,
         PointerAuthenticationKey::Da | PointerAuthenticationKey::Db
     );
-    let range = service.cipher.ranges[usize::from(data)][usize::from(operand & 1 << 55 != 0)];
+    let range = service.cipher.ranges()[usize::from(data)][usize::from(operand & 1 << 55 != 0)];
     operand & range.extension == range.canonical
 }
 
@@ -788,7 +788,7 @@ fn schedules_follow_the_keys_words() {
     }
     // TCRS[0]: 39-bit ranges, TBI0 alone (for instructions too, without
     // TBID0); FEAT_PAuth2's XOR.
-    let [instruction, data] = service.cipher.ranges;
+    let [instruction, data] = service.cipher.ranges();
     assert_eq!(instruction, data);
     assert_eq!(
         data,

@@ -442,22 +442,26 @@ impl PairCount {
 pub const DEFAULT_FRAME_BOUND: u32 = 64;
 /// Bytes of one paired frame on the host stack, from the top of the stack
 /// down: the host return address, the guest return address, the calling
-/// block's word, the retire epoch and the lower and upper half's contexts
-/// ([`FrameWord`]). A multiple of 16, so code between blocks keeps its
-/// stack alignment.
+/// block's word, the retire epoch and the context of the guest return
+/// address's half, twice ([`FrameWord`]). A multiple of 16, so code
+/// between blocks keeps its stack alignment.
 pub const FRAME_BYTES: usize = 48;
 
 /// The words of a paired frame above its host return address, by their
-/// offset from RSP while the return address is on top.
+/// offset from RSP while the return address is on top. The context is
+/// that of the half ([`half`]) of the guest return address, which a
+/// matching return's target shares: only that half's translation decides
+/// what the continuation's code runs, as only it decides what a lookup
+/// enters. `Pad` keeps the frame's size, the context again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameWord {
     Address = 8,
     Block = 16,
     Epoch = 24,
-    LowerContext = 32,
-    UpperContext = 40,
+    Context = 32,
+    Pad = 40,
 }
-const _: () = assert!(FrameWord::UpperContext as usize + 8 == FRAME_BYTES);
+const _: () = assert!(FrameWord::Pad as usize + 8 == FRAME_BYTES);
 
 // Epoch and observed state are naturally aligned atomic-width words. Capture
 // and storage owners keep the mapped control alive for every embedded address.
@@ -3269,9 +3273,9 @@ fn link_body(
 /// ([`FRAME_BYTES`]) and a host `call` of the exit that follows, whose
 /// return comes back to a jump to the call's continuation. The frame holds
 /// `return_address`, the calling block's word, the board's retire epoch
-/// and both halves' contexts, under the call's own return address, so a
-/// guest return to `return_address` in this native run, in the same
-/// contexts, can `ret` into the continuation ([`paired_return`]). The
+/// and the context of `return_address`'s half, under the call's own
+/// return address, so a guest return to `return_address` in this native
+/// run, in the same context of that half, can `ret` into the continuation ([`paired_return`]). The
 /// continuation is the caller's own exit to `return_address`, which runs
 /// none of the block's instructions: the call's exit counted them. A call
 /// past the room counts its refusal and takes the exit as a plain one;
@@ -3285,10 +3289,23 @@ fn link_body(
 /// the call's own exit while unlinked, discards the frames whole. The jump
 /// to the continuation is the patch this returns, which the caller binds
 /// after the call's exit.
+#[cfg(test)]
 pub(crate) fn paired_call(
     asm: &mut crate::x86_64::asm::Asm,
     return_address: GuestAddress,
 ) -> crate::x86_64::asm::Patch {
+    paired_call_holding(asm, return_address, None)
+}
+
+/// [`paired_call`] where `held` (neither RCX nor R8), if any, already
+/// holds `return_address`, as the call's link of X30 left it, so the frame
+/// takes it from there.
+pub(crate) fn paired_call_holding(
+    asm: &mut crate::x86_64::asm::Asm,
+    return_address: GuestAddress,
+    held: Option<Gpr>,
+) -> crate::x86_64::asm::Patch {
+    debug_assert!(!matches!(held, Some(Rcx | R8)));
     asm.place(Rcx, CONTROL);
     asm.test(Qword, Rcx, Rcx);
     let uncontrolled = asm.jcc(Cond::E);
@@ -3297,13 +3314,21 @@ pub(crate) fn paired_call(
     asm.alu(Alu::Sub, Qword, R8, Gpr::Rsp);
     asm.alu_load(Alu::Cmp, Dword, R8, Mem::base(Rcx, FRAME_ROOM));
     let refused = asm.jcc(Cond::Ae);
-    asm.push_rm(Mem::base(Rcx, CONTEXTS + 8));
-    asm.push_rm(Mem::base(Rcx, CONTEXTS));
+    // The context of the return address's half, and again for the pad.
+    let context = Mem::base(Rcx, CONTEXTS + 8 * half(return_address.0) as i32);
+    asm.push_rm(context);
+    asm.push_rm(context);
     asm.mov_load(Qword, R8, Mem::base(Rcx, RETIRE_EPOCH));
     asm.push_rm(Mem::base(R8, 0));
     asm.push_rm(Mem::base(Rcx, BLOCK));
-    asm.guest_imm64(R8, return_address);
-    asm.push(R8);
+    let address = match held {
+        Some(held) => held,
+        None => {
+            asm.guest_imm64(R8, return_address);
+            R8
+        }
+    };
+    asm.push(address);
     let call = asm.call();
     let continuation = asm.jmp();
     asm.bind(refused);
@@ -3322,8 +3347,8 @@ pub(crate) fn paired_call(
 /// instructions, in code that RCX, R8 and flags are free in, before its
 /// lookup: when the host stack holds a frame ([`paired_call`]), which it
 /// does below the entry's stack pointer, and that frame holds the target,
-/// the board's retire epoch has not moved since its push, both halves'
-/// contexts are the frame's, no interruption is pending and budget is
+/// the board's retire epoch has not moved since its push, the context of
+/// the target's half is the frame's, no interruption is pending and budget is
 /// left, the return counts `ran`, names the calling block again and
 /// `ret`s into the frame's continuation, taking the frame. Anything else
 /// goes on to the lookup, its frames left in place.
@@ -3355,11 +3380,13 @@ pub(crate) fn paired_return(asm: &mut crate::x86_64::asm::Asm, ran: u32) -> Opti
     asm.mov_load(Qword, R8, Mem::base(R8, 0));
     asm.alu_load(Alu::Cmp, Qword, R8, frame(FrameWord::Epoch));
     misses.push(asm.jcc8(Cond::Ne));
-    for (half, word) in [(0, FrameWord::LowerContext), (1, FrameWord::UpperContext)] {
-        asm.mov_load(Qword, R8, Mem::base(Rcx, CONTEXTS + 8 * half));
-        asm.alu_load(Alu::Cmp, Qword, R8, frame(word));
-        misses.push(asm.jcc8(Cond::Ne));
-    }
+    // The context of the target's half, the frame's address's: the
+    // upper one where bit 55 is set ([`half`]).
+    asm.mov_load(Qword, R8, Mem::base(Rcx, CONTEXTS));
+    asm.bit_imm(BitTest::Bt, Qword, Rax, 55);
+    asm.cmov(Cond::B, Qword, R8, Mem::base(Rcx, CONTEXTS + 8));
+    asm.alu_load(Alu::Cmp, Qword, R8, frame(FrameWord::Context));
+    misses.push(asm.jcc8(Cond::Ne));
     // A transfer left and no interruption pending. A return spends none,
     // and counts the block's instructions.
     misses.push(stop_check(asm, Interruption::Quiet, false));

@@ -2860,7 +2860,8 @@ fn emit_terminal(
                 super::guest_immediate(code, fallthrough);
                 super::store(code, Register::X(30));
                 let ran = source_map.len();
-                paired_exit(code, fallthrough, ran, |asm| {
+                // RAX holds the return address the frame takes.
+                paired_exit(code, fallthrough, Some(Gpr::Rax), ran, |asm| {
                     direct_exit_with(asm, *target, ExitKind::Call)
                 });
             }
@@ -2890,12 +2891,15 @@ fn emit_terminal(
 /// X30 first and pairs its frame ([`paired_exit`]).
 fn register_transfer(code: &mut Code, kind: ExitKind, fallthrough: GuestAddress, ran: usize) {
     if kind == ExitKind::Call {
-        // Capture BLR X30's target before LR is overwritten.
-        code.asm().mov(Size::Qword, Gpr::Rcx, Gpr::Rax);
-        super::guest_immediate(code, fallthrough);
-        super::store(code, Register::X(30));
-        code.asm().mov(Size::Qword, Gpr::Rax, Gpr::Rcx);
-        paired_exit(code, fallthrough, ran, |asm| {
+        // The return address through R9, which the frame then takes: RAX
+        // keeps the target, captured before BLR X30's link overwrites LR.
+        {
+            let mut asm = code.asm();
+            asm.guest_imm64(Gpr::R9, fallthrough);
+            let link = asm.guest(Register::X(30)).expect("X30 has storage");
+            asm.mov_store(Size::Qword, link, Gpr::R9);
+        }
+        paired_exit(code, fallthrough, Some(Gpr::R9), ran, |asm| {
             exit_kind_with(asm, ExitKind::Call)
         });
     } else {
@@ -2907,12 +2911,14 @@ fn register_transfer(code: &mut Code, kind: ExitKind, fallthrough: GuestAddress,
 
 /// The exit of a call to a guest return address of `return_address` from a
 /// block of `ran` instructions, which `exit` emits: in code that chains,
-/// after a paired frame and a host call of it (`chain::paired_call`), then
+/// after a paired frame (taking the return address from `held`, if it
+/// holds it) and a host call of it (`chain::paired_call`), then
 /// the frame's continuation, an exit to `return_address` that leaves all
 /// `ran` unrun, as the call's exit counted them. Elsewhere `exit` alone.
 fn paired_exit(
     code: &mut Code,
     return_address: GuestAddress,
+    held: Option<Gpr>,
     ran: usize,
     exit: impl FnOnce(&mut Asm),
 ) {
@@ -2921,7 +2927,7 @@ fn paired_exit(
         exit(&mut asm);
         return;
     }
-    let continuation = super::chain::paired_call(&mut asm, return_address);
+    let continuation = super::chain::paired_call_holding(&mut asm, return_address, held);
     exit(&mut asm);
     asm.bind(continuation);
     direct_exit_with(&mut asm, return_address, continuation_word(ran));

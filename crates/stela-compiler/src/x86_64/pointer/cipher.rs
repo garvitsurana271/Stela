@@ -103,21 +103,59 @@ impl Range {
 pub struct Cipher {
     /// Each tag word's key schedule ([`SCHEDULE`]).
     pub schedules: [[[u64; 2]; SCHEDULE]; TAG_WORDS],
+    /// The instruction keys' ranges, then the data keys', each by bit 55
+    /// ([`Self::set_ranges`]).
+    ranges: [[Range; 2]; 2],
+    /// The same, as native code reads them: each domain's fields, each the
+    /// upper range's word, then the lower range's. Bit 55 broadcast to 0 or
+    /// -1 (SBB) times 8 from the lower word selects a field's word, in one
+    /// instruction fewer than a range's index.
+    lanes: [[[u64; 2]; FIELDS]; 2],
+}
+
+impl Cipher {
     /// The instruction keys' ranges, then the data keys', each by bit 55.
-    pub ranges: [[Range; 2]; 2],
+    pub fn ranges(&self) -> [[Range; 2]; 2] {
+        self.ranges
+    }
+
+    /// Lay out `ranges` (the instruction keys', then the data keys', each
+    /// by bit 55) for native code.
+    pub fn set_ranges(&mut self, ranges: [[Range; 2]; 2]) {
+        self.ranges = ranges;
+        for (lanes, [lower, upper]) in self.lanes.iter_mut().zip(ranges) {
+            for (field, lane) in lanes.iter_mut().enumerate() {
+                *lane = [upper.word(field), lower.word(field)];
+            }
+        }
+    }
 }
 
 const SCHEDULES: usize = core::mem::offset_of!(Cipher, schedules);
-const RANGES: usize = core::mem::offset_of!(Cipher, ranges);
-/// Bytes of a [`Range`], which bit 55 indexes.
-const RANGE_BYTES: i32 = core::mem::size_of::<Range>() as i32;
-const _: () = assert!(RANGE_BYTES == 64 && SCHEDULES.is_multiple_of(16));
-const EXTENSION: usize = core::mem::offset_of!(Range, extension);
-const KEPT: usize = core::mem::offset_of!(Range, kept);
-const CANONICAL: usize = core::mem::offset_of!(Range, canonical);
-const FIELD: usize = core::mem::offset_of!(Range, field);
-const SIGNED: usize = core::mem::offset_of!(Range, signed);
-const AUTHENTICATED: usize = core::mem::offset_of!(Range, authenticated);
+const LANES: usize = core::mem::offset_of!(Cipher, lanes);
+const _: () = assert!(SCHEDULES.is_multiple_of(16));
+/// A [`Range`]'s fields, in its order.
+const FIELDS: usize = 6;
+const EXTENSION: usize = 0;
+const KEPT: usize = 1;
+const CANONICAL: usize = 2;
+const FIELD: usize = 3;
+const SIGNED: usize = 4;
+const AUTHENTICATED: usize = 5;
+
+impl Range {
+    /// The word of field `index` ([`FIELDS`]' order).
+    const fn word(&self, index: usize) -> u64 {
+        match index {
+            EXTENSION => self.extension,
+            KEPT => self.kept,
+            CANONICAL => self.canonical,
+            FIELD => self.field,
+            SIGNED => self.signed,
+            _ => self.authenticated,
+        }
+    }
+}
 
 /// `operation` on XMM0 with ModRM.rm `rm`, a legacy SSE form.
 fn sse(asm: &mut Asm, opcode: &[u8], rm: impl Into<Rm>) {
@@ -173,13 +211,13 @@ fn rounds(asm: &mut Asm, data: Gpr, modifier: Gpr, schedule: i32) {
     }
 }
 
-/// R11 the byte offset of the range bit 55 of RAX selects: 0 or
-/// [`RANGE_BYTES`].
+/// R11 bit 55 of RAX broadcast: 0 for the lower range, -1 for the upper
+/// one, which scaled by 8 from a lower lane word reaches the upper word
+/// ([`Cipher::set_ranges`]).
 fn range_index(asm: &mut Asm) {
     use Gpr::{R11, Rax};
     asm.bit_imm(BitTest::Bt, Size::Qword, Rax, RANGE_BIT);
     asm.alu(Alu::Sbb, Size::Qword, R11, R11);
-    asm.alu_imm8(Alu::And, Size::Dword, R11, RANGE_BYTES as i8);
 }
 
 /// The result of `form` on its operands, computed from the [`Cipher`]
@@ -228,8 +266,9 @@ pub(super) fn compute(
         };
     }
     let data = form.key >= super::key_index(crate::block::PointerAuthenticationKey::Da);
-    let domain = RANGES + usize::from(data) * 2 * RANGE_BYTES as usize;
-    let range = |field: usize| Mem::indexed(R8, R11, 1, at(domain + field));
+    // A field's lower word, from which R11 times 8 selects.
+    let domain = LANES + usize::from(data) * FIELDS * 16 + 8;
+    let range = |field: usize| Mem::indexed(R8, R11, 8, at(domain + 16 * field));
     let mut misses = Vec::new();
     if form.kind != super::AUTHENTICATED {
         // The cipher of the pointer itself, a canonical one's input: the

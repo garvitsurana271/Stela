@@ -95,8 +95,10 @@ enum Callee {
     /// That entry, then the ERET back: the contexts are the call's again.
     EnteredAndReturned,
     /// A native ERET to another process: the lower half's context alone
-    /// changes.
+    /// changes, which [`RETURN`], an upper-half address, does not lie in.
     Switched,
+    /// The upper half's context alone changes, [`RETURN`]'s.
+    Upper,
 }
 
 /// Change the context of `half` by `by`.
@@ -110,9 +112,14 @@ const CONTEXTS_AT: i32 = core::mem::offset_of!(ChainControl, contexts) as i32;
 /// straight into a callee that runs `callee`, then returns to the target in
 /// RSI, and whose continuation returns [`CONTINUED`].
 fn call_and_return(callee: Callee) -> Vec<u8> {
+    call_and_return_to(callee, RETURN)
+}
+
+/// [`call_and_return`] of a call whose guest return address is `address`.
+fn call_and_return_to(callee: Callee, address: u64) -> Vec<u8> {
     let mut code = Code::pinned();
     let mut asm = code.asm();
-    let continuation = paired_call(&mut asm, GuestAddress(RETURN));
+    let continuation = paired_call(&mut asm, GuestAddress(address));
     // The call's exit, linked: into the callee.
     let to_callee = asm.jmp();
     asm.bind(continuation);
@@ -144,6 +151,7 @@ fn call_and_return(callee: Callee) -> Vec<u8> {
             move_context(&mut asm, 1, -1);
         }
         Callee::Switched => move_context(&mut asm, 0, 1),
+        Callee::Upper => move_context(&mut asm, 1, 1),
     }
     returning(&mut asm);
     code.into_bytes()
@@ -256,7 +264,9 @@ fn what_runs_between_call_and_return_decides_the_frame() {
         (Callee::Retired, false),
         (Callee::Interrupted, false),
         (Callee::Entered, false),
-        (Callee::Switched, false),
+        // Only the context of the return address's half decides.
+        (Callee::Switched, true),
+        (Callee::Upper, false),
         (Callee::EnteredAndReturned, true),
     ] {
         let code = pages(&call_and_return(callee));
@@ -280,6 +290,36 @@ fn what_runs_between_call_and_return_decides_the_frame() {
     unsafe { acknowledge(&mut *run.control, epoch) };
     let code = pages(&call_and_return(Callee::Return));
     assert_eq!(run.enter(&code, 0, RETURN), CONTINUED);
+}
+
+/// A return to a lower-half address (an EL0 caller's) follows the lower
+/// half's context: a process switch fails its frame, a change of the
+/// kernel's context alone does not, and the frame matched is the one of
+/// that address.
+#[test]
+fn a_lower_half_return_follows_the_lower_context() {
+    const LOWER: u64 = 0x0000_0001_0000_4404;
+    for (callee, taken) in [
+        (Callee::Return, true),
+        (Callee::Switched, false),
+        (Callee::Upper, true),
+        (Callee::Entered, false),
+        (Callee::EnteredAndReturned, true),
+    ] {
+        let code = pages(&call_and_return_to(callee, LOWER));
+        let mut run = Run::new(DEFAULT_FRAME_BOUND);
+        let (result, pairs) = match taken {
+            true => (CONTINUED, [1, 0, 0]),
+            false => ((LOWER, RETURNED), [0, 1, 0]),
+        };
+        assert_eq!(run.enter(&code, 0, LOWER), result, "{callee:?}");
+        assert_eq!(run.pairs(), pairs, "{callee:?}");
+        // The upper-half return address with the same low bits is
+        // another address: no frame holds it.
+        let mut run = Run::new(DEFAULT_FRAME_BOUND);
+        let upper = LOWER | 0xffff_ff80_0000_0000;
+        assert_eq!(run.enter(&code, 0, upper), (upper, RETURNED), "{callee:?}");
+    }
 }
 
 #[test]

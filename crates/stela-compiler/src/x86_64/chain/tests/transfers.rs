@@ -11,7 +11,10 @@ use crate::{
     GuestState, Options, TargetCpu,
     block::{BlockProfile, CompilationPlan, Features},
     state::Limit,
-    x86_64::{MemoryChecks, NativeSystem, RangeCheck, pinned},
+    x86_64::{
+        MemoryChecks, NativeSystem, RangeCheck, pinned,
+        pointer::{self, inline::Cells},
+    },
 };
 use alloc::{vec, vec::Vec};
 use core::ffi::c_void;
@@ -246,11 +249,71 @@ pub(super) struct Program {
     arena: Arena,
     pub blocks: Vec<Placed>,
     pub control: Box<ChainControl>,
+    /// The PAC service blocks read through [`Anchor::Pointer`], where they
+    /// complete PAC instructions in line ([`Program::with_calls`]).
+    service: Option<Box<Service>>,
+    /// The retire epoch paired frames hold, and the tables a return's
+    /// tail probes when its frame does not match.
+    _epoch: Box<u64>,
+    _tables: Option<(LookupTable, LookupTable)>,
 }
 
+/// The PAC service's cells as blocks read them ([`Program::with_calls`]):
+/// every key's tag word open, a routine that completes with its input,
+/// and a cipher whose layouts hold no PAC field, so every pointer is
+/// canonical, a signing gives its pointer and every authentication
+/// succeeds: the path a signing and an authentication take in line.
+#[repr(C, align(64))]
+struct Service {
+    tags: [u64; pointer::TAG_WORDS],
+    strips: [pointer::strip::Cell; 2],
+    routine: u64,
+    cipher: pointer::cipher::Cipher,
+}
+
+/// The PAC routine of [`Service`]: complete with the input.
+extern "sysv64" fn completed(_: u64, _: u32, value: u64, _: u64) -> pointer::Completion {
+    pointer::Completion {
+        completed: 1,
+        value,
+    }
+}
+
+impl Service {
+    fn new() -> Box<Self> {
+        let routine: pointer::ServiceRoutine = completed;
+        let range = |upper| pointer::cipher::Range::new(0, upper, false);
+        let mut cipher = pointer::cipher::Cipher::default();
+        cipher.set_ranges([[range(false), range(true)]; 2]);
+        Box::new(Self {
+            tags: core::array::from_fn(|key| pointer::tag(1, key as u8, 0)),
+            strips: [pointer::strip::Cell::default(); 2],
+            routine: routine as usize as u64,
+            cipher,
+        })
+    }
+
+    /// The cells of blocks that compute PACs with the AES rounds, or the
+    /// fast mix where `mix`.
+    fn cells(mix: bool) -> Cells {
+        Cells {
+            tags: core::mem::offset_of!(Service, tags) as u32,
+            strips: core::mem::offset_of!(Service, strips) as u32,
+            routine: core::mem::offset_of!(Service, routine) as u32,
+            cipher: Some(core::mem::offset_of!(Service, cipher) as u32),
+            mix,
+        }
+    }
+}
+
+/// Where [`Program::with_calls`] puts the tails of returns and the lookup
+/// probes they call: past every block.
+const TAILS_AT: usize = ARENA_BYTES - 0x3000;
+const PROBES_AT: usize = ARENA_BYTES - 0x1800;
+
 /// The options the system-mode engine compiles EL0 blocks with on a host
-/// of `target`.
-fn options(target: TargetCpu, self_loops: bool) -> Options {
+/// of `target`, PAC instructions completed in line through `pointer`.
+fn options(target: TargetCpu, self_loops: bool, pointer: Option<Cells>) -> Options {
     let checks = MemoryChecks::system(true, false, true, true)
         .with_range(RangeCheck::FIVE_LEVEL.one_sided(true));
     Options::new(BlockProfile::new(Features::SYSTEM_MODE), target)
@@ -258,6 +321,7 @@ fn options(target: TargetCpu, self_loops: bool) -> Options {
         .with_native_system(NativeSystem {
             exclusive: true,
             self_loops,
+            pointer,
             ..NativeSystem::NONE
         })
 }
@@ -276,11 +340,26 @@ impl Program {
         self_loops: bool,
         target: TargetCpu,
     ) -> Self {
+        Self::build(words, entry, options(target, self_loops, None), false)
+    }
+
+    /// [`Self::new`] for a program that calls and returns, on this host:
+    /// PAC instructions completed in line through a service whose cipher
+    /// is the AES rounds or, `mix`, the fast mix (`--fast-pac`); calls pair
+    /// their frames, and each return's exit jumps to its paired tail, as
+    /// the engine links them.
+    pub(super) fn with_calls(words: &[u32], entry: usize, mix: bool) -> Self {
+        let target = TargetCpu::detect();
+        let options = options(target, true, Some(Service::cells(mix)));
+        Self::build(words, entry, options, true)
+    }
+
+    fn build(words: &[u32], entry: usize, options: Options, calls: bool) -> Self {
         let source: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-        let options = options(target, self_loops);
         let arena = Arena::new();
         let mut blocks: Vec<Placed> = Vec::new();
         let mut exits = Vec::new();
+        let mut returns = Vec::new();
         let mut pending = vec![BASE + 4 * entry as u64];
         let mut next = BLOCKS_AT;
         while let Some(pc) = pending.pop() {
@@ -300,6 +379,15 @@ impl Program {
                     pending.push(exit.target.0);
                 }
             }
+            // A return's exit to its target ends the code, as the engine
+            // finds it (`compilation`): the patch point its tail takes.
+            let ending = without_failures(code);
+            let site = ending.len().saturating_sub(DYNAMIC_EXIT_BYTES);
+            if compiled.direct_exits.is_empty()
+                && is_dynamic_exit(&ending[site..], ExitKind::Return)
+            {
+                returns.push((blocks.len(), dynamic_patch(arena.at(next + site))));
+            }
             exits.push(compiled.direct_exits.clone());
             blocks.push(Placed {
                 pc,
@@ -309,6 +397,8 @@ impl Program {
             });
             next = (next + code.len()).next_multiple_of(BLOCK_ALIGN);
         }
+        assert!(next <= TAILS_AT);
+        let offset = |address: u64| (address - arena.at(0)) as usize;
         for (index, block) in blocks.iter().enumerate() {
             for exit in &exits[index] {
                 let Some(target) = blocks.iter().position(|other| other.pc == exit.target.0) else {
@@ -322,11 +412,28 @@ impl Program {
                 let retired = block.instructions - u32::from(exit.skipped);
                 let linking = link(at, slot, retired, target as u32, blocks[target].at, gate())
                     .expect("a link in reach");
-                let offset = |address: u64| (address - arena.at(0)) as usize;
                 arena.write(offset(linking.rest_at), &linking.rest);
                 let point = slot_patch(at);
                 assert!(patchable(point));
                 arena.write(offset(point), &linking.point);
+            }
+        }
+        // Each return's own paired tail, its misses through the probes.
+        let probe = arena.at(PROBES_AT);
+        if calls {
+            arena.write(PROBES_AT, &lookup_dispatcher(0).expect("the probes"));
+            let mut tail = TAILS_AT;
+            for &(index, point) in &returns {
+                let at = arena.at(tail);
+                let word = ExitWord::from(ExitKind::Return);
+                let ran = blocks[index].instructions;
+                let code =
+                    paired_tail(at, word, ran, probe + PROBE_ENTRY as u64).expect("a paired tail");
+                arena.write(tail, &code);
+                assert!(patchable(point));
+                arena.write(offset(point), &jump(point, at).expect("the tail in reach"));
+                tail += code.len().next_multiple_of(BLOCK_ALIGN);
+                assert!(tail <= PROBES_AT);
             }
         }
         // The entry: the pinned registers loaded around a jump to the
@@ -338,11 +445,31 @@ impl Program {
         stub[field..].copy_from_slice(&distance.to_le_bytes());
         assert!(stub.len() <= BLOCKS_AT);
         arena.write(STUB_AT, &stub);
-        let control = Box::new(ChainControl::default());
+        let mut control = Box::new(ChainControl::default());
+        let mut epoch = Box::new(1u64);
+        let mut tables = None;
+        let mut service = None;
+        if calls {
+            let mut table = LookupTable::new();
+            let itlb = LookupTable::itlb();
+            control.contexts = [5 << LOOKUP_SALT_BITS, 9 << LOOKUP_SALT_BITS];
+            control.salts = control.contexts.map(|context| itlb.salt(context));
+            control.table = table.address();
+            control.itlb = itlb.address();
+            control.masks = [table.mask(), itlb.mask()];
+            control.stamps = table.new_stamps();
+            control.frame_room = DEFAULT_FRAME_BOUND * FRAME_BYTES as u32;
+            control.retire_epoch = &raw mut *epoch as u64;
+            tables = Some((table, itlb));
+            service = Some(Service::new());
+        }
         Self {
             arena,
             blocks,
             control,
+            service,
+            _epoch: epoch,
+            _tables: tables,
         }
     }
 
@@ -358,6 +485,9 @@ impl Program {
             frame.x[register] = value;
         }
         frame.anchors[Anchor::Control] = (&mut *self.control as *mut ChainControl) as u64;
+        if let Some(service) = &mut self.service {
+            frame.anchors[Anchor::Pointer] = (&mut **service as *mut Service) as u64;
+        }
         frame
     }
 
@@ -736,4 +866,86 @@ fn scanner_time_on_this_host() {
         per_guest(cost.modifies),
         retired as f64 / transfers as f64,
     );
+}
+
+const RET: u32 = 0xd65f_03c0;
+const PACIBSP: u32 = 0xd503_237f;
+const RETAB: u32 = 0xd65f_0fff;
+/// ADD X0, X0, #1.
+const ADD_X0: u32 = 0x9100_0400;
+
+fn bl(words: i32) -> u32 {
+    0x9400_0000 | (words as u32 & 0x03ff_ffff)
+}
+
+/// A call and its return as a guest function makes them: BL at word 0 to
+/// `callee` at word 3, whose return lands in the continuation at word 1,
+/// on this host with the AES rounds or, `mix`, the fast mix. The host
+/// cost from the BL's block to the callee's first instruction (the call),
+/// and from there to the continuation's first instruction (the callee and
+/// its return), the call's frame taken by the return.
+fn call_and_return(callee: &[u32], mix: bool) -> (Cost, Cost) {
+    let mut words = vec![bl(3), ADD_X0, BRK];
+    words.extend(callee);
+    let mut program = Program::with_calls(&words, 0, mix);
+    let mut frame = program.frame(&[]);
+    frame.sp = 0x0000_7fff_fff0_0000;
+    let (exit, rips) = program.trace(&mut frame);
+    assert_eq!(exit.0, BASE + 8, "the BRK after the continuation");
+    assert_eq!((frame.x[0], frame.x[30]), (1, BASE + 4));
+    assert_eq!(program.control.pairs, [1, 0, 0], "the frame taken");
+    let callee = program.blocks[program.block(3)].at;
+    let continuation = program.blocks[program.block(1)].at;
+    let call = rips
+        .iter()
+        .position(|&rip| rip == callee)
+        .expect("the callee");
+    let back = rips
+        .iter()
+        .position(|&rip| rip == continuation)
+        .expect("the return");
+    if std::env::var_os("CALL_TRACE").is_some() {
+        for &rip in &rips[..back] {
+            let bytes = &program.arena.bytes(rip)[..12];
+            std::eprintln!("TRACE {:x} {bytes:02x?}", rip - program.arena.at(0));
+        }
+    }
+    (program.cost(&rips[..call]), program.cost(&rips[call..back]))
+}
+
+/// What a call and return cost in host instructions, BL then RET and BL
+/// then PACIBSP and RETAB with the fast mix, and with the AES rounds where
+/// the host has AES-NI.
+pub(super) fn call_costs() -> Vec<(&'static str, Cost)> {
+    let (call, plain) = call_and_return(&[RET], false);
+    let (_, mixed) = call_and_return(&[PACIBSP, RETAB], true);
+    let mut costs = vec![
+        ("bl", call),
+        ("ret", plain),
+        ("pacibsp retab, fast mix", mixed),
+    ];
+    if TargetCpu::detect().supports(TargetCpu::Aes) {
+        costs.push(("pacibsp retab", call_and_return(&[PACIBSP, RETAB], false).1));
+    }
+    costs
+}
+
+/// A call and its return take the paired frame, and cost what their path
+/// runs: a change to the call, return or PAC paths changes this table.
+#[test]
+fn calls_and_returns_cost_what_their_path_runs() {
+    let costs = call_costs();
+    for (path, cost) in &costs {
+        std::eprintln!("CALL COST {path}: {cost:?}");
+    }
+    // The call: X30, the frame (its context twice), the host call and the
+    // callee's link. The return: X30, the paired tail's checks and `ret`,
+    // then the continuation's link. PACIBSP and RETAB: the cipher in line.
+    let expected = [
+        ("bl", Cost::new(23, 11, 2, 0)),
+        ("ret", Cost::new(31, 13, 2, 1)),
+        ("pacibsp retab, fast mix", Cost::new(72, 32, 3, 1)),
+        ("pacibsp retab", Cost::new(82, 40, 3, 1)),
+    ];
+    assert_eq!(costs[..], expected[..costs.len()]);
 }

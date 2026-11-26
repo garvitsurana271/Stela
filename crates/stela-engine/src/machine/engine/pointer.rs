@@ -378,12 +378,12 @@ impl PointerService {
         }
         let classic = inputs.version == pauth::Version::Classic;
         // Instructions, then data, each by bit 55.
-        self.cipher.ranges = [false, true].map(|data| {
+        self.cipher.set_ranges([false, true].map(|data| {
             let extension = layouts.native(data);
             [false, true].map(|upper| {
                 pointer::cipher::Range::new(extension[usize::from(upper)], upper, classic)
             })
-        });
+        }));
         self.context = Some(context);
     }
 

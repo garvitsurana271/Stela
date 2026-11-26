@@ -280,12 +280,15 @@ fn prepare(state: &mut GuestState) {
                 .cast::<u64>()
                 .write(pointer::tag(1, key as u8, 0));
         }
-        let ranges = [[false, true].map(|upper| pointer::cipher::Range::new(0, upper, false)); 2];
+        let mut cipher = pointer::cipher::Cipher::default();
+        cipher.set_ranges(
+            [[false, true].map(|upper| pointer::cipher::Range::new(0, upper, false)); 2],
+        );
         anchors
             .add(3 << 16)
-            .add(CIPHER as usize + core::mem::offset_of!(pointer::cipher::Cipher, ranges))
-            .cast::<[[pointer::cipher::Range; 2]; 2]>()
-            .write(ranges);
+            .add(CIPHER as usize)
+            .cast::<pointer::cipher::Cipher>()
+            .write(cipher);
         anchors.add(3 << 16).add(0x1c0).cast::<u64>().write(
             (authenticated as extern "sysv64" fn(*mut u8, u32, u64, u64) -> Pair) as usize as u64,
         );

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/stela-aot",
     "crates/stela-boot-core",
     "crates/stela-crypto",
     "crates/stela-cli",

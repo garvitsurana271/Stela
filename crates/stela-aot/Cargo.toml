@@ -1,0 +1,21 @@
+[package]
+name = "stela-aot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Whole-image analysis for the ahead-of-time translator: the functions, control-flow graphs, register liveness and call graph of the byte-identical macOS images"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+object = { version = "0.37", features = ["read"] }
+
+[[bin]]
+name = "stela-aot"
+path = "src/main.rs"

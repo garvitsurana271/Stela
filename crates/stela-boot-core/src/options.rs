@@ -399,6 +399,14 @@ pub const TLBI_KEEP: &str = "--tlbi-keep";
 /// `--acpi-hardware`, so the options revision stays 13.
 pub const TLBI_VERIFY_CHECK: &str = "--tlbi-verify-check";
 
+/// Compile system-mode blocks position independent and run one copy of a
+/// block at every virtual address its physical code is mapped at, instead
+/// of a copy per address (`--share-aliases on|off`, off unless given): the
+/// shared cache at two slides, each process's own mapping of a binary. A
+/// hand-written opt-in setup never writes, so the options revision stays
+/// 13; it stays off by default until a boot has proven it.
+pub const SHARE_ALIASES: &str = "--share-aliases";
+
 /// A read-only bring-up boot (`--core-trial`): runs a prepared `--bundle`
 /// from the USB on an explicit `--native-cores` count, its disks backed by
 /// engine memory (`--storage-ram`), so nothing it does persists. It is for
@@ -770,6 +778,9 @@ pub struct System {
     /// Walk every entry a kept context's verification keeps in full as
     /// well ([`TLBI_VERIFY_CHECK`]).
     pub tlbi_verify_check: bool,
+    /// [`SHARE_ALIASES`]'s value, unset where the line has none
+    /// ([`Self::share_aliases`]).
+    pub share_aliases: Option<bool>,
     /// A read-only bring-up boot ([`CORE_TRIAL`]).
     pub core_trial: bool,
     /// Run tier 2 ([`TIER2`]): `Some(true)` for `on`, `Some(false)` for
@@ -926,6 +937,7 @@ impl Default for System {
             keep_running_on_panic: false,
             tlbi_keep: None,
             tlbi_verify_check: false,
+            share_aliases: None,
             core_trial: false,
             tier2: None,
             tier2_check: false,
@@ -1144,6 +1156,12 @@ impl System {
     pub fn tlbi_keep(&self) -> (bool, bool) {
         let keep = self.tlbi_keep.unwrap_or(false);
         (keep, keep && self.tlbi_verify_check)
+    }
+
+    /// Whether one translation serves every virtual alias of its physical
+    /// code ([`SHARE_ALIASES`]): off unless `--share-aliases on`.
+    pub fn share_aliases(&self) -> bool {
+        self.share_aliases.unwrap_or(false)
     }
 
     /// The GPU links' power management: `--gpu-aspm`, else
@@ -1545,6 +1563,10 @@ impl fmt::Display for System {
             self.tlbi_keep.map(|keep| if keep { "on" } else { "off" }),
         )?;
         line.flag(TLBI_VERIFY_CHECK, self.tlbi_verify_check)?;
+        line.value(
+            SHARE_ALIASES,
+            self.share_aliases.map(|on| if on { "on" } else { "off" }),
+        )?;
         line.flag(CORE_TRIAL, self.core_trial)?;
         line.value(TIER2, self.tier2.map(|on| if on { "on" } else { "off" }))?;
         line.flag(TIER2_CHECK, self.tier2_check)?;

@@ -80,6 +80,7 @@ pub mod host_resources;
 pub mod host_samples;
 pub mod host_speed;
 pub mod hpet;
+pub mod input_pace;
 pub mod install_caution;
 pub mod install_mode;
 pub mod install_progress;

@@ -245,6 +245,13 @@ pub enum PlatformError {
         bytes: u64,
         error: ServiceError,
     },
+    /// A memory BAR the firmware left at zero that was not placed, or
+    /// whose placement did not take, and why.
+    Unplaced {
+        index: u8,
+        bytes: u64,
+        why: String,
+    },
     I2c(crate::bus::i2c::Error),
     Lpss(crate::bus::lpss::Error),
     LpssAttach(crate::bus::lpss::AttachError),
@@ -287,8 +294,8 @@ impl fmt::Display for PlatformError {
             Self::Refused(why) => f.write_str(why),
             Self::Ps2(error) => error.fmt(f),
             Self::Native(error) => error.fmt(f),
-            // Stambha assigns no PCI BARs: one the firmware left at 0 stays
-            // unmapped where Linux would assign it.
+            // Only an input controller's driver has a BAR the firmware left
+            // at 0 placed (`Unplaced`); any other stays unmapped.
             Self::PciBar {
                 index,
                 base: 0,
@@ -296,8 +303,7 @@ impl fmt::Display for PlatformError {
                 error,
             } => write!(
                 f,
-                "BAR{index} ({bytes:#x} bytes) left unassigned by the firmware, and Stambha \
-                 assigns none yet: {error}"
+                "BAR{index} ({bytes:#x} bytes) left unassigned by the firmware: {error}"
             ),
             Self::PciBar {
                 index,
@@ -305,6 +311,11 @@ impl fmt::Display for PlatformError {
                 bytes,
                 error,
             } => write!(f, "BAR{index} at {base:#x} ({bytes:#x} bytes): {error}"),
+            Self::Unplaced { index, bytes, why } => write!(
+                f,
+                "BAR{index} ({bytes:#x} bytes) left unassigned by the firmware and not placed: \
+                 {why}"
+            ),
             Self::I2c(error) => write!(f, "I2C controller: {error:?}"),
             Self::Lpss(error) => write!(f, "LPSS: {error:?}"),
             Self::LpssAttach(error) => write!(f, "LPSS I2C attach: {error:?}"),
@@ -5048,8 +5059,17 @@ mod tests {
         );
         assert_eq!(
             format!("{}", bar(0)),
-            "BAR0 (0x1000 bytes) left unassigned by the firmware, and Stambha assigns none yet: \
-             outside"
+            "BAR0 (0x1000 bytes) left unassigned by the firmware: outside"
+        );
+        let unplaced = PlatformError::Unplaced {
+            index: 0,
+            bytes: 0x1000,
+            why: String::from("no free 0x1000-byte span is left"),
+        };
+        assert_eq!(
+            format!("{unplaced}"),
+            "BAR0 (0x1000 bytes) left unassigned by the firmware and not placed: no free \
+             0x1000-byte span is left"
         );
     }
 }

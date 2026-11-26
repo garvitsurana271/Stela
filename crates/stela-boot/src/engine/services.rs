@@ -23,6 +23,7 @@ use stela_drivers::{
         pci::{
             Address, Bar, Function, FunctionError,
             owned::OwnedConfig,
+            placement,
             power::Timer,
             requester::{
                 ClaimError, FunctionRole, RequesterBinding,
@@ -310,6 +311,18 @@ unsafe impl NativeServices for Services<'_> {
 
     fn authority(&self) -> Result<owned::Authority, ServiceError> {
         Ok(self.mmio.authority().clone())
+    }
+
+    fn place_bar(
+        &self,
+        address: Address,
+        index: u8,
+        request: placement::Request,
+        firmware: &placement::Firmware,
+    ) -> Result<owned::Resource, ServiceError> {
+        // SAFETY: the function's driver owns it and programs the span.
+        unsafe { self.mmio.place_bar(address, index, request, firmware) }
+            .map_err(ServiceError::Refused)
     }
 
     fn domain(&self, binding: RequesterBinding) -> Result<Arc<dyn DmaDomain>, ServiceError> {

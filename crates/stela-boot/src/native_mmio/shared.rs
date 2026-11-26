@@ -22,6 +22,7 @@ use crate::{
     native_smp::memory_types::Image,
 };
 mod config_space;
+mod placement;
 pub(crate) use config_space::{ContainedPci, ContainmentError, PciScope};
 mod hpet;
 use alloc::{boxed::Box, rc::Rc, string::String, sync::Arc, vec::Vec};
@@ -815,7 +816,7 @@ impl Source {
             crate::output::arguments(format_args!(
                 "HOST PCI BAR at {address:#x} ({bytes:#x} bytes) on segment {segment} lies in \
                  no memory window the firmware's root bridges report (windows:{listed}); \
-                 Stambha assigns no BARs, so it stays unmapped\n"
+                 Stambha moves no BAR the firmware placed, so it stays unmapped\n"
             ));
             return Err(Error::OutsideResource);
         };

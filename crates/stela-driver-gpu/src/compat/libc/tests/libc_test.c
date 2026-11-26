@@ -571,6 +571,9 @@ static void test_time(void)
 		(long)((UINT64_MAX - 1) % 1000000000)};
 	CHECK(clock_nanosleep(CLOCK_MONOTONIC, 0, &too_late, NULL) == EOVERFLOW);
 	CHECK(!getenv("HOME"));
+	/* ANV's heap is all of the share i915 reports. */
+	CHECK(!strcmp(getenv("ANV_SYS_MEM_LIMIT"), "100"));
+	CHECK(!strcmp(getenv("RADV_DEBUG"), "nodcc"));
 }
 
 static _Thread_local int per_thread = 5;

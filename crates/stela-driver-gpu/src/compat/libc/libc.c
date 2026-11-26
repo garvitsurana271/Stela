@@ -165,11 +165,21 @@ int atexit(void (*function)(void))
 /* RADV runs with color compression (DCC) off: under the unified image
  * layouts Stela's Metal device requires, an image a copy fills and a shader
  * then samples read back blank with DCC on (app icons and widgets drew
- * empty on an RX 6800 XT). */
+ * empty on an RX 6800 XT).
+ *
+ * ANV's system heap is all the RAM i915 reports (ANV_SYS_MEM_LIMIT=100), not
+ * the half it keeps of 4 GiB or less: that RAM is the integrated GPU's share,
+ * already held from the guest for the GPU, and the Metal device budgets its
+ * allocations against it. At half, a 2560 MiB share gave a UHD 630 a 1280
+ * MiB heap that the guest memory ANV imports (IOSurfaces, no-copy buffers)
+ * counts in too; it filled with Linux holding 1017 MiB of the share, every
+ * further allocation and import was refused, and WindowServer died. */
 char *getenv(const char *name)
 {
 	if (name && !strcmp(name, "RADV_DEBUG"))
 		return (char *)"nodcc";
+	if (name && !strcmp(name, "ANV_SYS_MEM_LIMIT"))
+		return (char *)"100";
 	return NULL;
 }
 

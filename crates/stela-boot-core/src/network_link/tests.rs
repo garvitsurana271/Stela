@@ -350,3 +350,52 @@ fn the_guest_adapter_is_one_with_a_usable_station_address() {
     );
     assert_eq!(usable_guest_adapter(&[], &[], &[], true), None);
 }
+
+/// An adapter that raises no receive signal (the I219 of a 0.6.1 log whose
+/// line read "stays: no MSI-X entry for processor apic=0xe" while 0xe ran
+/// one of the boot's PEs) is polled: its driver is never asked to move a
+/// signal, and the line says it polls rather than naming a missing entry.
+#[test]
+fn an_adapter_without_a_receive_signal_is_polled_and_never_retargeted() {
+    let asked = Cell::new(false);
+    let signal = receive_signal(false, || {
+        asked.set(true);
+        true
+    });
+    assert_eq!(signal, ReceiveSignal::Polled);
+    assert!(!asked.get());
+    let line = receive_signal_line(signal, "0000:00:1f.6 Intel I219", 0xe, 0x63);
+    assert_eq!(
+        line,
+        "GUEST NETWORK receive polled: host adapter 0000:00:1f.6 Intel I219 raises no receive \
+         signal, its frames are read at each host service turn\n"
+    );
+    assert!(!line.contains("MSI-X"));
+    assert!(!line.contains("apic"));
+}
+
+/// An adapter that signals is asked to move its signal once: moved, the
+/// line keeps 0.6.1's wording; refused, it names the driver, not an entry.
+#[test]
+fn a_signalling_adapter_is_moved_or_kept_as_its_driver_answers() {
+    let asked = Cell::new(0);
+    let moved = receive_signal(true, || {
+        asked.set(asked.get() + 1);
+        true
+    });
+    assert_eq!((moved, asked.get()), (ReceiveSignal::Moved, 1));
+    assert_eq!(
+        receive_signal_line(moved, "0000:00:03.0", 0x2, 0x63),
+        "GUEST NETWORK receive signal moved to processor apic=0x2 vector=0x63\n"
+    );
+    let kept = receive_signal(true, || {
+        asked.set(asked.get() + 1);
+        false
+    });
+    assert_eq!((kept, asked.get()), (ReceiveSignal::Kept, 2));
+    assert_eq!(
+        receive_signal_line(kept, "0000:02:00.0 RTL8168H/RTL8111H XID 541", 0xc, 0x63),
+        "GUEST NETWORK receive signal stays where host adapter 0000:02:00.0 RTL8168H/RTL8111H \
+         XID 541's driver set it: the driver cannot move it to processor apic=0xc vector=0x63\n"
+    );
+}

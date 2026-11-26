@@ -7,26 +7,31 @@
 #include <stela/page.h>
 #include <stela/test.h>
 
+#ifndef STELA_TEST_PAGES
 #define STELA_TEST_PAGES 8UL
+#endif
 #define STELA_TEST_PHYSICAL 0x36000000ULL
 
 static u8 *stela_test_memory;
 static u64 stela_test_physical[STELA_TEST_PAGES];
 static size_t stela_test_used;
 
+/* A run starts at a multiple of its size, as Linux's page allocator gives
+ * one; the pages skipped to align it are never used. */
 static int stela_test_validate_pages(void *context, u32 gfp, unsigned int order, bool atomic)
 {
 	(void)context;
 	(void)gfp;
 	(void)atomic;
-	return stela_test_used + (1UL << order) <= STELA_TEST_PAGES ? 0 : -ENOMEM;
+	return ALIGN(stela_test_used, 1UL << order) + (1UL << order) <= STELA_TEST_PAGES ? 0 :
+											   -ENOMEM;
 }
 
 static int stela_test_allocate_pages(void *context, u32 gfp, unsigned int order, bool atomic,
 				     struct stela_linux_page_allocation *result)
 {
 	assert(!stela_test_validate_pages(context, gfp, order, atomic));
-	size_t count = 1UL << order, first = stela_test_used;
+	size_t count = 1UL << order, first = ALIGN(stela_test_used, count);
 
 	for (size_t i = 0; i < count; i++)
 		stela_test_physical[first + i] = STELA_TEST_PHYSICAL + (u64)(first + i) * PAGE_SIZE;
@@ -36,7 +41,7 @@ static int stela_test_allocate_pages(void *context, u32 gfp, unsigned int order,
 		.physical_pages = stela_test_physical + first,
 		.page_count = count,
 	};
-	stela_test_used += count;
+	stela_test_used = first + count;
 	return 0;
 }
 

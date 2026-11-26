@@ -206,10 +206,68 @@ struct file *alloc_file_pseudo(struct inode *inode, struct vfsmount *mount, cons
  * by the cache, until a truncation or the inode's last reference drops it.
  * Nothing is written back, as there is no swap to write to. GEM objects of
  * system memory take their pages from here (i915), or only their size and
- * mapping offset (nouveau). */
-static struct folio *shmem_folio(struct address_space *mapping, pgoff_t index, gfp_t gfp)
+ * mapping offset (nouveau).
+ *
+ * A read of a page no folio holds yet takes a large folio, as a huge=within_size
+ * mount gives one: the largest of SHMEM_LARGE_ORDER down to SHMEM_SMALL_ORDER
+ * whose naturally aligned block starts at the page, lies inside the file and
+ * holds no cached page, and order 0 when none does or it cannot be had. Each
+ * of the folio's indices names it, and the cache holds one reference to it.
+ * i915 fills an object's pages in order, a folio at a time, so a 64 MiB object
+ * takes 32 allocations and as many scatterlist entries, where one per 4 KiB
+ * page made its first submission, which fills them, take 350 to 900 ms. */
+#define SHMEM_LARGE_ORDER 9
+#define SHMEM_SMALL_ORDER 4
+
+static unsigned int shmem_order(struct address_space *mapping, pgoff_t index)
 {
-	struct folio *folio, *cached;
+	pgoff_t pages = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE);
+
+	for (unsigned int order = SHMEM_LARGE_ORDER; order >= SHMEM_SMALL_ORDER; order--) {
+		pgoff_t count = 1UL << order;
+		unsigned long at = index;
+
+		if ((index & (count - 1)) || index + count > pages)
+			continue;
+		if (!xa_find(&mapping->i_pages, &at, index + count - 1, XA_PRESENT))
+			return order;
+	}
+	return 0;
+}
+
+/* Caches `folio` at each of its indices, or none of them: whether it did, with
+ * the entry or error that stopped it in *cached. */
+static bool shmem_cache(struct address_space *mapping, struct folio *folio, gfp_t gfp,
+			void **cached)
+{
+	unsigned long count = (unsigned long)folio_nr_pages(folio);
+	unsigned long stored;
+
+	/* The page cache's lock is taken with interrupts off (XA_FLAGS_LOCK_IRQ),
+	 * and its nodes take the request's reclaim behaviour only. */
+	gfp &= __GFP_RECLAIM | __GFP_IO | __GFP_FS | __GFP_NOWARN | __GFP_RETRY_MAYFAIL |
+	       __GFP_NORETRY;
+	*cached = NULL;
+	xa_lock_irq(&mapping->i_pages);
+	for (stored = 0; stored < count; stored++) {
+		*cached = __xa_cmpxchg(&mapping->i_pages, folio->index + stored, NULL, folio, gfp);
+		if (*cached)
+			break;
+	}
+	if (stored == count)
+		WRITE_ONCE(mapping->nrpages, mapping->nrpages + count);
+	else
+		while (stored--)
+			__xa_erase(&mapping->i_pages, folio->index + stored);
+	xa_unlock_irq(&mapping->i_pages);
+	return !*cached;
+}
+
+static struct folio *shmem_folio_order(struct address_space *mapping, pgoff_t index, gfp_t gfp,
+				       bool large)
+{
+	struct folio *folio;
+	void *cached;
 
 	rcu_read_lock();
 	folio = xa_load(&mapping->i_pages, index);
@@ -218,7 +276,17 @@ static struct folio *shmem_folio(struct address_space *mapping, pgoff_t index, g
 	rcu_read_unlock();
 	if (folio)
 		return folio;
-	folio = folio_alloc(gfp | __GFP_ZERO, 0);
+	unsigned int order = large ? shmem_order(mapping, index) : 0;
+
+	/* A large folio is only tried: it may fail without reclaim or a warning. */
+	folio = order ? folio_alloc((gfp | __GFP_ZERO | __GFP_NORETRY | __GFP_NOWARN) &
+					    ~__GFP_RETRY_MAYFAIL,
+				    order) :
+			NULL;
+	if (!folio) {
+		order = 0;
+		folio = folio_alloc(gfp | __GFP_ZERO, 0);
+	}
 	if (!folio)
 		return ERR_PTR(-ENOMEM);
 	folio->mapping = mapping;
@@ -226,24 +294,26 @@ static struct folio *shmem_folio(struct address_space *mapping, pgoff_t index, g
 	folio_mark_uptodate(folio);
 	/* The cache's reference, beside the caller's. */
 	folio_get(folio);
-	/* The page cache's lock is taken with interrupts off (XA_FLAGS_LOCK_IRQ),
-	 * and its nodes take the request's reclaim behaviour only. */
-	xa_lock_irq(&mapping->i_pages);
-	cached = __xa_cmpxchg(&mapping->i_pages, index, NULL, folio,
-			      gfp & (__GFP_RECLAIM | __GFP_IO | __GFP_FS | __GFP_NOWARN |
-				     __GFP_RETRY_MAYFAIL | __GFP_NORETRY));
-	if (!cached)
-		WRITE_ONCE(mapping->nrpages, mapping->nrpages + 1);
-	xa_unlock_irq(&mapping->i_pages);
-	if (!cached)
+	if (shmem_cache(mapping, folio, gfp, &cached))
 		return folio;
 	folio->mapping = NULL;
 	folio_put(folio);
 	folio_put(folio);
 	if (xa_is_err(cached))
 		return ERR_PTR(xa_err(cached));
-	/* Another caller cached the page first. */
-	return shmem_folio(mapping, index, gfp);
+	/* Another caller cached a page of it first. */
+	return shmem_folio_order(mapping, index, gfp, large);
+}
+
+static struct folio *shmem_folio(struct address_space *mapping, pgoff_t index, gfp_t gfp)
+{
+	return shmem_folio_order(mapping, index, gfp, false);
+}
+
+/* The byte of `folio` at `offset` into page `index`. */
+static size_t shmem_offset(const struct folio *folio, pgoff_t index, size_t offset)
+{
+	return ((size_t)(index - folio->index) << PAGE_SHIFT) + offset;
 }
 
 /* mm/folio-compat.c's. */
@@ -257,7 +327,7 @@ struct folio *shmem_read_folio_gfp(struct address_space *mapping, pgoff_t index,
 {
 	if (index >= DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE))
 		return ERR_PTR(-EINVAL);
-	return shmem_folio(mapping, index, gfp);
+	return shmem_folio_order(mapping, index, gfp, true);
 }
 
 struct page *shmem_read_mapping_page_gfp(struct address_space *mapping, pgoff_t index, gfp_t gfp)
@@ -273,11 +343,13 @@ static void shmem_zero_part(struct address_space *mapping, pgoff_t index, size_t
 	struct folio *folio = xa_load(&mapping->i_pages, index);
 
 	if (folio && from < to)
-		folio_zero_range(folio, from, to - from);
+		folio_zero_range(folio, shmem_offset(folio, index, from), to - from);
 }
 
 /* Drops the cached pages of [start, end] (end inclusive) and zeroes the
- * parts of the pages at either end that the range covers. */
+ * parts of the pages at either end that the range covers. A large folio the
+ * range covers only in part stays cached with those pages zeroed, as they
+ * read after a hole is punched. */
 void shmem_truncate_range(struct inode *inode, loff_t start, uoff_t end)
 {
 	struct address_space *mapping = inode->i_mapping;
@@ -296,8 +368,24 @@ void shmem_truncate_range(struct inode *inode, loff_t start, uoff_t end)
 	if (last == 0 || first > last - 1)
 		return;
 	xa_for_each_range(&mapping->i_pages, index, folio, first, last - 1) {
-		xa_erase_irq(&mapping->i_pages, index);
-		WRITE_ONCE(mapping->nrpages, mapping->nrpages - 1);
+		pgoff_t head = folio->index;
+		pgoff_t count = (pgoff_t)folio_nr_pages(folio);
+
+		if (head < first || head + count - 1 > last - 1) {
+			/* Its pages in the range, from this one. */
+			pgoff_t end = min_t(pgoff_t, head + count, last);
+
+			folio_zero_range(folio, shmem_offset(folio, index, 0),
+					 (size_t)(end - index) << PAGE_SHIFT);
+			index = end - 1;
+			continue;
+		}
+		xa_lock_irq(&mapping->i_pages);
+		for (pgoff_t page = head; page < head + count; page++)
+			__xa_erase(&mapping->i_pages, page);
+		WRITE_ONCE(mapping->nrpages, mapping->nrpages - count);
+		xa_unlock_irq(&mapping->i_pages);
+		index = head + count - 1;
 		folio->mapping = NULL;
 		folio_put(folio);
 	}
@@ -358,7 +446,9 @@ static ssize_t shmem_write_iter(struct kiocb *iocb, struct iov_iter *from)
 				written = PTR_ERR(folio);
 			break;
 		}
-		size_t copied = copy_folio_from_iter(folio, offset, bytes, from);
+		size_t copied = copy_folio_from_iter(
+			folio, shmem_offset(folio, (pgoff_t)(position >> PAGE_SHIFT), offset), bytes,
+			from);
 
 		folio_mark_dirty(folio);
 		folio_put(folio);
@@ -572,6 +662,8 @@ struct file *stela_linux_reopen_unowned_path(void)
 #include <linux/radix-tree.h>
 #include <linux/statfs.h>
 #include <stela/page.h>
+/* Room for a sixteen-page shmem folio, aligned, beside the single pages. */
+#define STELA_TEST_PAGES 64UL
 #include <stela/page_test.h>
 #include <stela/test.h>
 
@@ -695,10 +787,21 @@ static bool test_realtime_at(void *context, s64 monotonic, u32 mode, u32 tick_ns
 	return true;
 }
 
+/* The slab names a nonblocking allocation that found no ready slot (an
+ * xarray's first try at a node under the page cache's lock), which then
+ * retries blocking; anything else unsupported ends the test. */
+static void test_unsupported(void *context, const char *operation)
+{
+	(void)context;
+	if (strncmp(operation, "nonblocking allocation with no ready slot", 41))
+		__builtin_trap();
+}
+
 int main(void)
 {
 	static const struct stela_linux_services services = {
 		.now_ns = test_now_ns, .realtime_at = test_realtime_at,
+		.unsupported = test_unsupported,
 	};
 	static const struct stela_linux_owner owner = {.services = &services};
 	stela_linux_enter(&owner);
@@ -838,6 +941,34 @@ int main(void)
 	folio_put(leading);
 	/* The last reference drops the cached page with the inode. */
 	fput(object);
+
+	/* A read takes the largest aligned folio inside the file that holds no
+	 * cached page, sixteen pages here, and single pages past the last whole
+	 * block; each index names it, writes land at their page of it, a
+	 * truncation of part of it zeroes those pages and one of all of it drops
+	 * it whole. */
+	struct file *large = shmem_file_setup("large", 18 * PAGE_SIZE, EMPTY_VMA_FLAGS);
+	assert(!IS_ERR(large));
+	struct address_space *blocks = large->f_mapping;
+	struct folio *block = shmem_read_folio_gfp(blocks, 0, GFP_KERNEL);
+	assert(!IS_ERR(block) && folio_nr_pages(block) == 16 && blocks->nrpages == 16);
+	assert(folio_ref_count(block) == 2 && !memchr_inv(folio_address(block), 0, 16 * PAGE_SIZE));
+	struct page *inner = shmem_read_mapping_page_gfp(blocks, 5, GFP_KERNEL);
+	assert(!IS_ERR(inner) && inner == folio_page(block, 5) && folio_ref_count(block) == 3);
+	put_page(inner);
+	struct folio *tail = shmem_read_folio_gfp(blocks, 16, GFP_KERNEL);
+	assert(!IS_ERR(tail) && folio_nr_pages(tail) == 1 && blocks->nrpages == 17);
+	folio_put(tail);
+	position = 5 * PAGE_SIZE + 3;
+	assert(kernel_write(large, "xy", 2, &position) == 2);
+	assert(!memcmp((char *)folio_address(block) + 5 * PAGE_SIZE + 3, "xy", 2));
+	shmem_truncate_range(file_inode(large), 4 * PAGE_SIZE, 6 * PAGE_SIZE - 1);
+	assert(blocks->nrpages == 17 &&
+	       !memchr_inv((char *)folio_address(block) + 4 * PAGE_SIZE, 0, 2 * PAGE_SIZE));
+	shmem_truncate_range(file_inode(large), 0, (uoff_t)-1);
+	assert(!blocks->nrpages && folio_ref_count(block) == 1);
+	folio_put(block);
+	fput(large);
 
 	struct pin_interleave overlap = {};
 	interleave = &overlap;

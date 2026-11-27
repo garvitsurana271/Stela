@@ -70,6 +70,15 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateShareAliases);
                 }
             }
+            REFILL_CAP => {
+                let pages = value()
+                    .and_then(|word| word.parse::<usize>().ok())
+                    .filter(|pages| *pages <= REFILL_CAP_PAGES)
+                    .ok_or(Error::RefillCap)?;
+                if options.refill_cap.replace(pages).is_some() {
+                    return Err(Error::DuplicateRefillCap);
+                }
+            }
             TLBI_VERIFY_CHECK => flag(
                 &mut options.tlbi_verify_check,
                 Error::DuplicateTlbiVerifyCheck,

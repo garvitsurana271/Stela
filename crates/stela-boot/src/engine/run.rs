@@ -2186,9 +2186,11 @@ impl Heartbeat {
                 String::from("PES TIME idle%/spin%/sync%/waits/compiled/shared/halt%/short");
             // Per PE: the interval's share compiling, reading and hashing
             // fetch pages, finding shared blocks, installing blocks, walking
-            // fetch translations and refilling dropped or remade pages.
-            let mut fetches =
-                String::from("PES FETCH compile%/page%/shared%/install%/walk%/refill%");
+            // fetch translations and refilling dropped or remade pages, then
+            // the pages each refill walked again on average.
+            let mut fetches = String::from(
+                "PES FETCH compile%/page%/shared%/install%/walk%/refill%/pages_per_refill",
+            );
             // Per PE: the blocks it holds, its block table's slots, the
             // pages its index finds blocks in, and the code arena parts it
             // released for heap pressure since the last beat; on a shared
@@ -2260,6 +2262,7 @@ impl Heartbeat {
                 "PES ITLBSRC fills_lower/fills_upper/cold_seen/drop_asid/drop_every",
                 "/all_local/all_received/all_forgot/all_kept/made/mail_merged/refilled",
                 "/drop_upper/drop_no_asid/drop_global/leaf_fills/shared_fills",
+                "/refill_hit/refill_unhit/refill_batches/refill_kept",
             ));
             // Per PE: its installs at EL0 and then above EL0 by where the
             // block came from: compiled in a page the store keys (offered
@@ -2420,14 +2423,23 @@ impl Heartbeat {
                     percent(now.halt_ticks.saturating_sub(before.halt_ticks)),
                     now.short_waits.saturating_sub(before.short_waits),
                 ));
+                let source = |counts: &parallel::Counts, at: usize| counts.itlb_sources[at];
+                let refilled = source(now, stela_engine::machine::engine::ITLB_REFILLED)
+                    .saturating_sub(source(before, stela_engine::machine::engine::ITLB_REFILLED));
+                let batches = source(now, stela_engine::machine::engine::ITLB_REFILL_BATCHES)
+                    .saturating_sub(source(
+                        before,
+                        stela_engine::machine::engine::ITLB_REFILL_BATCHES,
+                    ));
                 fetches.push_str(&format!(
-                    " {pe}:{}/{}/{}/{}/{}/{}",
+                    " {pe}:{}/{}/{}/{}/{}/{}/{}",
                     percent(now.compile_ticks.saturating_sub(before.compile_ticks)),
                     percent(now.page_ticks.saturating_sub(before.page_ticks)),
                     percent(now.shared_ticks.saturating_sub(before.shared_ticks)),
                     percent(now.install_ticks.saturating_sub(before.install_ticks)),
                     percent(now.walk_ticks.saturating_sub(before.walk_ticks)),
                     percent(now.refill_ticks.saturating_sub(before.refill_ticks)),
+                    refilled / batches.max(1),
                 ));
                 code.push_str(&format!(
                     " {pe}:{}/{}/{}/{}",

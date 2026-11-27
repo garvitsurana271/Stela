@@ -115,7 +115,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let btype = self.cpu.pstate.btype;
         let path = if single {
             FetchPath::Single
-        } else if let Some(key) = self.current_key(pc) {
+        } else if let Some((key, slot, held_in)) = self.current_entry(pc) {
+            // A refilled entry this fetch reaches is its page's demand.
+            self.note_refill_hit(pc, slot, held_in);
             let table = &self.code.table;
             let target = table.find(table.slot(pc, key), pc, key);
             if target.pc != pc || target.key != key {
@@ -273,16 +275,88 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// whose walk ended in a global leaf ([`Self::itlb_context`]): what a
     /// lookup dispatcher's translation finds (`chain::translate`).
     pub(super) fn current_key(&self, pc: u64) -> Option<u64> {
+        self.current_entry(pc).map(|(key, ..)| key)
+    }
+
+    /// [`Self::current_key`] with the slot its set is found from and the
+    /// context that holds it.
+    fn current_entry(&self, pc: u64) -> Option<(u64, usize, u64)> {
         let half = chain::half(pc);
         let contexts = self.chain.contexts();
         let page = pc & !(FETCH_PAGE - 1);
         let held = |context: u64| {
-            let held = self
-                .itlb
-                .find(self.itlb.page_slot(pc, context), page, context);
-            (held.pc == page && held.key == context).then_some(held.entry)
+            let slot = self.itlb.page_slot(pc, context);
+            let held = self.itlb.find(slot, page, context);
+            (held.pc == page && held.key == context).then_some((held.entry, slot, context))
         };
         held(contexts[half]).or_else(|| if half == 0 { held(contexts[1]) } else { None })
+    }
+
+    /// An engine fetch reached the ITLB's entry of the page of `pc` in
+    /// `context`, whose set `slot` picks. One a refill took that no fetch
+    /// had reached ([`Self::refill_marks`]) is now its page's demand: the
+    /// fill log takes it as it takes a fill, so the page's next refill
+    /// walks it again ([`Self::refill_after`]). A probe in native code
+    /// reaches entries without the engine, so a page only native code ran
+    /// counts as reached by none. One bit test while no mark is in the set.
+    #[inline]
+    fn note_refill_hit(&mut self, pc: u64, slot: usize, context: u64) {
+        let set = slot / 2;
+        if self.refill_marks.is_empty()
+            || self
+                .refill_mark_sets
+                .get(set / 64)
+                .is_none_or(|word| word >> (set % 64) & 1 == 0)
+        {
+            return;
+        }
+        self.refill_hit(pc & !(FETCH_PAGE - 1), context);
+    }
+
+    #[cold]
+    fn refill_hit(&mut self, page: u64, context: u64) {
+        if self.refill_marks.remove(&(context, page)).is_some() {
+            self.statistics.itlb_sources[ItlbSource::RefillHits as usize] += 1;
+            self.log_fill(page, context);
+        }
+    }
+
+    /// Mark the entry of `page` that a refill just put in `context`, in the
+    /// set of `slot`, as reached by no fetch yet, after `unhit` refills
+    /// before it no fetch reached either ([`REFILL_AGE`]). Past
+    /// [`REFILL_MARKS`] marks a refilled page goes unmarked: it is neither
+    /// reached nor unreached, and its page is walked again only if a fetch
+    /// takes it again.
+    fn mark_refill(&mut self, page: u64, context: u64, slot: usize, unhit: u64) {
+        if self.refill_marks.len() >= REFILL_MARKS {
+            return;
+        }
+        let sets = self.itlb.entries() / 2;
+        if self.refill_mark_sets.len() != sets.div_ceil(64) {
+            self.refill_mark_sets = vec![0; sets.div_ceil(64)];
+        }
+        let set = slot / 2;
+        if let Some(word) = self.refill_mark_sets.get_mut(set / 64) {
+            *word |= 1 << (set % 64);
+        }
+        let unhit = u8::try_from(unhit + 1).unwrap_or(u8::MAX);
+        self.refill_marks.insert((context, page), unhit);
+    }
+
+    /// After a TLBI of everything, walk again at most `pages` pages of each
+    /// forgotten context's key at once, and a page no fetch reached since
+    /// its last refill only while it was refilled fewer than `unhit` times
+    /// in a row (2,048 and 1 unless set). 0 pages refill nothing.
+    pub fn set_refill_limits(&mut self, pages: usize, unhit: u8) {
+        self.refill_limits = RefillLimits {
+            pages: pages.min(FILL_LOG),
+            unhit,
+        };
+    }
+
+    /// [`Self::set_refill_limits`]'s pages and refills in a row.
+    pub fn refill_limits(&self) -> (usize, u8) {
+        (self.refill_limits.pages, self.refill_limits.unhit)
     }
 
     /// The context an ITLB entry of the page of `pc` takes: its half's
@@ -462,31 +536,40 @@ impl<H: Host, D: Devices> Machine<H, D> {
             false => chain::LookupEntry::page(page, context, key),
         };
         let held = self.itlb.find(slot, page, context);
+        let held_page = held.pc == page && held.key == context;
+        // A fetch that finds its page held reaches the entry there.
+        if held_page && matches!(taken, Taken::Fetch) {
+            self.note_refill_hit(pc, slot, context);
+        }
         if held == entry {
             if self.tlbi_keep.on && record.is_some() {
                 self.note_kept_fill(page, context, record);
             }
             return;
         }
-        let held_page = held.pc == page && held.key == context;
-        // A leaf's other pages come back with the page whose take brought
-        // them (`refill_pages` takes its leaf's pages again), which the
-        // log holds: they would only lengthen it, and every TLBI of
-        // everything goes through it.
-        if !held_page && !matches!(taken, Taken::Leaf) {
+        // Only a fetch's take is logged. A leaf's other pages come back with
+        // the page whose take brought them (`refill_pages` takes its leaf's
+        // pages again), which the log holds: they would only lengthen it,
+        // and every TLBI of everything goes through it. A refill's take is
+        // marked instead ([`Self::mark_refill`]): logged, every refilled
+        // page would be walked again after every later TLBI of everything,
+        // whether any fetch ran it since or not, as the log took it anew
+        // each time (boot 35: about 1,100 pages each, 82% of the fills in
+        // Finder still `context` misses).
+        if !held_page && matches!(taken, Taken::Fetch) {
             self.log_fill(page, context);
         }
         if !held_page && shared && half == 0 {
             self.statistics.itlb_sources[ItlbSource::SharedFills as usize] += 1;
         }
         match taken {
-            Taken::Refill if !held_page => {
+            Taken::Refill(_) if !held_page => {
                 self.statistics.itlb_sources[ItlbSource::Refilled as usize] += 1;
             }
             Taken::Leaf if !held_page => {
                 self.statistics.itlb_sources[ItlbSource::LeafFills as usize] += 1;
             }
-            Taken::Refill | Taken::Leaf => {}
+            Taken::Refill(_) | Taken::Leaf => {}
             Taken::Fetch if held_page => self.statistics.itlb[1] += 1,
             Taken::Fetch => {
                 self.statistics.itlb[0] += 1;
@@ -524,6 +607,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 note_itlb_ghost(&mut self.itlb_ghosts, &lost, ItlbMiss::Evicted);
             }
             self.itlb.insert_over(slot, entry, &dead);
+        }
+        if let Taken::Refill(unhit) = taken
+            && !held_page
+        {
+            self.mark_refill(page, context, slot, unhit);
         }
         if self.tlbi_keep.on {
             self.note_kept_fill(page, context, record);
@@ -686,11 +774,28 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     /// Before the contexts of `half` go: keep, by key, the pages each took
-    /// last ([`Self::fill_log`]), for the context made anew for its key to
-    /// walk again ([`Self::refill_pages`]). Lists kept from before for keys
-    /// of `half` no context took since give way.
+    /// or reached last, for the context made anew for its key to walk again
+    /// ([`Self::refill_pages`]): those fetches took or reached since
+    /// ([`Self::fill_log`]), and of those refills took that no fetch reached
+    /// since ([`Self::refill_marks`], counted unhit) the ones refilled fewer
+    /// times in a row than [`RefillLimits::unhit`]; at most
+    /// [`RefillLimits::pages`] a key. A key's list from an earlier TLBI that
+    /// no context took since stays through [`PENDING_FLUSHES`] more, merged
+    /// with its new one: a process the switch that flushed left finds its
+    /// pages when it runs again, after another switch's flush. The half
+    /// keeps at most [`PENDING_LISTS`] lists, the newest. A list holds VAs
+    /// alone, never a translation: each page is walked again in the tables
+    /// as they are when a context of its key is made, and taken only as
+    /// that walk gives it.
     pub(super) fn refill_after(&mut self, half: usize) {
-        self.pending_refills.retain(|&(held, _), _| held != half);
+        let limits = self.refill_limits;
+        self.pending_refills.retain(|&(held, _), pending| {
+            if held != half {
+                return true;
+            }
+            pending.flushes += 1;
+            pending.flushes <= PENDING_FLUSHES
+        });
         let spaces = &self.spaces[half];
         let other = &self.spaces[1 - half];
         // Runs of the log share a context: each context is looked up once,
@@ -726,7 +831,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             match fate {
                 Fate::Refill(list) => {
                     let pages = &mut lists[list].1;
-                    if pages.len() < REFILLS_PER_CONTEXT {
+                    if pages.len() < limits.pages {
                         pages.push(page);
                     }
                     false
@@ -735,10 +840,83 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
         });
         self.fill_next = self.fill_log.len() % FILL_LOG;
+        // The refilled entries no fetch reached: of a context that goes now
+        // or went before, unhit; of the other half's live ones, kept.
+        let mut unhit = 0;
+        for ((context, page), refilled) in core::mem::take(&mut self.refill_marks) {
+            match spaces.live(context) {
+                Some(space) => {
+                    unhit += 1;
+                    if refilled >= limits.unhit {
+                        continue;
+                    }
+                    let list = match lists.iter().position(|(key, _)| *key == space.key) {
+                        Some(list) => list,
+                        None => {
+                            lists.push((space.key, Vec::new()));
+                            lists.len() - 1
+                        }
+                    };
+                    let pages = &mut lists[list].1;
+                    if pages.len() < limits.pages {
+                        pages.push(page | u64::from(refilled));
+                    }
+                }
+                None if other.live(context).is_some() => {
+                    self.refill_marks.insert((context, page), refilled);
+                }
+                None => unhit += 1,
+            }
+        }
+        self.statistics.itlb_sources[ItlbSource::RefillUnhit as usize] += unhit;
+        if !self.refill_mark_sets.is_empty() {
+            self.refill_mark_sets.fill(0);
+            for &(context, page) in self.refill_marks.keys() {
+                let set = self.itlb.page_slot(page, context) / 2;
+                if let Some(word) = self.refill_mark_sets.get_mut(set / 64) {
+                    *word |= 1 << (set % 64);
+                }
+            }
+        }
         for (key, mut pages) in lists {
-            pages.sort_unstable();
-            pages.dedup();
-            self.pending_refills.insert((half, key), pages);
+            sort_refills(&mut pages);
+            match self.pending_refills.entry((half, key)) {
+                alloc::collections::btree_map::Entry::Vacant(vacant) => {
+                    vacant.insert(PendingRefill { pages, flushes: 0 });
+                }
+                alloc::collections::btree_map::Entry::Occupied(mut occupied) => {
+                    // The new list's pages first, then the kept one's.
+                    let kept = core::mem::take(&mut occupied.get_mut().pages);
+                    let room = limits.pages.saturating_sub(pages.len());
+                    let older: Vec<u64> = kept
+                        .into_iter()
+                        .filter(|entry| {
+                            pages
+                                .binary_search_by_key(&(entry & !REFILL_AGE), |held| {
+                                    held & !REFILL_AGE
+                                })
+                                .is_err()
+                        })
+                        .take(room)
+                        .collect();
+                    pages.extend(older);
+                    sort_refills(&mut pages);
+                    *occupied.get_mut() = PendingRefill { pages, flushes: 0 };
+                }
+            }
+        }
+        let mut held: Vec<(u8, contexts::Key)> = self
+            .pending_refills
+            .iter()
+            .filter(|((held, _), _)| *held == half)
+            .map(|((_, key), pending)| (pending.flushes, *key))
+            .collect();
+        if held.len() > PENDING_LISTS {
+            // The oldest go first.
+            held.sort_unstable_by_key(|&(flushes, _)| core::cmp::Reverse(flushes));
+            for (_, key) in &held[..held.len() - PENDING_LISTS] {
+                self.pending_refills.remove(&(half, *key));
+            }
         }
     }
 
@@ -794,7 +972,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn refill_pages(&mut self, el: u8, context: Variant, numbers: &mut PageNumbers) {
         let generation = self.translation_generation;
         let mut quiet = QuietWalk::new(&self.cpu);
-        for pc in core::mem::take(&mut self.refills) {
+        if !self.refills.is_empty() {
+            self.statistics.itlb_sources[ItlbSource::RefillBatches as usize] += 1;
+        }
+        for entry in core::mem::take(&mut self.refills) {
+            // A page, and the refills in a row no fetch reached it.
+            let (pc, unhit) = (entry & !REFILL_AGE, entry & REFILL_AGE);
             // Taken already, with its leaf's other pages.
             if self.current_key(pc).is_some() {
                 continue;
@@ -816,7 +999,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 self.take_page(
                     pc,
                     key,
-                    Taken::Refill,
+                    Taken::Refill(unhit),
                     walk.global,
                     walk.global,
                     walk.record,
@@ -2579,12 +2762,40 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
 /// How [`Machine::take_page`] came to a page: counted as a fetch's ITLB
 /// hit or miss, a batch refill ([`Machine::refill_pages`]) or a page of a
-/// walked leaf ([`Machine::take_leaf_pages`]).
+/// walked leaf ([`Machine::take_leaf_pages`]). A refill names the refills
+/// in a row before it that no fetch reached its page.
 #[derive(Clone, Copy)]
 enum Taken {
     Fetch,
-    Refill,
+    Refill(u64),
     Leaf,
+}
+
+/// The low bits of a page in [`Machine::refills`] and a pending list
+/// ([`PendingRefill`]): the refills in a row no fetch reached it.
+const REFILL_AGE: u64 = FETCH_PAGE - 1;
+
+/// The refilled entries a PE marks as reached by no fetch yet
+/// ([`Machine::refill_marks`]): a TLBI of everything ends every mark of its
+/// half, and a PE refills about 1,100 pages between two (boot 35).
+const REFILL_MARKS: usize = FILL_LOG;
+
+/// The TLBIs of everything of its half a pending list no context took
+/// outlives ([`Machine::refill_after`]): XNU flushes at the switch between
+/// two processes of different shared regions, so the list the switch away
+/// from a process made is still there when the switch back makes its
+/// context, past the flush of the switch between.
+pub(super) const PENDING_FLUSHES: u8 = 2;
+
+/// The pending lists a PE keeps a half ([`Machine::refill_after`]): at most
+/// [`PENDING_LISTS`] times [`RefillLimits::pages`] pages a half.
+pub(super) const PENDING_LISTS: usize = 16;
+
+/// Sort a list of refills by page, each page once with its fewest refills
+/// in a row unreached.
+fn sort_refills(pages: &mut Vec<u64>) {
+    pages.sort_unstable();
+    pages.dedup_by_key(|entry| *entry & !REFILL_AGE);
 }
 
 /// The span around a fetched page whose other pages one walk gives the
@@ -2609,7 +2820,38 @@ struct Leaf {
 /// of everything a PE refilled about 510 pages and then missed about 600
 /// more one exit at a time (run 20261115-112116, beat 40: 880 such TLBIs
 /// per PE, `refilled` 427-495 K, `context` misses 430-566 K).
-const REFILLS_PER_CONTEXT: usize = 2048;
+pub(super) const REFILLS_PER_CONTEXT: usize = 2048;
+
+/// The pages a forgotten context left to walk again when a context of its
+/// key is made ([`Machine::pending_refills`]), each with the refills in a
+/// row no fetch reached it in its low bits ([`REFILL_AGE`]), and the TLBIs
+/// of everything of its half it outlived untaken ([`PENDING_FLUSHES`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct PendingRefill {
+    pub(super) pages: Vec<u64>,
+    pub(super) flushes: u8,
+}
+
+/// How much a TLBI of everything leaves to walk again
+/// ([`Machine::set_refill_limits`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RefillLimits {
+    /// The pages of a key ([`REFILLS_PER_CONTEXT`] unless set).
+    pub(super) pages: usize,
+    /// The refills in a row a page no fetch reached takes: past them it
+    /// waits for a fetch to take it again. 1 unless set: a page is walked
+    /// again after one TLBI with no fetch since, not after the next.
+    pub(super) unhit: u8,
+}
+
+impl Default for RefillLimits {
+    fn default() -> Self {
+        Self {
+            pages: REFILLS_PER_CONTEXT,
+            unhit: 1,
+        }
+    }
+}
 
 /// What [`Machine::refill_after`] does with a context's fills: gather the
 /// pages in the list at this index, or keep the log's entries when the

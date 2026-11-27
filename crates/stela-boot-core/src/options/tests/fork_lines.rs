@@ -99,7 +99,7 @@ fn on(option: &str) -> bool {
     value(option) == "on"
 }
 
-fn forks() -> [Fork; 14] {
+fn forks() -> [Fork; 15] {
     [
         Fork {
             valid: &["--acpi-hardware"],
@@ -149,6 +149,17 @@ fn forks() -> [Fork; 14] {
                 ("--share-aliases 1", Error::ShareAliases),
             ],
             duplicate: Some(Error::DuplicateShareAliases),
+        },
+        Fork {
+            valid: &["--refill-cap 0", "--refill-cap 512", "--refill-cap 8192"],
+            set: |o, t| o.refill_cap = Some(value(t).parse().unwrap()),
+            bad: &[
+                ("--refill-cap", Error::RefillCap),
+                ("--refill-cap 8193", Error::RefillCap),
+                ("--refill-cap on", Error::RefillCap),
+                ("--refill-cap 0x10", Error::RefillCap),
+            ],
+            duplicate: Some(Error::DuplicateRefillCap),
         },
         Fork {
             valid: &["--tlbi-verify-check"],

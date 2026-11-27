@@ -1030,3 +1030,192 @@ fn address_spaces_share_their_global_pages_entries() {
     assert_eq!(machine.current_key(pc(0)), None);
     assert_eq!(machine.current_key(pc(1)), None);
 }
+
+/// A machine of `pages` pages of RET at BASE, private (nG) pages of address
+/// space 0 at their own frames, selected with ASID 1.
+fn private_pages(pages: u64) -> Machine<FakeHost, NoDevices> {
+    const RET: u32 = 0xd65f_03c0;
+    const NG: u64 = 1 << 11;
+    let mut words = vec![0u32; (pages * 0x1000 / 4) as usize];
+    for page in 0..pages as usize {
+        words[page * 0x400] = RET;
+    }
+    let mut machine = machine(&words);
+    let frames: Vec<u64> = (0..pages).map(|page| BASE + page * 0x1000).collect();
+    paged_space(&mut machine, 0, &frames);
+    let [_, _, l3] = SPACES_TABLES[0];
+    for (page, &frame) in frames.iter().enumerate() {
+        write_entry(
+            &mut machine,
+            l3 + 8 * page as u64,
+            page_descriptor(frame, false) | NG,
+        );
+    }
+    select_space(&mut machine, 0, 1);
+    machine
+}
+
+/// Select address space `space` with ASID `asid`.
+fn select_space(machine: &mut Machine<FakeHost, NoDevices>, space: usize, asid: u64) {
+    let [l1, _, _] = SPACES_TABLES[space];
+    machine.cpu.state.x[0] = (BASE + l1) | asid << 48;
+    machine.system_instruction(MSR_TTBR0_EL1_X0).unwrap();
+}
+
+/// Fetch the block of page `page` of BASE.
+fn fetch_page(machine: &mut Machine<FakeHost, NoDevices>, page: u64) {
+    assert!(matches!(
+        machine.fetch_block(BASE + page * 0x1000, false),
+        Ok(Fetched::Block(_))
+    ));
+}
+
+/// Which of the first `pages` pages of BASE the ITLB holds now.
+fn held_pages(machine: &Machine<FakeHost, NoDevices>, pages: u64) -> Vec<bool> {
+    (0..pages)
+        .map(|page| machine.current_key(BASE + page * 0x1000).is_some())
+        .collect()
+}
+
+/// Only fetches' takes go in the fill log: a page a refill took after a
+/// TLBI of everything is walked again after the next only when an engine
+/// fetch reached it since, or while it was refilled fewer times in a row
+/// unreached than the limit (one unless set). Each refilled entry a fetch
+/// reaches counts as hit, each that none reached before its context went
+/// as unhit, and each refill that walked pages as a batch. Logged instead,
+/// every refilled page was walked again after every TLBI, used or not.
+#[test]
+fn a_refilled_page_no_fetch_reaches_is_walked_again_only_within_its_limit() {
+    use mmu::tlbi::{Everywhere, Reach};
+    const PAGES: u64 = 4;
+    let sources = |machine: &Machine<FakeHost, NoDevices>, source: ItlbSource| {
+        machine.statistics.itlb_sources[source as usize]
+    };
+    let all = |machine: &mut Machine<FakeHost, NoDevices>| {
+        machine.tlb_maintained(Reach::All, Everywhere::All, None)
+    };
+    for unhit in [1, 2] {
+        let mut machine = private_pages(PAGES);
+        machine.set_refill_limits(REFILLS_PER_CONTEXT, unhit);
+        for page in 0..PAGES {
+            fetch_page(&mut machine, page);
+        }
+        all(&mut machine);
+        // Page 0's fetch walks every page again and reaches its own; the
+        // fetch of page 1 reaches page 1's.
+        fetch_page(&mut machine, 0);
+        assert_eq!(held_pages(&machine, PAGES), [true; 4], "unhit {unhit}");
+        assert_eq!(sources(&machine, ItlbSource::Refilled), PAGES);
+        assert_eq!(sources(&machine, ItlbSource::RefillBatches), 1);
+        fetch_page(&mut machine, 1);
+        assert_eq!(sources(&machine, ItlbSource::RefillHits), 2);
+        assert_eq!(machine.refill_marks.len(), 2, "pages 2 and 3 unreached");
+        all(&mut machine);
+        assert_eq!(sources(&machine, ItlbSource::RefillUnhit), 2);
+        assert!(machine.refill_marks.is_empty());
+        fetch_page(&mut machine, 0);
+        fetch_page(&mut machine, 1);
+        let again = match unhit {
+            1 => [true, true, false, false],
+            _ => [true; 4],
+        };
+        assert_eq!(held_pages(&machine, PAGES), again, "unhit {unhit}");
+        // Refilled twice in a row unreached, pages 2 and 3 wait for a fetch
+        // at any limit of two.
+        all(&mut machine);
+        fetch_page(&mut machine, 0);
+        assert_eq!(
+            held_pages(&machine, PAGES),
+            [true, true, false, false],
+            "unhit {unhit}"
+        );
+        // A fetch takes page 3 again, and the next TLBI's refill walks it.
+        fetch_page(&mut machine, 3);
+        all(&mut machine);
+        fetch_page(&mut machine, 0);
+        assert!(held_pages(&machine, PAGES)[3]);
+    }
+}
+
+/// XNU flushes everything at a switch between processes of different shared
+/// regions. The list the switch away from a process left stays through the
+/// flush of the next switch, so the switch back walks that process's pages
+/// again at once (and counts the list as kept); each page is walked in the
+/// tables as they are then, so one unmapped meanwhile is not taken and its
+/// fetch faults. A list held through more TLBIs than [`PENDING_FLUSHES`]
+/// goes, and a half keeps at most [`PENDING_LISTS`].
+#[test]
+fn a_process_finds_its_refills_after_another_process_flushed() {
+    use mmu::tlbi::{Everywhere, Reach};
+    const NG: u64 = 1 << 11;
+    const PAGES: u64 = 4;
+    let all = |machine: &mut Machine<FakeHost, NoDevices>| {
+        machine.tlb_maintained(Reach::All, Everywhere::All, None)
+    };
+    let lists = |machine: &Machine<FakeHost, NoDevices>| {
+        machine
+            .pending_refills
+            .keys()
+            .filter(|(half, _)| *half == 0)
+            .count()
+    };
+    let mut machine = private_pages(PAGES);
+    for page in 0..PAGES {
+        fetch_page(&mut machine, page);
+    }
+    // To process B (space 1, ASID 2), flushing; B runs its page 0.
+    all(&mut machine);
+    paged_space(&mut machine, 1, &[BASE]);
+    let [_, _, l3_other] = SPACES_TABLES[1];
+    write_entry(&mut machine, l3_other, page_descriptor(BASE, false) | NG);
+    select_space(&mut machine, 1, 2);
+    fetch_page(&mut machine, 0);
+    // Meanwhile A's page 3 is unmapped. Back to A, flushing.
+    let [_, _, l3] = SPACES_TABLES[0];
+    write_entry(&mut machine, l3 + 3 * 8, 0);
+    all(&mut machine);
+    select_space(&mut machine, 0, 1);
+    fetch_page(&mut machine, 0);
+    assert_eq!(
+        held_pages(&machine, PAGES),
+        [true, true, true, false],
+        "A's pages from its kept list, walked again"
+    );
+    assert_eq!(
+        machine.statistics.itlb_sources[ItlbSource::RefillKept as usize],
+        1
+    );
+    assert!(matches!(
+        machine.fetch_block(BASE + 3 * 0x1000, false),
+        Ok(Fetched::Exception(_))
+    ));
+    // B's list outlives PENDING_FLUSHES TLBIs untaken, then goes.
+    assert_eq!(lists(&machine), 1, "B's");
+    for _ in 0..PENDING_FLUSHES {
+        all(&mut machine);
+        fetch_page(&mut machine, 0);
+    }
+    let b = |machine: &Machine<FakeHost, NoDevices>| {
+        machine
+            .pending_refills
+            .keys()
+            .any(|(half, key)| *half == 0 && key.ttbr0 >> 48 == 2)
+    };
+    assert!(b(&machine), "kept through {PENDING_FLUSHES}");
+    all(&mut machine);
+    assert!(!b(&machine), "gone after {PENDING_FLUSHES}");
+    // Processes past PENDING_LISTS between two TLBIs: the half keeps that
+    // many lists.
+    for asid in 10..10 + 2 * PENDING_LISTS as u64 {
+        select_space(&mut machine, 0, asid);
+        fetch_page(&mut machine, 0);
+    }
+    all(&mut machine);
+    assert_eq!(lists(&machine), PENDING_LISTS);
+    assert!(
+        machine
+            .pending_refills
+            .values()
+            .all(|pending| pending.pages.len() <= REFILLS_PER_CONTEXT)
+    );
+}

@@ -107,6 +107,9 @@ pub(crate) struct Settings {
     /// `--share-aliases` ([`stela_boot_core::options::System::share_aliases`]),
     /// as on the home machine.
     pub share_aliases: bool,
+    /// `--refill-cap` ([`stela_boot_core::options::System::refill_cap`]),
+    /// as on the home machine.
+    pub refill_cap: Option<usize>,
     /// `--hle` and `--hle-off`: the functions native routines replace, as
     /// on the home machine.
     pub hle: stela_engine::hle::Config,
@@ -146,6 +149,7 @@ pub(crate) fn spawn<H: Host>(
             amx_model: settings.amx_model,
             tlbi_keep: settings.tlbi_keep,
             share_aliases: settings.share_aliases,
+            refill_cap: settings.refill_cap,
             hle: settings.hle.clone(),
             tier2: settings.tier2,
         };
@@ -173,6 +177,7 @@ struct Pe {
     amx_model: u32,
     tlbi_keep: (bool, bool),
     share_aliases: bool,
+    refill_cap: Option<usize>,
     hle: stela_engine::hle::Config,
     tier2: Option<stela_engine::machine::engine::tier2::Tier2Options>,
 }
@@ -190,6 +195,7 @@ impl Pe {
             amx_model,
             tlbi_keep,
             share_aliases,
+            refill_cap,
             hle,
             tier2,
         } = self;
@@ -217,6 +223,10 @@ impl Pe {
         machine.set_amx_model(amx_model);
         machine.set_tlbi_keep(tlbi_keep.0, tlbi_keep.1);
         machine.set_share_aliases(share_aliases);
+        if let Some(pages) = refill_cap {
+            let (_, unhit) = machine.refill_limits();
+            machine.set_refill_limits(pages, unhit);
+        }
         machine.set_hle(hle);
         machine.set_tier2(tier2);
         if step_timing {

@@ -1334,6 +1334,14 @@ fn run_machine<H: Host>(
              correct engine\n"
         ));
     }
+    if let Some(pages) = options.refill_cap() {
+        let (_, unhit) = machine.refill_limits();
+        machine.set_refill_limits(pages, unhit);
+        output::arguments(format_args!(
+            "REFILL CAP {pages} (--refill-cap): a TLBI of everything walks again at most \
+             {pages} pages of each forgotten context's key\n"
+        ));
+    }
     let hle = stela_engine::hle::Config::boot(options.hle, &options.hle_off);
     if options.hle {
         output::arguments(format_args!("HLE {}\n", hle.describe(&options.hle_off)));

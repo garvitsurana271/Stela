@@ -11,14 +11,17 @@ pub use boundary::{
     OwnLockRegisters, PassiveRegisters, PlainRead, ScalarRead, Settled, Start, UnlockedDma,
     WriteSettled,
 };
-use compilation::{PENDING_EXITS, PendingExits};
+use compilation::{PENDING_EXITS, PendingExits, PendingRefill, RefillLimits};
+#[cfg(test)]
+use compilation::{PENDING_FLUSHES, PENDING_LISTS, REFILLS_PER_CONTEXT};
 use mirrors::*;
 use reports::*;
 pub use reports::{
-    DeviceRegister, Discard, Event, ExitWordsWalk, Footprint, FootprintWalk, MAIL_WAITS, MailWait,
-    Occupancy, PeState, Requirement, RequirementKind, Reset, Statistics, Stop, Surveyed,
-    Suspension, TLBI_KEEP_SAMPLES, TRACE_HITS, TlbiKeepCounts, TraceHit, WATCH_HITS,
-    WHOLE_TLBI_SAMPLE_EVERY, WHOLE_TLBI_SAMPLES, WatchHit, WholeTlbiSites, WholeTlbiTrigger,
+    DeviceRegister, Discard, Event, ExitWordsWalk, Footprint, FootprintWalk, ITLB_REFILL_BATCHES,
+    ITLB_REFILLED, MAIL_WAITS, MailWait, Occupancy, PeState, Requirement, RequirementKind, Reset,
+    Statistics, Stop, Surveyed, Suspension, TLBI_KEEP_SAMPLES, TRACE_HITS, TlbiKeepCounts,
+    TraceHit, WATCH_HITS, WHOLE_TLBI_SAMPLE_EVERY, WHOLE_TLBI_SAMPLES, WatchHit, WholeTlbiSites,
+    WholeTlbiTrigger,
 };
 mod amx;
 pub use amx::{AmxCell, AmxCounts, AmxForms, FORMS};
@@ -1029,8 +1032,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// the bits it has set.
     itlb_seen: Vec<u64>,
     itlb_seen_bits: usize,
-    /// The last [`FILL_LOG`] pages the ITLB took, each with its context,
-    /// in a ring ([`Self::refill_after`]), and the next place.
+    /// The last [`FILL_LOG`] pages fetches took into the ITLB or reached
+    /// there after a refill took them, each with its context, in a ring
+    /// ([`Self::refill_after`]), and the next place.
     fill_log: Vec<(u64, u64)>,
     fill_next: usize,
     /// TTBR0_EL1 at this PE's last TLBI of everything, and how many it
@@ -1046,9 +1050,18 @@ pub struct Machine<H: Host, D: Devices> {
     /// The pages forgotten contexts had taken last, by half and key: a
     /// context made anew for the key walks them again at once
     /// ([`Self::refill_pages`]).
-    pending_refills: BTreeMap<(usize, contexts::Key), Vec<u64>>,
-    /// The pages the contexts just made walk again before the fetch goes on.
+    pending_refills: BTreeMap<(usize, contexts::Key), PendingRefill>,
+    /// The pages the contexts just made walk again before the fetch goes
+    /// on, each with its refills in a row unreached in its low bits.
     refills: Vec<u64>,
+    /// The ITLB entries refills took that no fetch has reached since, by
+    /// context and page, with the refills in a row that none reached
+    /// (`Machine::note_refill_hit`), and a bit per ITLB set holding one.
+    refill_marks: BTreeMap<(u64, u64), u8>,
+    refill_mark_sets: Vec<u64>,
+    /// What a TLBI of everything leaves to walk again
+    /// ([`Self::set_refill_limits`]).
+    refill_limits: RefillLimits,
     /// The pages TLBIs by VA dropped of each live context, by its number:
     /// the next fetch in the context walks them again
     /// ([`Self::refill_dropped`]).
@@ -1566,6 +1579,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             share: share_aliases::Share::default(),
             pending_refills: BTreeMap::new(),
             refills: Vec::new(),
+            refill_marks: BTreeMap::new(),
+            refill_mark_sets: Vec::new(),
+            refill_limits: RefillLimits::default(),
             dropped_refills: BTreeMap::new(),
             mail_returned: 0,
             applying_mail: false,

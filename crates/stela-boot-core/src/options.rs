@@ -407,6 +407,15 @@ pub const TLBI_VERIFY_CHECK: &str = "--tlbi-verify-check";
 /// 13; it stays off by default until a boot has proven it.
 pub const SHARE_ALIASES: &str = "--share-aliases";
 
+/// The most pages a TLBI of everything leaves to walk again for each
+/// forgotten context's key (`--refill-cap N`, 0 to [`REFILL_CAP_PAGES`],
+/// 2,048 unless given; 0 refills nothing): an A/B setting for the
+/// engine's refill after the guest's whole TLB flushes. A hand-written
+/// opt-in setup never writes, so the options revision stays 13.
+pub const REFILL_CAP: &str = "--refill-cap";
+/// [`REFILL_CAP`]'s bound: the engine's fill log.
+pub const REFILL_CAP_PAGES: usize = 8192;
+
 /// A read-only bring-up boot (`--core-trial`): runs a prepared `--bundle`
 /// from the USB on an explicit `--native-cores` count, its disks backed by
 /// engine memory (`--storage-ram`), so nothing it does persists. It is for
@@ -790,6 +799,9 @@ pub struct System {
     /// [`SHARE_ALIASES`]'s value, unset where the line has none
     /// ([`Self::share_aliases`]).
     pub share_aliases: Option<bool>,
+    /// [`REFILL_CAP`]'s pages, unset where the line has none
+    /// ([`Self::refill_cap`]).
+    pub refill_cap: Option<usize>,
     /// A read-only bring-up boot ([`CORE_TRIAL`]).
     pub core_trial: bool,
     /// Run tier 2 ([`TIER2`]): `Some(true)` for `on`, `Some(false)` for
@@ -950,6 +962,7 @@ impl Default for System {
             tlbi_keep: None,
             tlbi_verify_check: false,
             share_aliases: None,
+            refill_cap: None,
             core_trial: false,
             tier2: None,
             tier2_check: false,
@@ -1175,6 +1188,12 @@ impl System {
     /// code ([`SHARE_ALIASES`]): off unless `--share-aliases on`.
     pub fn share_aliases(&self) -> bool {
         self.share_aliases.unwrap_or(false)
+    }
+
+    /// The pages a TLBI of everything leaves to walk again a key
+    /// ([`REFILL_CAP`]), where the line sets them.
+    pub fn refill_cap(&self) -> Option<usize> {
+        self.refill_cap
     }
 
     /// The GPU links' power management: `--gpu-aspm`, else
@@ -1588,6 +1607,7 @@ impl fmt::Display for System {
             SHARE_ALIASES,
             self.share_aliases.map(|on| if on { "on" } else { "off" }),
         )?;
+        line.value(REFILL_CAP, self.refill_cap)?;
         line.flag(CORE_TRIAL, self.core_trial)?;
         line.value(TIER2, self.tier2.map(|on| if on { "on" } else { "off" }))?;
         line.flag(TIER2_CHECK, self.tier2_check)?;

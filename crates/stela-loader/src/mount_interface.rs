@@ -74,6 +74,9 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// So does the fork's `--share-aliases on|off`, a hand-written opt-in that
 /// runs one translation at every virtual alias of its physical code: no
 /// line setup writes holds it.
+/// So does the fork's `--refill-cap N`, a hand-written A/B setting of the
+/// pages the engine walks again after a guest's TLBI of everything: no
+/// line setup writes holds it.
 pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.

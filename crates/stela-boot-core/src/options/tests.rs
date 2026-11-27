@@ -115,6 +115,32 @@ fn an_asus_laptop_runs_in_performance_unless_asus_mode_says_otherwise() {
 }
 
 #[test]
+fn the_refill_cap_is_the_engines_unless_given() {
+    assert_eq!(System::parse("--system").unwrap().refill_cap(), None);
+    for (text, pages) in [
+        ("--system --refill-cap 0", 0),
+        ("--system --refill-cap 512", 512),
+        ("--system --refill-cap 8192", 8192),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.refill_cap(), Some(pages), "{text}");
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --refill-cap", Error::RefillCap),
+        ("--system --refill-cap 8193", Error::RefillCap),
+        ("--system --refill-cap -1", Error::RefillCap),
+        ("--system --refill-cap many", Error::RefillCap),
+        (
+            "--system --refill-cap 1 --refill-cap 2",
+            Error::DuplicateRefillCap,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
+#[test]
 fn sharing_aliases_is_off_unless_asked_for() {
     let plain = System::parse("--system").unwrap();
     assert!(!plain.share_aliases());

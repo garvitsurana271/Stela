@@ -224,8 +224,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.mirrors.transitions.contexts_moved();
         }
         self.statistics.itlb_sources[ItlbSource::Made as usize] += 1;
-        if let Some(pages) = self.pending_refills.remove(&(half, key)) {
-            self.refills.extend(pages);
+        if let Some(pending) = self.pending_refills.remove(&(half, key)) {
+            // A list a TLBI of everything since kept for its key.
+            if pending.flushes != 0 {
+                self.statistics.itlb_sources[ItlbSource::RefillKept as usize] += 1;
+            }
+            self.refills.extend(pending.pages);
         }
         number
     }

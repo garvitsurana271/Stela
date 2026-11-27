@@ -1479,6 +1479,7 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         amx_model: options.amx_model().0,
         tlbi_keep: options.tlbi_keep(),
         share_aliases: options.share_aliases(),
+        refill_cap: options.refill_cap(),
         hle: stela_engine::hle::Config::boot(options.hle, &options.hle_off),
         tier2: super::tier2_options(options),
     };

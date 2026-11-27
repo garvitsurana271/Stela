@@ -499,7 +499,13 @@ const _: () = assert!(ItlbMiss::Cold as usize + 1 == ItlbMiss::COUNT);
 /// - pages taken with another page of their leaf, by its walk
 ///   (`Machine::take_leaf_pages`);
 /// - lower-half pages taken in the context every address space shares, as
-///   their walk ended in a global leaf (`Machine::itlb_context`).
+///   their walk ended in a global leaf (`Machine::itlb_context`);
+/// - refilled entries an engine fetch reached later, and those none reached
+///   before their context went (`Machine::note_refill_hit`; a probe in
+///   native code is no engine fetch);
+/// - refills that walked pages again (refilled per batch: `refilled` over
+///   this), and lists a TLBI of everything kept that a context of their
+///   key took after (`Machine::refill_after`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ItlbSource {
     FillsLower,
@@ -519,13 +525,22 @@ pub(super) enum ItlbSource {
     DropGlobal,
     LeafFills,
     SharedFills,
+    RefillHits,
+    RefillUnhit,
+    RefillBatches,
+    RefillKept,
 }
 
 impl ItlbSource {
-    pub(super) const COUNT: usize = 17;
+    pub(super) const COUNT: usize = 21;
 }
 
-const _: () = assert!(ItlbSource::SharedFills as usize + 1 == ItlbSource::COUNT);
+const _: () = assert!(ItlbSource::RefillKept as usize + 1 == ItlbSource::COUNT);
+
+/// The places in [`Statistics::itlb_sources`] of the pages refills walked
+/// again and of the refills that walked any: the profile's pages a refill.
+pub const ITLB_REFILLED: usize = ItlbSource::Refilled as usize;
+pub const ITLB_REFILL_BATCHES: usize = ItlbSource::RefillBatches as usize;
 // A fill counts at `FillsLower` plus its half.
 const _: () = assert!(ItlbSource::FillsUpper as usize == ItlbSource::FillsLower as usize + 1);
 

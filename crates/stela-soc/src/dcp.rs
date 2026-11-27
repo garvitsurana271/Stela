@@ -33,6 +33,7 @@ pub mod afk;
 pub mod avipc;
 pub mod compose;
 pub mod gpu;
+pub mod host_cursor;
 pub mod iomfb;
 pub mod link;
 pub mod modes;
@@ -542,6 +543,12 @@ impl Coprocessor {
         self.link.borrow().retained_idle()
             && !self.frame_pending()
             && self.afk.iter().all(|afk| afk.borrow().retained_idle())
+    }
+
+    /// `--host-cursor on`: show the guest's pointer where `shared`'s is
+    /// ([`host_cursor`]).
+    pub fn set_host_cursor(&mut self, shared: &'static host_cursor::Shared) {
+        self.link.borrow_mut().service_mut().set_host_cursor(shared);
     }
 
     /// Choose per-swap tracing or bounded presentation reports.

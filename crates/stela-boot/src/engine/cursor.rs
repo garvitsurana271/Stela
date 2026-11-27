@@ -11,6 +11,11 @@
 //! a touchpad's motion, or, with `--trackpad`, a touch frame whose one
 //! finger moved: the guest's trackpad moves its pointer by one finger's
 //! travel.
+//!
+//! With `--host-cursor on` the report has a `HOST CURSOR` line too: the
+//! host's pointer against the guest's ([`host_cursor`]). A moved present
+//! then counts the pointer shown where the host's is, as the guest's own
+//! placements no longer move it while the hotspot holds.
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -113,6 +118,10 @@ impl Cursor {
                 millis(now.saturating_sub(pending))
             },
         );
+        let line = match host_cursor(wall, tsc_hz) {
+            Some(host) => line + &host,
+            None => line,
+        };
         *self = Self {
             seen: self.seen,
             since: now,
@@ -123,4 +132,39 @@ impl Cursor {
         };
         line
     }
+}
+
+/// With `--host-cursor on`, the host cursor's line over the `wall` TSC
+/// ticks of the window: positions given the guest, presents that moved the
+/// pointer to the host's position with no swap, and the guest's own
+/// placements, each a wall second; how far the guest's pointer stood from
+/// the host's at its placements while the hotspot held; and the hotspot.
+fn host_cursor(wall: u64, tsc_hz: u128) -> Option<String> {
+    let shared = &stela_soc::dcp::host_cursor::HOST_CURSOR;
+    if !shared.on() {
+        return None;
+    }
+    let counts = shared.take();
+    let rate = |count: u64| {
+        let per_ten = u128::from(count) * 10 * tsc_hz / u128::from(wall);
+        alloc::format!("{}.{}", per_ten / 10, per_ten % 10)
+    };
+    Some(alloc::format!(
+        "HOST CURSOR given_per_second={} drawn_per_second={} guest_moves_per_second={} \
+         divergence_px={}/{} samples={} locked={} hotspot={},{} locks={} unlocks={} shapes={} \
+         warps={}\n",
+        rate(counts.given),
+        rate(counts.drawn),
+        rate(counts.guest_moves),
+        counts.diverged_total / counts.diverged_samples.max(1),
+        counts.diverged_most,
+        counts.diverged_samples,
+        if counts.locked { "yes" } else { "no" },
+        counts.hotspot.0,
+        counts.hotspot.1,
+        counts.locks,
+        counts.unlocks,
+        counts.shapes,
+        counts.warps,
+    ))
 }

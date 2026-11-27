@@ -332,7 +332,7 @@ impl Service {
             {
                 input_turn.usb_done = host::rdtsc();
             }
-            let inputs = input.read(
+            let mut inputs = input.read(
                 step,
                 #[cfg(feature = "diagnostics")]
                 &mut input_turn,
@@ -342,6 +342,7 @@ impl Service {
                 input_turn.read_done = host::rdtsc();
                 input_turn.reports = inputs.len();
             }
+            input.host_cursor(&mut inputs, host::rdtsc(), *tsc_hz);
             super::cursor::inputs(&inputs, host::rdtsc());
             if !inputs.is_empty() {
                 devices.serve(|devices| {

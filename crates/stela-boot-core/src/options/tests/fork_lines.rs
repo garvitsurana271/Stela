@@ -99,7 +99,7 @@ fn on(option: &str) -> bool {
     value(option) == "on"
 }
 
-fn forks() -> [Fork; 12] {
+fn forks() -> [Fork; 13] {
     [
         Fork {
             valid: &["--acpi-hardware"],
@@ -215,6 +215,16 @@ fn forks() -> [Fork; 12] {
             ],
             duplicate: Some(Error::DuplicatePackPreload),
         },
+        Fork {
+            valid: &["--host-cursor on", "--host-cursor off"],
+            set: |o, t| o.host_cursor = Some(on(t)),
+            bad: &[
+                ("--host-cursor", Error::HostCursor),
+                ("--host-cursor yes", Error::HostCursor),
+                ("--host-cursor ON", Error::HostCursor),
+            ],
+            duplicate: Some(Error::DuplicateHostCursor),
+        },
     ]
 }
 
@@ -263,6 +273,7 @@ fn setup_lines_and_the_stick_s_choices_mean_what_they_meant() {
         assert!(!options.core_trial);
         assert!(options.tier2.is_none() && !options.tier2_check && !options.tier2_runs());
         assert!(options.pack_preload.is_none() && !options.pack_preload());
+        assert!(options.host_cursor.is_none() && !options.host_cursor());
     }
 }
 

@@ -1376,6 +1376,25 @@ fn run_machine<H: Host>(
             "DISPLAY TRACE enabled: per-swap DCP reports\n"
         ));
     }
+    if options.host_cursor() {
+        if options.guest_trackpad().is_some() {
+            output::arguments(format_args!(
+                "HOST CURSOR off: --trackpad's touch frames move the guest's own pointer, \
+                 which the host cannot follow\n"
+            ));
+        } else {
+            let shared = &stela_soc::dcp::host_cursor::HOST_CURSOR;
+            shared.enable();
+            machine
+                .devices
+                .with(|devices| devices.set_display_host_cursor(shared));
+            output::arguments(format_args!(
+                "HOST CURSOR on: mouse motion is accelerated on the host and given to the \
+                 guest's absolute pointer; the display shows the pointer at the host's position \
+                 at each vblank once it has learned the hotspot\n"
+            ));
+        }
+    }
     machine.set_monitor_tracing(options.monitor_trace);
     if options.monitor_trace {
         output::arguments(format_args!(

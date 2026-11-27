@@ -429,6 +429,15 @@ pub const TIER2_CHECK: &str = "--tier2-check";
 /// writes, so the options revision stays 13.
 pub const PACK_PRELOAD: &str = "--pack-preload";
 
+/// Shows the guest's pointer where the host's is, at the display's rate
+/// (`--host-cursor on|off`, off unless given): a mouse's motion is
+/// accelerated on the host into the guest's absolute pointer, and the
+/// display moves the pointer's layer at each vblank, whatever macOS's own
+/// frame rate (`stela_soc::dcp::host_cursor`). Not with `--trackpad`,
+/// whose touch frames move the guest's pointer itself. A hand-written
+/// opt-in setup never writes, so the options revision stays 13.
+pub const HOST_CURSOR: &str = "--host-cursor";
+
 /// Cables an emulated Magic Trackpad 2 fed by the host's precision
 /// touchpads (`--trackpad mt2|builtin`): a hand-written opt-in, in a
 /// startup choice of its own, that setup never writes (so the options
@@ -780,6 +789,9 @@ pub struct System {
     /// Preload the translation pack in the background ([`PACK_PRELOAD`]):
     /// `None` unless given, which does not preload ([`Self::pack_preload`]).
     pub pack_preload: Option<bool>,
+    /// Show the pointer at the host's position ([`HOST_CURSOR`]): `None`
+    /// unless given, which leaves it off ([`Self::host_cursor`]).
+    pub host_cursor: Option<bool>,
     /// Whether a laptop takes its laptop features unasked ([`LAPTOP`]);
     /// [`Laptop::Auto`] unless given ([`Self::laptop`]).
     pub laptop: Option<Laptop>,
@@ -930,6 +942,7 @@ impl Default for System {
             tier2: None,
             tier2_check: false,
             pack_preload: None,
+            host_cursor: None,
             laptop: None,
             asus_mode: None,
             gpu_aspm: None,
@@ -1159,6 +1172,14 @@ impl System {
     /// saved, since compile was 1-4% of PE time (boots 29-30, 2026-11-23).
     pub fn pack_preload(&self) -> bool {
         self.pack_preload == Some(true)
+    }
+
+    /// Whether the pointer is shown at the host's position: only with
+    /// `--host-cursor on`. Off by default until a boot on hardware has
+    /// confirmed the guest's absolute pointer lands where the host shows
+    /// it.
+    pub fn host_cursor(&self) -> bool {
+        self.host_cursor == Some(true)
     }
 
     /// Whether tier 2 runs: `--tier2 on`, or `--tier2-check`.
@@ -1551,6 +1572,10 @@ impl fmt::Display for System {
         line.value(
             PACK_PRELOAD,
             self.pack_preload.map(|on| if on { "on" } else { "off" }),
+        )?;
+        line.value(
+            HOST_CURSOR,
+            self.host_cursor.map(|on| if on { "on" } else { "off" }),
         )?;
         line.value(LAPTOP, self.laptop.map(Laptop::name))?;
         line.value(ASUS_MODE, self.asus_mode.map(AsusMode::name))?;

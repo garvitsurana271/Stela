@@ -20,15 +20,15 @@
 //! device (the stick moved to another PC) or another build (a newer fix to
 //! try) is passed over and the GuC is tried again. `--i915-guc off` turns
 //! the GuC off by hand and `--i915-guc on` asks for it, the record still
-//! followed; `--i915-guc auto`, the default, is off on Alder Lake P and
-//! Raptor Lake P or U in this test build ([`off_by_default`]) and follows
-//! the record elsewhere.
+//! followed; `--i915-guc auto`, the default, follows the record: test 4
+//! starts Alder Lake P and Raptor Lake P or U with the GuC again
+//! ([`off_by_default`]).
 use alloc::{format, string::String};
 
 /// What each record line starts with, after the log's time stamp.
 pub const RECORD: &str = "INTEL GUC RECORD ";
 /// The build whose records this one follows.
-pub const BUILD: &str = "dev64-2";
+pub const BUILD: &str = "test4";
 /// The marker line each boot's log starts with.
 const BOOT: &str = "=== STELA BOOT ";
 
@@ -75,12 +75,16 @@ pub fn falls_back(platform: &str) -> bool {
 }
 
 /// Whether this test build starts the platform without its GuC unless
-/// `--i915-guc on` asks for it: Alder Lake P, whose table holds Raptor Lake
-/// P and U (dev64's a7a0, Ashu's a7ab) and Alder Lake N. Their GuC started
-/// in dev64-1, and each of Mesa's submissions still failed, so this build
-/// tests execlists in one boot.
-pub fn off_by_default(platform: &str) -> bool {
-    platform == "ALDERLAKE_P"
+/// `--i915-guc on` asks for it: none in test 4. dev64-2 and test 3 started
+/// Alder Lake P (Raptor Lake P and U, Alder Lake N) without it, as each of
+/// Mesa's submissions had failed with -ENOMEM under the GuC in dev64-1, a
+/// failure Linux patch 0237 removed in the same build. Under execlists
+/// both Alder Lake P testers' boots (dev64's a7a0, MGKFN's 46a8) then lost
+/// the GPU to an engine reset after minutes of the desktop, so test 4 tries
+/// the GuC, whose SLPC sets the GPU's frequency, again; a GuC failure still
+/// makes the next start go without it.
+pub fn off_by_default(_platform: &str) -> bool {
+    false
 }
 
 /// How a boot's GuC failed.

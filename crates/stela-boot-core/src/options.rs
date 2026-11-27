@@ -408,9 +408,8 @@ pub const TLBI_KEEP: &str = "--tlbi-keep";
 /// Whether i915 starts an Intel GPU with its GuC (`--i915-guc auto|off|on`,
 /// auto unless given): `off` starts i915 with `i915.enable_guc=0`
 /// (execlists); `on` runs GuC submission unless the earlier boot recorded
-/// this GPU's GuC failing, when it starts without it; `auto` is `off` on
-/// Alder Lake P and Raptor Lake P or U in this test build and `on` elsewhere
-/// ([`crate::intel_guc`]). A hand-written override for debugging that setup
+/// this GPU's GuC failing, when it starts without it; `auto`, in test 4, is
+/// `on` on every platform, the record still followed ([`crate::intel_guc`]). A hand-written override for debugging that setup
 /// never writes, so the options revision stays 13.
 pub const I915_GUC: &str = "--i915-guc";
 

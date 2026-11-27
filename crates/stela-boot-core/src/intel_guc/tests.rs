@@ -48,7 +48,7 @@ fn a_record_round_trips_through_its_line() {
     }
     assert_eq!(
         failed(0xa7a0, Cause::Init(-11)).line(),
-        "INTEL GUC RECORD failed device=a7a0 cause=init-11 build=dev64-2\n"
+        "INTEL GUC RECORD failed device=a7a0 cause=init-11 build=test4\n"
     );
 }
 
@@ -129,35 +129,30 @@ fn the_mode_follows_the_setting_then_the_record_of_this_device() {
 }
 
 #[test]
-fn alder_and_raptor_lake_p_start_without_the_guc_unless_it_is_asked_for() {
+fn alder_and_raptor_lake_p_start_with_the_guc_in_test_4_and_fall_back_after_a_failure() {
     let p = "ALDERLAKE_P";
-    assert!(off_by_default(p) && falls_back(p));
+    assert!(!off_by_default(p) && falls_back(p));
     for platform in ["ALDERLAKE_S", "DG1", "TIGERLAKE", "DG2", "METEORLAKE"] {
         assert!(!off_by_default(platform), "{platform}");
     }
     let record = Some(failed(0xa7a0, Cause::Metal));
-    for device in [0xa7a0, 0xa7ab] {
-        // The default, with or without a record: execlists in one boot.
-        assert_eq!(
-            Mode::decide(Setting::Auto, None, device, p),
-            Mode::OffByDefault
-        );
-        assert_eq!(
-            Mode::decide(Setting::Auto, record, device, p),
-            Mode::OffByDefault
-        );
+    for device in [0xa7a0, 0xa7ab, 0x46a8] {
+        assert_eq!(Mode::decide(Setting::Auto, None, device, p), Mode::Guc);
         assert_eq!(Mode::decide(Setting::Off, None, device, p), Mode::OffByHand);
         assert_eq!(Mode::decide(Setting::On, None, device, p), Mode::Guc);
     }
-    // --i915-guc on still falls back the boot after its GuC failed.
-    assert_eq!(
-        Mode::decide(Setting::On, record, 0xa7a0, p),
-        Mode::Fallback(Cause::Metal)
-    );
-    assert_eq!(Mode::decide(Setting::On, record, 0xa7ab, p), Mode::Guc);
+    // The boot after this device's GuC failed goes without it, asked or not.
+    for setting in [Setting::Auto, Setting::On] {
+        assert_eq!(
+            Mode::decide(setting, record, 0xa7a0, p),
+            Mode::Fallback(Cause::Metal)
+        );
+        assert_eq!(Mode::decide(setting, record, 0xa7ab, p), Mode::Guc);
+    }
+    assert_eq!(Mode::decide(Setting::Off, record, 0xa7a0, p), Mode::OffByHand);
     let line = Mode::OffByDefault.line(0xa7a0, None);
     assert!(
-        line.starts_with("INTEL GUC off (dev64-2): ") && line.contains("--i915-guc on"),
+        line.starts_with("INTEL GUC off (test4): ") && line.contains("--i915-guc on"),
         "{line}"
     );
     assert_eq!(line.matches('\n').count(), 1);
@@ -204,7 +199,7 @@ fn each_mode_says_itself_in_one_line() {
     let fallback = Mode::Fallback(Cause::Init(-11)).line(0xa7a0, None);
     assert!(
         fallback.starts_with(
-            "INTEL GUC fallback (dev64-2): GuC failed last boot (its start failed (-11)), \
+            "INTEL GUC fallback (test4): GuC failed last boot (its start failed (-11)), \
              starting i915 on a7a0 without GuC"
         ),
         "{fallback}"
@@ -215,7 +210,7 @@ fn each_mode_says_itself_in_one_line() {
             .contains("--i915-guc off")
     );
     let on = Mode::Guc.line(0xa7ab, Some(failed(0xa7a0, Cause::Wedged)));
-    assert!(on.starts_with("INTEL GUC on (dev64-2)") && on.contains("another PC's"));
+    assert!(on.starts_with("INTEL GUC on (test4)") && on.contains("another PC's"));
     for line in [fallback, on] {
         assert_eq!(line.matches('\n').count(), 1);
     }

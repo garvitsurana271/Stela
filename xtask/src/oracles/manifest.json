@@ -5079,6 +5079,38 @@
   },
   {
     "package": "stela-engine",
+    "test": "tlbi_keep_cost",
+    "source": "crates/stela-engine/src/machine/engine/tests/tlbi_keep_cost.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of kept TLBI contexts against whole TLBIs; run by hand in release; run on request"
+  },
+  {
+    "package": "stela-engine",
+    "test": "tier2_against_tier1_in_ticks_per_instruction",
+    "source": "crates/stela-engine/tests/tier2_bench.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host benchmark of tier 2 against tier 1 in ticks per instruction; run in release on request"
+  },
+  {
+    "package": "stela-loader",
+    "test": "original_mac_mini_m2_admission_is_unchanged_by_the_t602x_rows",
+    "source": "crates/stela-loader/src/devices/tests.rs",
+    "kind": "oracle",
+    "inputs": ["STELA_TEST_M2_DT_DIR"],
+    "reason": "requires original Mac mini M2 and T602x DeviceTrees in STELA_TEST_M2_DT_DIR"
+  },
+  {
+    "package": "stela-loader",
+    "test": "original_t602x_boards_keep_their_external_pipe_and_memory_cache",
+    "source": "crates/stela-loader/src/devices/tests.rs",
+    "kind": "oracle",
+    "inputs": ["STELA_TEST_M2_DT_DIR"],
+    "reason": "requires original T602x DeviceTrees in STELA_TEST_M2_DT_DIR"
+  },
+  {
+    "package": "stela-engine",
     "test": "shared_path_scaling",
     "source": "crates/stela-engine/src/machine/engine/tests/sharing.rs",
     "kind": "manual",

@@ -237,7 +237,7 @@ fn measure(
 }
 
 #[test]
-#[ignore = "a benchmark: run with --ignored"]
+#[ignore = "manual: opt-in"]
 fn tier2_against_tier1_in_ticks_per_instruction() -> Result<()> {
     let data = Mapping::new()?;
     let code = Mapping::new()?;

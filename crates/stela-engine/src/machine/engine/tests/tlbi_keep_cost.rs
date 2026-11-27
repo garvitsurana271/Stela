@@ -202,7 +202,7 @@ fn tsc_per_ns() -> f64 {
 }
 
 #[test]
-#[ignore = "a host timing, run by hand"]
+#[ignore = "manual: opt-in"]
 fn tlbi_keep_cost() {
     let rounds = number("KEEP_ROUNDS", 200) as u64;
     let busy = number("KEEP_BUSY", 27) as u64;

@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Garvit Surana <251430630+garvitsurana271@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 07:54:03 +0000
+Subject: [PATCH] fix(i915): a kernel built with CONFIG_STELA says, in one
+ line, what a render engine ran when it was reset and how fast the GPU was
+ clocked, where a request that did not yield for the 7.5 s preemption timeout
+ was reset with nothing saying what it waited in
+
+On Gen12 render engines i915 takes CONFIG_DRM_I915_PREEMPT_TIMEOUT_COMPUTE,
+7500 ms, as the preemption timeout. dev64's a7a0 and MGKFN's 46a8 under
+execlists both lost their Metal device to "Resetting rcs0 for preemption
+time out" after minutes of the desktop, each about 7.5 s after an
+execbuf began to wait for ring space, with GPU latencies rising from
+milliseconds to hundreds of them before it. Neither log says what the
+engine was running.
+
+execlists_reset now says the engine's ACTHD, batch address, ring head and
+tail, IPEHR, IPEIR, INSTDONE, ESR and EIR, the active request with its
+priority, whether it started and how long since it was queued, the queue's
+priority, and the GPU's actual, requested, lowest and highest frequency
+and whether RPS runs. mark_guilty, which the GuC's resets reach too, says
+the guilty request's age and the GPU's clock.
+---
+ .../drm/i915/gt/intel_execlists_submission.c  | 44 +++++++++++++++++++
+ drivers/gpu/drm/i915/gt/intel_reset.c         | 13 ++++++
+ 2 files changed, 57 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+index e693b0c9d2a3e2ee0530b0cafbe39621038c0c20..2602921125d484105c78fdb820f5792feede93ef 100644
+--- a/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
++++ b/drivers/gpu/drm/i915/gt/intel_execlists_submission.c
+@@ -137,6 +137,7 @@
+ #include "intel_mocs.h"
+ #include "intel_reset.h"
+ #include "intel_ring.h"
++#include "intel_rps.h"
+ #include "intel_workarounds.h"
+ #include "shmem_utils.h"
+ 
+@@ -2383,6 +2384,46 @@ err_free:
+ 	kfree(cap);
+ }
+ 
++#if IS_ENABLED(CONFIG_STELA)
++/*
++ * What the engine ran when its reset was decided, in one line: where its
++ * command streamer stood (ACTHD, the batch address, the ring's head and
++ * tail), the instruction it parsed (IPEHR) and what of the pipeline was
++ * done (INSTDONE), its error registers, the active request and how long
++ * since it was queued, and the GPU's clock. A request that will
++ * not yield for the 7.5 s preemption timeout of a Gen12 render engine is
++ * reset with no other line saying what it was waiting in (dev64's a7a0,
++ * MGKFN's 46a8 under execlists).
++ */
++static void stela_reset_report(struct intel_engine_cs *engine, const char *msg)
++{
++	struct intel_rps *rps = &engine->gt->rps;
++	struct i915_request *rq = execlists_active(&engine->execlists);
++	u64 bbaddr = ENGINE_READ(engine, RING_BBADDR);
++
++	if (GRAPHICS_VER(engine->i915) >= 8)
++		bbaddr |= (u64)ENGINE_READ(engine, RING_BBADDR_UDW) << 32;
++	drm_notice(&engine->i915->drm,
++		   "%s reset for %s: acthd %#llx bbaddr %#llx head %#x tail %#x ipehr %#08x ipeir %#x instdone %#x esr %#x eir %#x; active %llx:%lld prio %d started %s, queued %u ms ago; queue prio %d; gpu %u MHz (asked %u, %u-%u, rps %s)\n",
++		   engine->name, msg,
++		   intel_engine_get_active_head(engine), bbaddr,
++		   ENGINE_READ(engine, RING_HEAD), ENGINE_READ(engine, RING_TAIL),
++		   ENGINE_READ(engine, RING_IPEHR), ENGINE_READ(engine, RING_IPEIR),
++		   ENGINE_READ(engine, RING_INSTDONE), ENGINE_READ(engine, RING_ESR),
++		   ENGINE_READ(engine, RING_EIR),
++		   rq ? rq->fence.context : 0, rq ? (long long)rq->fence.seqno : -1LL,
++		   rq ? rq->sched.attr.priority : 0,
++		   rq && i915_request_started(rq) ? "yes" : "no",
++		   rq ? jiffies_to_msecs(jiffies - rq->emitted_jiffies) : 0,
++		   engine->sched_engine->queue_priority_hint,
++		   intel_rps_read_actual_frequency(rps),
++		   intel_rps_get_requested_frequency(rps),
++		   intel_rps_get_min_frequency(rps),
++		   intel_rps_get_max_frequency(rps),
++		   intel_rps_is_enabled(rps) ? "on" : "off");
++}
++#endif
++
+ static void execlists_reset(struct intel_engine_cs *engine, const char *msg)
+ {
+ 	const unsigned int bit = I915_RESET_ENGINE + engine->id;
+@@ -2400,6 +2441,9 @@ static void execlists_reset(struct intel_engine_cs *engine, const char *msg)
+ 	tasklet_disable_nosync(&engine->sched_engine->tasklet);
+ 
+ 	ring_set_paused(engine, 1); /* Freeze the current request in place */
++#if IS_ENABLED(CONFIG_STELA)
++	stela_reset_report(engine, msg);
++#endif
+ 	execlists_capture(engine);
+ 	intel_engine_reset(engine, msg);
+ 
+diff --git a/drivers/gpu/drm/i915/gt/intel_reset.c b/drivers/gpu/drm/i915/gt/intel_reset.c
+index b2cf672564dd9c0db94a3e70147c67d064aa6773..29876bd5bae72e577df20011f25e62b4c6ebd11d 100644
+--- a/drivers/gpu/drm/i915/gt/intel_reset.c
++++ b/drivers/gpu/drm/i915/gt/intel_reset.c
+@@ -31,6 +31,7 @@
+ #include "intel_gt_print.h"
+ #include "intel_gt_requests.h"
+ #include "intel_reset.h"
++#include "intel_rps.h"
+ 
+ #define RESET_MAX_RETRIES 3
+ 
+@@ -90,6 +91,18 @@ static bool mark_guilty(struct i915_request *rq)
+ 	drm_notice(&ctx->i915->drm,
+ 		   "%s context reset due to GPU hang\n",
+ 		   ctx->name);
++#if IS_ENABLED(CONFIG_STELA)
++	/* Under the GuC too: the guilty request's age and the GPU's clock. */
++	drm_notice(&ctx->i915->drm,
++		   "%s guilty request %llx:%lld on %s, %u ms since it was queued; gpu %u MHz (asked %u, %u-%u)\n",
++		   ctx->name, rq->fence.context, (long long)rq->fence.seqno,
++		   rq->engine->name,
++		   jiffies_to_msecs(jiffies - rq->emitted_jiffies),
++		   intel_rps_read_actual_frequency(&rq->engine->gt->rps),
++		   intel_rps_get_requested_frequency(&rq->engine->gt->rps),
++		   intel_rps_get_min_frequency(&rq->engine->gt->rps),
++		   intel_rps_get_max_frequency(&rq->engine->gt->rps));
++#endif
+ 
+ 	/* Record the timestamp for the last N hangs */
+ 	prev_hang = ctx->hang_timestamp[0];

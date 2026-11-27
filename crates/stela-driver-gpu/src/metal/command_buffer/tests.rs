@@ -4862,6 +4862,16 @@ fn stencil_resolves_following_min_depth_run_on_copies_of_the_samples() {
         sample_positions: Vec::new(),
         rasterization_rate_map: false,
     };
+    // ANV, which has no multisampled storage images, claims Apple5 all the
+    // same: the pass that asks for this resolve is refused alone.
+    let anv = crate::metal::capabilities::tests::anv_gen12();
+    assert!(anv.supports_family(crate::metal::abi::GpuFamily::Apple5));
+    assert_eq!(
+        render_pass(&anv, &descriptor).err(),
+        Some(crate::metal::error::Error::Unsupported(
+            "stencil resolve following a min or max depth resolve"
+        ))
+    );
     let mut plan = render_pass(&capabilities(), &descriptor).unwrap();
     let stencil = plan.stencil.as_ref().unwrap();
     assert!(stencil.follows_depth);

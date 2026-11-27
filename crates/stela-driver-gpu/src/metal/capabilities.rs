@@ -394,6 +394,9 @@ const APPLE7_NEEDS: [&str; 2] = ["simdgroup matrices", "barycentric coordinates"
 /// The gap of a device whose framebuffer reads reach single-sample
 /// attachments alone ([`Capabilities::single_sample_storage`]).
 const MULTISAMPLED_FRAMEBUFFER_READS: &str = "multisampled framebuffer reads";
+/// The gap of a device whose stencil resolves cannot follow a min or max
+/// depth resolve ([`Capabilities::stencil_follows_depth`]).
+const STENCIL_FOLLOWS_DEPTH: &str = "stencil resolve following a min or max depth resolve";
 /// What Apple4 needs beyond Apple3, by its gaps' names: Apple1's and
 /// Apple2's formats, then Apple4's own.
 const APPLE4_NEEDS: [&str; 7] = [
@@ -404,6 +407,18 @@ const APPLE4_NEEDS: [&str; 7] = [
     "imageblocks and tile functions",
     "raster order groups",
     MULTISAMPLED_FRAMEBUFFER_READS,
+];
+/// What Apple5 needs beyond Apple4, by its gaps' names.
+const APPLE5_NEEDS: [&str; 2] = ["stencil resolve", STENCIL_FOLLOWS_DEPTH];
+/// What Apple6 needs beyond Apple5, by its gaps' names, in the order the
+/// derivation checks them.
+const APPLE6_NEEDS: [&str; 6] = [
+    "sparse textures",
+    "vertex amplification",
+    "function pointers in render pipelines",
+    "render dynamic libraries",
+    "texture atomics",
+    "ASTC HDR sampling",
 ];
 /// What Apple3 needs, by its gaps' names: Mac2, with the Common families
 /// it contains, and framebuffer reads in draw order, which take raster
@@ -447,40 +462,66 @@ impl Capabilities {
         .run()
     }
 
-    /// One line for the boot log of a device in Apple3 that RenderBox's
-    /// Apple4 question concerns: one in Apple4 without multisampled storage
-    /// images, which the strict families would have kept in Apple3
-    /// ([`set_strict_families`]), or one out of Apple4 with what keeps it
-    /// out; `None` for a device in Apple4 with them, or in no Apple family.
-    pub fn apple4_note(&self) -> Option<String> {
+    /// One line for the boot log of a device in Apple3, whose Apple4 to
+    /// Apple6 RenderBox asks for one after another: what a device without
+    /// multisampled storage images claims without them, which the strict
+    /// families would have kept in Apple3 ([`set_strict_families`]), and the
+    /// first of Apple4 to Apple6 it is out of with what it lacks of it.
+    /// `None` for a device in Apple6 with multisampled storage images, or in
+    /// no Apple family.
+    pub fn family_note(&self) -> Option<String> {
+        use core::fmt::Write;
         if !self.supports_family(GpuFamily::Apple3) {
             return None;
         }
-        if self.supports_family(GpuFamily::Apple4) {
-            return self.single_sample_storage.then(|| {
-                alloc::format!(
-                    "{}: Metal device claims Apple4 without multisampled framebuffer reads or \
-                     multisampled 16-bit packed targets (no multisampled storage images): a \
-                     pipeline or texture that needs them is refused alone; \
-                     {STRICT_FAMILIES_OPTION} in stela.cfg keeps it in Apple3",
-                    self.name
-                )
-            });
+        let mut line = String::new();
+        let relaxed = [GpuFamily::Apple6, GpuFamily::Apple5, GpuFamily::Apple4]
+            .into_iter()
+            .find(|family| self.supports_family(*family))
+            .filter(|_| self.single_sample_storage);
+        if let Some(highest) = relaxed {
+            let stencil = if self.supports_family(GpuFamily::Apple5) {
+                ", stencil resolves following a min or max depth resolve"
+            } else {
+                ""
+            };
+            let _ = write!(
+                line,
+                "{}: Metal device claims {highest:?} without multisampled storage images (no \
+                 multisampled framebuffer reads, multisampled 16-bit packed targets{stencil}): a \
+                 pipeline, texture or pass that needs them is refused alone; \
+                 {STRICT_FAMILIES_OPTION} on the startup choice's line keeps it in Apple3",
+                self.name
+            );
         }
-        let missing: Vec<&str> = APPLE4_NEEDS
-            .iter()
-            .copied()
-            .filter(|need| self.gaps.iter().any(|gap| gap.capability == *need))
-            .collect();
-        let missing = if missing.is_empty() {
-            String::from("GPU family Apple4")
-        } else {
-            missing.join(", ")
-        };
-        Some(alloc::format!(
-            "{}: Metal device stays out of Apple4 (no {missing})",
-            self.name
-        ))
+        let out = [
+            (GpuFamily::Apple4, &APPLE4_NEEDS[..]),
+            (GpuFamily::Apple5, &APPLE5_NEEDS[..]),
+            (GpuFamily::Apple6, &APPLE6_NEEDS[..]),
+        ]
+        .into_iter()
+        .find(|(family, _)| !self.supports_family(*family));
+        if let Some((family, needs)) = out {
+            let missing: Vec<&str> = needs
+                .iter()
+                .copied()
+                .filter(|need| self.gaps.iter().any(|gap| gap.capability == *need))
+                .collect();
+            let missing = if missing.is_empty() {
+                alloc::format!("GPU family {family:?}")
+            } else {
+                missing.join(", ")
+            };
+            if !line.is_empty() {
+                line.push_str("; ");
+            }
+            let _ = write!(
+                line,
+                "{}: Metal device stays out of {family:?} (no {missing})",
+                self.name
+            );
+        }
+        (!line.is_empty()).then_some(line)
     }
 
     /// One line for the boot log of a device outside Metal3 or Apple7, the
@@ -1933,20 +1974,30 @@ impl Derivation<'_> {
         // Apple5's RG11B10 and RGB9E5 vertex formats are single words, which
         // vertex functions decode when the driver cannot fetch them
         // (`vertex::word_formats`).
+        // The stencil resolve that follows a min or max depth resolve
+        // resolves copies of the stencil's samples, which take multisampled
+        // storage images: a device without them is in Apple5 all the same
+        // unless the boot asks for the strict families, and a pass that
+        // asks for that resolve is refused alone ([`crate::metal::pass`]). RenderBox
+        // asks for Apple5 once Apple4 is claimed.
+        let stencil_resolve = driver(
+            "stencil resolve",
+            !capabilities.stencil_resolve_modes.is_empty(),
+        );
+        let stencil_follows_depth =
+            driver(STENCIL_FOLLOWS_DEPTH, capabilities.stencil_follows_depth);
         let apple5 = apple4
-            && self.check_all(
-                "GPU family Apple5",
-                &[
-                    driver(
-                        "stencil resolve",
-                        !capabilities.stencil_resolve_modes.is_empty(),
-                    ),
-                    driver(
-                        "stencil resolve following a min or max depth resolve",
-                        capabilities.stencil_follows_depth,
-                    ),
-                ],
-            );
+            && if relaxed {
+                self.check_all("GPU family Apple5", &[stencil_resolve])
+            } else {
+                self.check_all(
+                    "GPU family Apple5",
+                    &[stencil_resolve, stencil_follows_depth],
+                )
+            };
+        if relaxed && !capabilities.stencil_follows_depth {
+            self.gap(STENCIL_FOLLOWS_DEPTH, Cause::Driver);
+        }
         // NVIDIA's fragment shaders have no stencil output: functions that
         // write one run the fragment tests themselves.
         if !self.device.limits.stencil_export && !capabilities.fragment_tests {

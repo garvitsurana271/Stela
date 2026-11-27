@@ -3674,7 +3674,7 @@ fn start_devices(
             if options.gpu_strict_families {
                 output::arguments(format_args!(
                     "GPU FAMILIES strict ({}): a GPU without multisampled storage images stays \
-                     out of Apple4\n",
+                     out of Apple4 to Apple6\n",
                     stela_boot_core::options::GPU_STRICT_FAMILIES
                 ));
             }

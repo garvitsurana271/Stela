@@ -1603,7 +1603,7 @@ fn open_gpu(gpu: &Installed, index: usize, bound: &Bound) -> Result<Arc<Shared>,
                     bound.name
                 ));
             }
-            if let Some(note) = service.apple4_note() {
+            if let Some(note) = service.family_note() {
                 output::arguments(format_args!("GPU {}: {note}\n", bound.name));
             }
             // On a Metal device in no Apple GPU family Core Animation draws

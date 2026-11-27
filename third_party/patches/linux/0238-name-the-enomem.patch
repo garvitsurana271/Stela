@@ -1,0 +1,48 @@
+From 59e4eb37ddff89a793b8ddad5ce013e11608e06d Mon Sep 17 00:00:00 2001
+From: Android Artisan <romartisan2025@gmail.com>
+Date: Sat, 21 Nov 2026 04:28:06 +0000
+Subject: [PATCH] fix(i915): name the ENOMEM that makes an execbuf or a VMA pin
+ fail
+
+An execbuf that fails with -ENOMEM says its buffer count and flags, and
+a VMA pin that fails with it says the size, alignment and flags it was
+asked for, each rate limited, so a boot whose Mesa submissions fail for
+memory tells which allocation refused.
+---
+ drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c | 5 +++++
+ drivers/gpu/drm/i915/i915_vma.c                | 6 ++++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+--- a/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_execbuffer.c
+@@ -3638,5 +3638,10 @@ end:;
+ 
+ 	args->flags &= ~__I915_EXEC_UNKNOWN_FLAGS;
+ 	kvfree(exec2_list);
++	if (err == -ENOMEM)
++		drm_err_ratelimited(&i915->drm,
++				    "execbuf ENOMEM buffers=%u flags=%llx\n",
++				    args->buffer_count,
++				    (unsigned long long)args->flags);
+ 	return err;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_vma.c b/drivers/gpu/drm/i915/i915_vma.c
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@ -1618,6 +1618,12 @@ err_rpm:
+ 		dma_fence_put(moving);
+ 
+ 	i915_vma_put_pages(vma);
++	if (err == -ENOMEM)
++		drm_err_ratelimited(&vma->vm->i915->drm,
++				    "vma pin ENOMEM size=%llu align=%llu flags=%llx\n",
++				    (unsigned long long)vma->size,
++				    (unsigned long long)alignment,
++				    (unsigned long long)flags);
+ 	return err;
+ }
+ 
+-- 
+2.53.0
+

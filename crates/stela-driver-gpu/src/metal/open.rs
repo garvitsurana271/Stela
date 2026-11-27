@@ -7,6 +7,7 @@
 #[cfg(feature = "metal-vulkan")]
 use crate::metal::{
     compiler::{self, AirCompiler},
+    mapped_memory,
     native::{InternalKernels, Loader, MemoryExporter, NativeBackend, vk},
 };
 use crate::{
@@ -301,24 +302,39 @@ pub unsafe fn stack(
     Ok((backend, compiler))
 }
 
+/// What the log says as a device whose GPU missed what the CPU wrote through
+/// a mapping of its memory opens again in system memory.
+pub const SYSTEM_MEMORY: &str = "the GPU missed what the CPU wrote through a mapping of its \
+    memory, as it would miss the shaders its driver uploads that way: the device opens again \
+    with every allocation in system memory, which the GPU reaches as it reaches its command \
+    buffers";
+
 /// Opens the Vulkan driver's device for `gpu` and serves it with the AIR
-/// compiler service `compiler` answers for that device.
+/// compiler service `service` answers for that device, with memory the
+/// CPU and GPU share exported by what `exporter` makes.
+///
+/// Before it serves anything, the device's mapped memory is checked
+/// ([`mapped_memory::check`]). A GPU that missed what the CPU wrote through
+/// a mapping of its own memory would read every shader NVK uploads that way
+/// wrong, so a driver that can keep its allocations in system memory
+/// ([`Loader::system_memory`]) is told to and the device opens again,
+/// checked once more.
 ///
 /// # Safety
 ///
-/// `loader` is the entry point of `gpu`'s stack's driver and `compiler`
+/// `loader` is the entry point of `gpu`'s stack's driver and `service`
 /// answers the AIR compiler service with that driver's NIR options for the
 /// device it is given, both outliving the service.
 #[cfg(feature = "metal-vulkan")]
 pub unsafe fn open(
     loader: Loader,
-    exporter: Box<dyn MemoryExporter>,
-    compiler: impl FnOnce(vk::PhysicalDevice) -> compiler::Service,
+    exporter: impl Fn() -> Box<dyn MemoryExporter>,
+    service: impl Fn(vk::PhysicalDevice) -> compiler::Service,
     gpu: &Gpu,
     epoch: DeviceEpoch,
 ) -> Result<NativeService, OpenError> {
     // SAFETY: the caller's guarantees.
-    let (mut backend, compiler) = unsafe { stack(loader, gpu.pci, exporter, compiler) }?;
+    let (mut backend, mut compiler) = unsafe { stack(loader, gpu.pci, exporter(), &service) }?;
     (loader.log)(&describe(backend.physical_device()));
     if loader.keep_lost {
         let failed = match first_submission(&mut backend) {
@@ -343,6 +359,25 @@ pub unsafe fn open(
             core::mem::forget(backend);
             return Err(error.into());
         }
+    }
+    // After a first submission a driver that may hang waits for, so the
+    // check's copy runs on rings that run.
+    let checked = mapped_memory::check(&mut backend);
+    (loader.log)(&checked.line());
+    if checked.unseen()
+        && let Some(system_memory) = loader.system_memory
+    {
+        (loader.log)(SYSTEM_MEMORY);
+        // The check's copy finished and nothing else ran: the device is
+        // idle, and its release waits for nothing.
+        drop(compiler);
+        drop(backend);
+        // SAFETY: the driver's own placement, before its next instance.
+        unsafe { system_memory() };
+        // SAFETY: the caller's guarantees.
+        (backend, compiler) = unsafe { stack(loader, gpu.pci, exporter(), &service) }?;
+        let checked = mapped_memory::check(&mut backend);
+        (loader.log)(&format!("in system memory, {}", checked.line()));
     }
     serve(backend, compiler, gpu, epoch)
 }

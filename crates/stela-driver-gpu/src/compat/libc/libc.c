@@ -162,6 +162,22 @@ int atexit(void (*function)(void))
 	return 0;
 }
 
+/* Whether NVK keeps every allocation in system memory (NVK_DEBUG=gart),
+ * which the Metal service sets for a GPU that did not see what the CPU wrote
+ * through a mapping of its own memory (`metal::mapped_memory`): NVK writes
+ * the shaders it uploads and the launch descriptors and constants a command
+ * buffer uploads that way, and an RTX 4060 Laptop GPU on a Meteor Lake MSI
+ * laptop read invalid program headers and zero launch descriptors from it.
+ * The GPU reads its command buffers from system memory already. NVK reads
+ * the variable as an instance is created; set, it stays for the boot. */
+static int nvk_system_memory;
+
+void stela_nvk_place_in_system_memory(void);
+void stela_nvk_place_in_system_memory(void)
+{
+	__atomic_store_n(&nvk_system_memory, 1, __ATOMIC_RELEASE);
+}
+
 /* RADV runs with color compression (DCC) off: under the unified image
  * layouts Stela's Metal device requires, an image a copy fills and a shader
  * then samples read back blank with DCC on (app icons and widgets drew
@@ -170,6 +186,9 @@ char *getenv(const char *name)
 {
 	if (name && !strcmp(name, "RADV_DEBUG"))
 		return (char *)"nodcc";
+	if (name && !strcmp(name, "NVK_DEBUG") &&
+	    __atomic_load_n(&nvk_system_memory, __ATOMIC_ACQUIRE))
+		return (char *)"gart";
 	return NULL;
 }
 

@@ -1246,7 +1246,7 @@ fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
     let service = unsafe {
         open(
             loader,
-            Box::new(Exporter),
+            || Box::new(Exporter) as Box<dyn MemoryExporter>,
             compiler,
             gpu,
             DeviceEpoch::from_registered(NonZeroU64::MIN),

@@ -33,6 +33,9 @@
 #include <stela/host.h>
 #include "host.h"
 
+/* The Metal service's switch of NVK to system memory (libc.c). */
+void stela_nvk_place_in_system_memory(void);
+
 static int failures;
 
 #define CHECK(condition)                                                                          \
@@ -495,6 +498,13 @@ static void test_time(void)
 	struct timespec too_late = {(time_t)((UINT64_MAX - 1) / 1000000000),
 		(long)((UINT64_MAX - 1) % 1000000000)};
 	CHECK(clock_nanosleep(CLOCK_MONOTONIC, 0, &too_late, NULL) == EOVERFLOW);
+	CHECK(!getenv("HOME"));
+	/* NVK places memory as the driver chose until the Metal service asks
+	 * for system memory, and from then on for the boot. */
+	CHECK(!getenv("NVK_DEBUG"));
+	stela_nvk_place_in_system_memory();
+	CHECK(getenv("NVK_DEBUG") && !strcmp(getenv("NVK_DEBUG"), "gart"));
+	CHECK(!strcmp(getenv("RADV_DEBUG"), "nodcc"));
 	CHECK(!getenv("HOME"));
 }
 

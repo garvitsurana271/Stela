@@ -31,6 +31,7 @@ pub mod indirect;
 pub mod intel;
 pub mod kms;
 pub mod library;
+pub mod mapped_memory;
 #[cfg(feature = "metal-vulkan")]
 pub mod native;
 pub mod nvidia;

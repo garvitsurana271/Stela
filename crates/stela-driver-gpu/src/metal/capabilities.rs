@@ -394,6 +394,17 @@ const APPLE7_NEEDS: [&str; 2] = ["simdgroup matrices", "barycentric coordinates"
 /// The gap of a device whose framebuffer reads reach single-sample
 /// attachments alone ([`Capabilities::single_sample_storage`]).
 const MULTISAMPLED_FRAMEBUFFER_READS: &str = "multisampled framebuffer reads";
+/// What Apple4 needs beyond Apple3, by its gaps' names: Apple1's and
+/// Apple2's formats, then Apple4's own.
+const APPLE4_NEEDS: [&str; 7] = [
+    "ETC2 and EAC sampling",
+    "PVRTC sampling",
+    "16-bit packed render targets",
+    "ASTC LDR sampling",
+    "imageblocks and tile functions",
+    "raster order groups",
+    MULTISAMPLED_FRAMEBUFFER_READS,
+];
 /// What Apple3 needs, by its gaps' names: Mac2, with the Common families
 /// it contains, and framebuffer reads in draw order, which take raster
 /// order groups.
@@ -413,14 +424,63 @@ impl Capabilities {
         shaders: ShaderFeatures,
         api: ApiFeatures,
     ) -> Self {
+        Self::derive_families(device, platform, shaders, api, strict_families())
+    }
+
+    /// [`Self::derive`] with the strict Apple families or without them,
+    /// whatever the boot asked for ([`set_strict_families`]).
+    pub fn derive_families(
+        device: &PhysicalDevice,
+        platform: &Platform,
+        shaders: ShaderFeatures,
+        api: ApiFeatures,
+        strict_families: bool,
+    ) -> Self {
         Derivation {
             device,
             platform,
             shaders,
             api,
             gaps: Vec::new(),
+            strict_families,
         }
         .run()
+    }
+
+    /// One line for the boot log of a device in Apple3 that RenderBox's
+    /// Apple4 question concerns: one in Apple4 without multisampled storage
+    /// images, which the strict families would have kept in Apple3
+    /// ([`set_strict_families`]), or one out of Apple4 with what keeps it
+    /// out; `None` for a device in Apple4 with them, or in no Apple family.
+    pub fn apple4_note(&self) -> Option<String> {
+        if !self.supports_family(GpuFamily::Apple3) {
+            return None;
+        }
+        if self.supports_family(GpuFamily::Apple4) {
+            return self.single_sample_storage.then(|| {
+                alloc::format!(
+                    "{}: Metal device claims Apple4 without multisampled framebuffer reads or \
+                     multisampled 16-bit packed targets (no multisampled storage images): a \
+                     pipeline or texture that needs them is refused alone; \
+                     {STRICT_FAMILIES_OPTION} in stela.cfg keeps it in Apple3",
+                    self.name
+                )
+            });
+        }
+        let missing: Vec<&str> = APPLE4_NEEDS
+            .iter()
+            .copied()
+            .filter(|need| self.gaps.iter().any(|gap| gap.capability == *need))
+            .collect();
+        let missing = if missing.is_empty() {
+            String::from("GPU family Apple4")
+        } else {
+            missing.join(", ")
+        };
+        Some(alloc::format!(
+            "{}: Metal device stays out of Apple4 (no {missing})",
+            self.name
+        ))
     }
 
     /// One line for the boot log of a device outside Metal3 or Apple7, the
@@ -711,7 +771,30 @@ struct Derivation<'a> {
     shaders: ShaderFeatures,
     api: ApiFeatures,
     gaps: Vec<Gap>,
+    /// Apple4 takes multisampled framebuffer reads ([`set_strict_families`]).
+    strict_families: bool,
 }
+
+/// Whether the boot asked for the strict Apple families
+/// (`--gpu-strict-families`): Apple4 then takes multisampled framebuffer
+/// reads, which a device without multisampled storage images (ANV on every
+/// Intel GPU) lacks, and such a device is in Apple3 at most, as before
+/// test 6.
+static STRICT_FAMILIES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Asks for the strict Apple families on every device derived after it.
+pub fn set_strict_families(strict: bool) {
+    STRICT_FAMILIES.store(strict, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the boot asked for the strict Apple families.
+pub fn strict_families() -> bool {
+    STRICT_FAMILIES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The boot option that keeps a device without multisampled storage images
+/// out of Apple4 ([`set_strict_families`]).
+pub const STRICT_FAMILIES_OPTION: &str = "--gpu-strict-families";
 
 /// One requirement of a capability: the driver's part, the compiler's
 /// constructs and this layer's API path.
@@ -1782,6 +1865,17 @@ impl Derivation<'_> {
                         .contains(FormatCapabilities::READ | FormatCapabilities::FILTER)
                 })
         };
+        // A device without multisampled storage images renders the packed
+        // formats it cannot render itself through their raw texels in
+        // single-sample targets alone: unless the boot asks for the strict
+        // families, Apple1 takes them without multisampling there, and a
+        // multisampled texture of one is refused alone.
+        let relaxed = !self.strict_families && capabilities.single_sample_storage;
+        let packed_render = if relaxed {
+            FormatCapabilities::COLOR | FormatCapabilities::BLEND
+        } else {
+            render
+        };
         let packed16 = [
             PixelFormat::B5G6R5Unorm,
             PixelFormat::A1Bgr5Unorm,
@@ -1789,7 +1883,7 @@ impl Derivation<'_> {
             PixelFormat::Bgr5A1Unorm,
         ]
         .into_iter()
-        .all(|packed| format(packed, render | FormatCapabilities::FILTER));
+        .all(|packed| format(packed, packed_render | FormatCapabilities::FILTER));
         // Framebuffer reads of single-sample attachments suffice: Core
         // Animation's are of the window server's framebuffers, which are.
         let apple3 = mac2 && capabilities.framebuffer_reads;
@@ -1809,24 +1903,33 @@ impl Derivation<'_> {
             );
         // Apple4 to Apple7 add what the feature set tables give them below
         // ray tracing, which Metal leaves to `supportsRaytracing`.
+        // Tile functions access the imageblock of a multisampled pass as
+        // multisampled storage. A device without multisampled storage
+        // images is in Apple4 all the same unless the boot asks for the
+        // strict families ([`set_strict_families`]): its pipelines that
+        // would read a multisampled framebuffer or tile one are refused one
+        // by one ([`Capabilities::framebuffer_reads_at`]). RenderBox, which
+        // draws the Dock's icons, asks for Apple4, and on Intel without it
+        // drew them as blank squares in the Default icon style.
+        let imageblocks = shader(
+            "imageblocks and tile functions",
+            true,
+            ShaderFeatures::IMAGEBLOCKS,
+        );
+        let raster_order_groups = driver("raster order groups", capabilities.raster_order_groups);
+        let multisampled_reads = driver(
+            MULTISAMPLED_FRAMEBUFFER_READS,
+            !capabilities.single_sample_storage,
+        );
         let apple4 = apple2
-            && self.check_all(
-                "GPU family Apple4",
-                &[
-                    shader(
-                        "imageblocks and tile functions",
-                        true,
-                        ShaderFeatures::IMAGEBLOCKS,
-                    ),
-                    driver("raster order groups", capabilities.raster_order_groups),
-                    // Tile functions access the imageblock of a
-                    // multisampled pass as multisampled storage.
-                    driver(
-                        MULTISAMPLED_FRAMEBUFFER_READS,
-                        !capabilities.single_sample_storage,
-                    ),
-                ],
-            );
+            && if relaxed {
+                self.check_all("GPU family Apple4", &[imageblocks, raster_order_groups])
+            } else {
+                self.check_all(
+                    "GPU family Apple4",
+                    &[imageblocks, raster_order_groups, multisampled_reads],
+                )
+            };
         // Apple5's RG11B10 and RGB9E5 vertex formats are single words, which
         // vertex functions decode when the driver cannot fetch them
         // (`vertex::word_formats`).

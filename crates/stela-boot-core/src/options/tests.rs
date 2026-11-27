@@ -493,6 +493,16 @@ fn scanout_mirror_round_trips() {
 }
 
 #[test]
+fn strict_gpu_families_round_trip_and_are_off_unless_written() {
+    let plain = round_trip("--system");
+    assert!(!plain.gpu_strict_families);
+    assert!(!plain.to_string().contains(GPU_STRICT_FAMILIES));
+    let strict = round_trip(&format!("--system {GPU_STRICT_FAMILIES}"));
+    assert!(strict.gpu_strict_families);
+    assert!(strict.to_string().contains(GPU_STRICT_FAMILIES));
+}
+
+#[test]
 fn maintenance_writes_require_an_explicit_preboot_selection() {
     let ordinary = round_trip(&format!("--system --preboot {DISK}"));
     assert!(!ordinary.maintenance_write);

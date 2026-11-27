@@ -213,11 +213,23 @@ fn anv_reads_single_sample_framebuffers_in_apple3() {
     ] {
         assert!(capabilities.supports_family(family), "{family:?}");
     }
-    // Apple4's tile functions of multisampled passes and Apple5's stencil
-    // resolve after a depth resolve take multisampled storage images;
-    // fragment functions test single-sample fragments themselves.
-    assert!(!capabilities.supports_family(GpuFamily::Apple4));
+    // Apple4 is claimed without multisampled framebuffer reads, whose
+    // pipelines are refused alone; Apple5's stencil resolve after a depth
+    // resolve takes multisampled storage images, so the device stops at
+    // Apple4. Fragment functions test single-sample fragments themselves.
+    for family in [GpuFamily::Apple1, GpuFamily::Apple2, GpuFamily::Apple4] {
+        assert!(capabilities.supports_family(family), "{family:?}");
+    }
+    assert_eq!(cause(&capabilities, "16-bit packed render targets"), None);
+    assert_eq!(cause(&capabilities, "GPU family Apple4"), None);
     assert!(!capabilities.supports_family(GpuFamily::Apple5));
+    assert_eq!(
+        cause(
+            &capabilities,
+            "stencil resolve following a min or max depth resolve"
+        ),
+        Some(Cause::Driver)
+    );
     assert!(!capabilities.stencil_follows_depth && capabilities.fragment_tests);
     assert!(!capabilities.supports_family(GpuFamily::Metal3));
     assert_eq!(capabilities.no_apple_family(), None);
@@ -225,11 +237,68 @@ fn anv_reads_single_sample_framebuffers_in_apple3() {
         capabilities
             .family_shortfall()
             .unwrap()
-            .starts_with("Intel(R) Iris(R) Xe Graphics (RPL-P): Metal device in Apple3 at most")
+            .starts_with("Intel(R) Iris(R) Xe Graphics (RPL-P): Metal device in Apple4 at most")
     );
+    let note = capabilities.apple4_note().unwrap();
+    assert!(note.contains("claims Apple4 without multisampled framebuffer reads"));
+    assert!(note.contains(super::STRICT_FAMILIES_OPTION));
     // The flag crosses the block.
     let block = capabilities.block().unwrap();
     assert_eq!(block.capabilities().unwrap(), capabilities);
+}
+
+/// `--gpu-strict-families`: Apple4 takes multisampled framebuffer reads
+/// and Apple1 multisampled 16-bit packed targets again, and ANV's device
+/// stays in Apple3, as before test 6.
+#[test]
+fn the_strict_families_keep_anv_in_apple3() {
+    let capabilities = Capabilities::derive_families(
+        &anv_gen12_device(),
+        &gb203().platform(attachment()),
+        ShaderFeatures::KNOWN,
+        ApiFeatures::IMPLEMENTED,
+        true,
+    );
+    assert!(capabilities.supports_family(GpuFamily::Apple3));
+    // The fixture's packed formats render through their raw texels, whose
+    // multisampled targets take multisampled storage images too.
+    assert!(!capabilities.supports_family(GpuFamily::Apple1));
+    assert!(!capabilities.supports_family(GpuFamily::Apple4));
+    assert_eq!(
+        cause(&capabilities, "16-bit packed render targets"),
+        Some(Cause::Driver)
+    );
+    assert_eq!(
+        capabilities.apple4_note().unwrap(),
+        "Intel(R) Iris(R) Xe Graphics (RPL-P): Metal device stays out of Apple4 (no 16-bit \
+         packed render targets, multisampled framebuffer reads)"
+    );
+    assert!(
+        capabilities
+            .family_shortfall()
+            .unwrap()
+            .starts_with("Intel(R) Iris(R) Xe Graphics (RPL-P): Metal device in Apple3 at most")
+    );
+    // A device with multisampled storage images derives the same either
+    // way, and says nothing of Apple4.
+    let chip = gb203();
+    let device = nvk(chip, 16 << 30);
+    let strict = Capabilities::derive_families(
+        &device,
+        &chip.platform(attachment()),
+        ShaderFeatures::KNOWN,
+        ApiFeatures::IMPLEMENTED,
+        true,
+    );
+    let relaxed = Capabilities::derive_families(
+        &device,
+        &chip.platform(attachment()),
+        ShaderFeatures::KNOWN,
+        ApiFeatures::IMPLEMENTED,
+        false,
+    );
+    assert_eq!(strict, relaxed);
+    assert_eq!(relaxed.apple4_note(), None);
 }
 
 /// What ANV derived before: framebuffer reads took multisampled storage

@@ -346,6 +346,14 @@ impl AsusMode {
 /// what the firmware set.
 pub const GPU_ASPM: &str = "--gpu-aspm";
 
+/// Keeps a GPU without multisampled storage images (Intel's, under ANV)
+/// out of Metal's Apple4 family, as before test 6
+/// (`--gpu-strict-families`). Without it such a GPU claims Apple4 and
+/// refuses its multisampled framebuffer reads one pipeline at a time. A
+/// hand-written opt-in setup never writes, so the options revision stays
+/// 13.
+pub const GPU_STRICT_FAMILIES: &str = "--gpu-strict-families";
+
 /// `--gpu-aspm`'s value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GpuAspm {
@@ -647,6 +655,9 @@ pub struct System {
     /// Keep the newest presented frame in host memory for a debugger to read:
     /// a passed-through GPU's picture otherwise leaves only through its port.
     pub scanout_mirror: bool,
+    /// Keep a GPU without multisampled storage images out of Apple4
+    /// ([`GPU_STRICT_FAMILIES`]).
+    pub gpu_strict_families: bool,
     /// The NVRAM boot volume the loader chose (`--boot-volume`), naming the
     /// Preboot disk's container and volume group.
     pub boot_volume: Option<BootVolume>,
@@ -908,6 +919,7 @@ impl Default for System {
             single_user: false,
             bundle_repair: false,
             scanout_mirror: false,
+            gpu_strict_families: false,
             boot_command: None,
             upgrade: false,
             recovery: None,
@@ -1498,6 +1510,7 @@ impl fmt::Display for System {
         line.flag(SINGLE_USER, self.single_user)?;
         line.flag(boot_selection::BUNDLE_REPAIR_OPTION, self.bundle_repair)?;
         line.flag(SCANOUT_MIRROR, self.scanout_mirror)?;
+        line.flag(GPU_STRICT_FAMILIES, self.gpu_strict_families)?;
         line.flag(boot_selection::UPGRADE_OPTION, self.upgrade)?;
         line.flag(
             boot_selection::PAIRED_RECOVERY_OPTION,

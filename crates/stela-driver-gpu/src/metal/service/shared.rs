@@ -1704,6 +1704,15 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             .and_then(|mut turn| turn.device().capabilities().family_shortfall())
     }
 
+    /// That the device claims Apple4 without multisampled framebuffer
+    /// reads, for the boot log
+    /// ([`crate::metal::capabilities::Capabilities::apple4_note`]); `None`
+    /// for any other device, or while a call holds the service.
+    pub fn apple4_note(&self) -> Option<alloc::string::String> {
+        self.try_turn()
+            .and_then(|mut turn| turn.device().capabilities().apple4_note())
+    }
+
     /// Why the boot leaves the device unused, in no Apple GPU family
     /// ([`crate::metal::capabilities::Capabilities::no_apple_family`]);
     /// `None` for a device in Apple3, or while a call holds the service,

@@ -1599,6 +1599,9 @@ fn open_gpu(gpu: &Installed, index: usize, bound: &Bound) -> Result<Arc<Shared>,
                     bound.name
                 ));
             }
+            if let Some(note) = service.apple4_note() {
+                output::arguments(format_args!("GPU {}: {note}\n", bound.name));
+            }
             // On a Metal device in no Apple GPU family Core Animation draws
             // no desktop, a black screen under the cursor, and the window
             // server ends at its first framebuffer read: the device is left

@@ -3667,6 +3667,17 @@ fn start_devices(
             #[cfg(feature = "nvk")]
             gpu::display::set_hybrid_scanout(options.hybrid_scanout());
             gpu::link::choose(options.gpu_aspm());
+            #[cfg(feature = "nvk")]
+            stela_drivers::gpu::metal::capabilities::set_strict_families(
+                options.gpu_strict_families,
+            );
+            if options.gpu_strict_families {
+                output::arguments(format_args!(
+                    "GPU FAMILIES strict ({}): a GPU without multisampled storage images stays \
+                     out of Apple4\n",
+                    stela_boot_core::options::GPU_STRICT_FAMILIES
+                ));
+            }
             #[cfg(feature = "intel")]
             {
                 gpu::intel_guc::set_setting(options.i915_guc());

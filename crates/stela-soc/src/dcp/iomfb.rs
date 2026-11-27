@@ -68,7 +68,11 @@
 //! no waiting swap in front of it set are composed over the frame on
 //! screen at the next vblank, though it still completes in order
 //! ([`Methods::ahead`]), so the pointer follows its client and not the
-//! GPU's slowest frame. The vsync callback
+//! GPU's slowest frame. With `--host-cursor on` it follows the host's
+//! pointer instead, once the hotspot is known ([`super::host_cursor`]):
+//! every present shows layer 1 at the host's position, and a vblank the
+//! host's pointer moved at presents that alone, completing no swap. The
+//! vsync callback
 //! `D588` carries the vblank's own counter value, not the time the model
 //! looked, as its first value and as its timestamp, the second. The AP's
 //! library turns that timestamp from the coprocessor's clock, continuous
@@ -107,6 +111,7 @@ use super::Log;
 use super::abi::{self, Fields, IO_RETURN_SUCCESS, Interface, LINK_UNSUPPORTED, Method, Packed};
 use super::avipc::DisplayState;
 use super::compose::{Compose, Composition, Pages};
+use super::host_cursor::{Shared, Tracker};
 use super::link::SHARED_VARIABLES;
 use super::modes::{self, Advertised};
 use super::rpc::{Callback, Service, Step};
@@ -240,6 +245,8 @@ const SWAP_INFO_ID: usize = 0x38;
 const SWAP_INFO_BLOB: usize = 0xe0;
 /// The ticks per second of the counter refreshes are timed by.
 const COUNTER_HZ: u64 = crate::counter::FREQUENCY_HZ;
+/// The slot WindowServer's cursor client sets: the pointer.
+const CURSOR_SLOT: usize = 1;
 
 /// The counter ticks each pacing report covers.
 const PACING_WINDOW: u64 = 10 * COUNTER_HZ;
@@ -791,6 +798,12 @@ struct Batch {
     /// The slots shown ahead of the swaps waiting in front of theirs
     /// ([`Methods::ahead`]): with `count` 0, all the batch shows anew.
     ahead: u32,
+    /// The slots as the guest's swaps set them: `planes` but for the
+    /// pointer, which the host's position may place elsewhere.
+    guest: [Option<scanout::Layer>; swap::LAYERS],
+    /// The batch only shows the pointer where the host's is now
+    /// ([`Methods::cursor_wanted`]): it completes and paces nothing.
+    cursor: bool,
 }
 
 /// The IOMFB methods of the one connected display, presenting to a host
@@ -814,6 +827,13 @@ pub struct Methods {
     in_place: bool,
     /// A compose outside the lock outlasted [`SETTLE_SPINS`] (reported once).
     compose_stall_reported: bool,
+    /// `--host-cursor on`: the pointer's layer shown where the host's
+    /// pointer is ([`super::host_cursor`]).
+    host_cursor: Option<Tracker>,
+    /// The layer slots the guest's swaps put on screen at the last present,
+    /// which [`Self::shown`] holds with the pointer where the host showed
+    /// it; `None` before the first.
+    shown_guest: Option<[Option<scanout::Layer>; swap::LAYERS]>,
     /// The layer slots on screen since the last present, `None` before it.
     shown: Option<[Option<scanout::Layer>; swap::LAYERS]>,
     /// Slots that swaps dropped without a present (an abort or a shutdown)
@@ -1020,6 +1040,8 @@ impl Methods {
             composing: None,
             in_place: false,
             compose_stall_reported: false,
+            host_cursor: None,
+            shown_guest: None,
             shown: None,
             unshown: 0,
             repaint_refused: false,
@@ -1105,6 +1127,39 @@ impl Methods {
     }
 
     /// Choose per-swap tracing or bounded presentation reports.
+    /// `--host-cursor on`: show the guest's pointer where `shared`'s is,
+    /// at each vblank it moved, and give `shared` the screen.
+    pub(super) fn set_host_cursor(&mut self, shared: &'static Shared) {
+        shared.set_screen(self.mode.width, self.mode.height);
+        self.host_cursor = Some(Tracker::new(shared));
+    }
+
+    /// `planes` with the pointer's layer where the host's pointer is, while
+    /// the host cursor knows the hotspot ([`Tracker::place`]).
+    fn cursor_planes(
+        &self,
+        mut planes: [Option<scanout::Layer>; swap::LAYERS],
+    ) -> [Option<scanout::Layer>; swap::LAYERS] {
+        if let Some(tracker) = &self.host_cursor
+            && let Some(layer) = &planes[CURSOR_SLOT]
+            && let Some(placed) = tracker.place(layer, (self.mode.width, self.mode.height))
+        {
+            planes[CURSOR_SLOT] = Some(placed);
+        }
+        planes
+    }
+
+    /// Whether the pointer on screen stands elsewhere than the host cursor
+    /// would show it now, with no swap: the host's pointer moved, or the
+    /// hotspot was lost and the guest's own placement is shown again.
+    fn cursor_wanted(&self) -> bool {
+        let (Some(_), Some(shown), Some(guest)) = (&self.host_cursor, self.shown, self.shown_guest)
+        else {
+            return false;
+        };
+        self.cursor_planes(guest) != shown
+    }
+
     pub(super) fn set_swap_tracing(&mut self, enabled: bool) {
         self.trace_swaps = enabled;
     }
@@ -1209,7 +1264,7 @@ impl Methods {
         if self.latched.is_none() {
             return false;
         }
-        if self.ready_swaps(now) != 0 || self.ahead_wanted() {
+        if self.ready_swaps(now) != 0 || self.ahead_wanted() || self.cursor_wanted() {
             return true;
         }
         self.latched = None;
@@ -1254,8 +1309,8 @@ impl Methods {
         let Some(shown) = self.shown else {
             return false;
         };
-        let (planes, ahead) = self.ahead(0, shown);
-        ahead != 0 && planes != shown
+        let (planes, ahead) = self.ahead(0, self.shown_guest.unwrap_or(shown));
+        ahead != 0 && self.cursor_planes(planes) != shown
     }
 
     /// `io_fence_notify`: the GPU finished `surface` for `swap_id`. A queued
@@ -1299,6 +1354,9 @@ impl Methods {
             || (!self.frames.is_empty() && self.display.borrow().active())
             || self.display.borrow().active() != self.sink_powered
             || self.repaint_wanted()
+            || (self.display.borrow().active()
+                && (self.cursor_wanted()
+                    || self.host_cursor.as_ref().is_some_and(Tracker::locked)))
             || self
                 .scanout
                 .as_ref()
@@ -1340,6 +1398,9 @@ impl Methods {
             .and_then(|scanout| scanout.vblank_age_ns());
         self.next_refresh = next_vblank(due, now, self.refresh_ticks, age);
         self.last_vblank = Some(due);
+        if let Some(tracker) = &mut self.host_cursor {
+            tracker.tick(due);
+        }
         // The latch takes only what is ready at its vblank.
         self.latched = Some(due);
         self.swap_ready(now);
@@ -1453,7 +1514,7 @@ impl Methods {
             read,
             &mut self.frame,
         );
-        if batch.count == 0 && batch.ahead == 0 {
+        if batch.count == 0 && batch.ahead == 0 && !batch.cursor {
             return self.repainted(presented);
         }
         presented?;
@@ -1483,17 +1544,24 @@ impl Methods {
                 layers: planes.iter().flatten().copied().collect(),
                 damage: None,
                 ahead: 0,
+                guest: self.shown_guest.unwrap_or(planes),
+                cursor: false,
             });
         }
         let due = self.latched.expect("a ready frame has an open latch");
         let count = self.ready_swaps(now);
         // With none ready, only a later swap's slots shown ahead: a frame
-        // on screen it changes (`ahead_wanted`).
+        // on screen it changes (`ahead_wanted`), or the pointer the host
+        // moved (`cursor_wanted`).
         let base = match count {
-            0 => self.shown.expect("only a frame on screen is shown ahead"),
+            0 => {
+                let shown = self.shown.expect("only a frame on screen is shown ahead");
+                self.shown_guest.unwrap_or(shown)
+            }
             _ => self.frames[count - 1].planes,
         };
-        let (planes, ahead) = self.ahead(count, base);
+        let (guest, ahead) = self.ahead(count, base);
+        let planes = self.cursor_planes(guest);
         let layers = planes.iter().flatten().copied().collect();
         let updated = self
             .frames
@@ -1511,6 +1579,8 @@ impl Methods {
             layers,
             damage,
             ahead,
+            guest,
+            cursor: count == 0 && ahead == 0,
         })
     }
 
@@ -1611,12 +1681,14 @@ impl Methods {
             self.in_place = true;
             return Ok(false);
         }
-        if batch.count == 0 && batch.ahead == 0 {
+        if batch.count == 0 && batch.ahead == 0 && !batch.cursor {
             return self.repainted(result).map(|()| false);
         }
         result?;
-        self.pacing.gpu_composed += u32::from(on_gpu);
-        self.pacing.cpu_composed += u32::from(!on_gpu);
+        if !batch.cursor {
+            self.pacing.gpu_composed += u32::from(on_gpu);
+            self.pacing.cpu_composed += u32::from(!on_gpu);
+        }
         self.presented(batch);
         Ok(true)
     }
@@ -1651,6 +1723,8 @@ impl Methods {
             layers,
             damage: _,
             ahead,
+            guest,
+            cursor,
         } = batch;
         // A vblank passed during a compose opened a new latch: it stays.
         if self.latched == Some(due) {
@@ -1666,8 +1740,17 @@ impl Methods {
         }
         self.pacing.overtaking += u32::from(ahead != 0);
         self.shown = Some(planes);
+        self.shown_guest = Some(guest);
         self.unshown = 0;
         self.repaint_refused = false;
+        if cursor {
+            // The host's pointer alone: no swap was shown, and the guest's
+            // frame rate is paced without it.
+            if let Some(tracker) = &self.host_cursor {
+                tracker.shared().drawn();
+            }
+            return;
+        }
         let waiting = self.frames.len();
         if count == 0 {
             // The newest swap on screen is still the last one latched.
@@ -2729,6 +2812,19 @@ impl Methods {
         let (_, client) = self.started.remove(start).expect("found started swap");
         self.log_placements(swap_id, &planes);
         self.planes = planes;
+        let updated = if submission.enabled & swap::REMOVE_LAYERS != 0 {
+            (1 << swap::LAYERS) - 1
+        } else {
+            submission.enabled & ((1 << swap::LAYERS) - 1)
+        };
+        // The guest placed its pointer for a position it was given: what
+        // the host cursor learns the hotspot from.
+        if updated & 1 << CURSOR_SLOT != 0
+            && let Some(tracker) = &mut self.host_cursor
+            && let Some(layer) = &shown[CURSOR_SLOT]
+        {
+            tracker.observe(layer, (self.mode.width, self.mode.height), self.now);
+        }
         let mut fenced = submission.fenced();
         self.early_fences.retain(|&(swap, surface)| {
             if swap != swap_id {
@@ -2771,11 +2867,7 @@ impl Methods {
             ready_at: (fenced == 0).then_some(self.now),
             requested: submission.requested,
             planes: shown,
-            updated: if submission.enabled & swap::REMOVE_LAYERS != 0 {
-                (1 << swap::LAYERS) - 1
-            } else {
-                submission.enabled & ((1 << swap::LAYERS) - 1)
-            },
+            updated,
         });
         self.pacing.submitted += 1;
         Ok(reply)

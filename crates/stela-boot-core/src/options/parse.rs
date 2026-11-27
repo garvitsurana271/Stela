@@ -96,6 +96,16 @@ impl ParseState<'_> {
                     return Err(Error::DuplicatePackPreload);
                 }
             }
+            HOST_CURSOR => {
+                let on = match value().ok_or(Error::HostCursor)? {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(Error::HostCursor),
+                };
+                if options.host_cursor.replace(on).is_some() {
+                    return Err(Error::DuplicateHostCursor);
+                }
+            }
             "--lid" => {
                 if options.lid.is_some() {
                     return Err(Error::DuplicateLid);

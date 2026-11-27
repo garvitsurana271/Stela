@@ -3424,3 +3424,112 @@ fn a_composed_present_goes_to_the_gpu_and_falls_back_to_the_cpu_reported_once() 
         }
     }
 }
+
+/// A 512 by 512 sink that keeps the rows each present named.
+#[derive(Clone, Default)]
+struct Rows(Rc<RefCell<Vec<Option<core::ops::Range<usize>>>>>);
+impl Scanout for Rows {
+    fn mode(&self) -> Mode {
+        Mode {
+            width: 512,
+            height: 512,
+            format: PixelFormat::Bgra8888,
+        }
+    }
+    fn present(&mut self, _: &[u8]) -> Result<()> {
+        unreachable!("rows are taken")
+    }
+    fn try_present_rows(
+        &mut self,
+        damage: Option<core::ops::Range<usize>>,
+        fill: &mut dyn FnMut(usize, &mut [u8]) -> Result<()>,
+    ) -> Result<bool> {
+        let mut row = [0; 512 * 4];
+        for y in damage.clone().unwrap_or(0..512) {
+            fill(y, &mut row)?;
+        }
+        self.0.borrow_mut().push(damage);
+        Ok(true)
+    }
+}
+
+#[test]
+fn the_host_cursor_moves_the_pointer_at_each_vblank_without_a_swap() {
+    use super::super::host_cursor::{STILL_TICKS, Shared};
+    let sink = Rows::default();
+    let presented = sink.0.clone();
+    let mut methods = Methods::new(Box::new(sink), interface());
+    methods.set_swap_tracing(false);
+    let shared: &'static Shared = Box::leak(Box::new(Shared::new()));
+    shared.enable();
+    methods.set_host_cursor(shared);
+    assert_eq!(
+        (shared.screen(), shared.position()),
+        (Some((512, 512)), (256, 256))
+    );
+    let period = methods.refresh_ticks;
+    let pointer_at = |methods: &mut Methods, x: u32, y: u32, desktop: bool| {
+        let id = start_client_swap(methods, 0xc0de);
+        let mut layers = alloc::vec![(1, 16, 16, 0x9000)];
+        if desktop {
+            layers.insert(0, (0, 512, 512, 0x1000));
+        }
+        let mut input = submission(id, &layers);
+        place(&mut input, 1, rect(0, 0, 16, 16), rect(x, y, 16, 16));
+        returned(methods.call(*b"A407", &input, 0xc));
+        id
+    };
+    let pointer = |methods: &Methods| {
+        let destination = methods.shown.unwrap()[1].unwrap().destination;
+        (destination.x, destination.y)
+    };
+    // The host gave (256, 256) and has been still since: the guest, caught
+    // up, shows its pointer there less its hotspot (6, 4).
+    shared.place(256, 256);
+    methods.refresh(period);
+    methods.refresh(period + STILL_TICKS + period);
+    let first = pointer_at(&mut methods, 250, 252, true);
+    let now = 2 * period + STILL_TICKS + period;
+    methods.present(now, |_, _| true).unwrap();
+    complete(&mut methods, first, true);
+    assert_eq!(pointer(&methods), (250, 252));
+    assert_eq!(shared.take().hotspot, (6, 4));
+
+    // The host's pointer moves; the guest sends nothing. The next vblank
+    // shows it there, over the rows it left and the rows it reached, and
+    // completes no swap.
+    shared.place(300, 280);
+    let now = now + period;
+    methods.refresh(now);
+    assert!(methods.frame_ready(now));
+    methods.present(now, |_, _| true).unwrap();
+    assert_eq!(pointer(&methods), (294, 276));
+    assert!(methods.completed.is_empty());
+    assert_eq!(presented.borrow().last(), Some(&Some(252..292)));
+    assert_eq!(shared.take().drawn, 1);
+    // Nothing new at the next vblank: nothing to show.
+    let now = now + period;
+    methods.refresh(now);
+    assert!(!methods.frame_ready(now));
+
+    // The guest, behind, places its pointer for an older position: the
+    // pointer stays where the host's is, and the swap completes as shown.
+    let late = pointer_at(&mut methods, 250, 252, false);
+    let now = now + period;
+    methods.present(now, |_, _| true).unwrap();
+    assert_eq!(pointer(&methods), (294, 276));
+    assert_eq!(methods.completed.front(), Some(&(late, true)));
+    assert_eq!(presented.borrow().last(), Some(&Some(276..292)));
+    let counts = shared.take();
+    assert_eq!((counts.locked, counts.diverged_samples), (true, 1));
+
+    // A layer the guest cannot have placed for any position given drops the
+    // lock: the next vblank shows the guest's own placement again.
+    complete(&mut methods, late, true);
+    let lost = pointer_at(&mut methods, 10, 10, false);
+    let now = now + period;
+    methods.present(now, |_, _| true).unwrap();
+    assert_eq!(pointer(&methods), (10, 10));
+    complete(&mut methods, lost, true);
+    assert!(!shared.take().locked);
+}

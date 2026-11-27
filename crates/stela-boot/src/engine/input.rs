@@ -36,12 +36,18 @@
 //! guest's emulated Magic Trackpad 2 instead of moving its mouse
 //! ([`HostInput::trackpad`]); what the guest asks of the trackpad is
 //! logged as `TRACKPAD` lines when inputs are delivered.
+//!
+//! With `--host-cursor on`, a mouse's motion moves the host's own pointer
+//! and reaches the guest as its absolute pointer's position, with the
+//! mouse's first three buttons ([`HostInput::host_cursor`]), so the display
+//! can show the pointer where the host's is (`stela_soc::dcp::host_cursor`).
 use super::storage::{Inputs, RestoreRoot};
 use crate::output;
 use alloc::vec::Vec;
 use stela_boot_core::input_pace::{self, Plan, Spread};
 use stela_boot_core::options::GuestTrackpad;
 use stela_drivers::input::{HeldInputs, Input, InputDevice, multitouch::Surface};
+use stela_soc::dcp::host_cursor;
 use stela_soc::machine::AppleDevices;
 use stela_soc::usb::trackpad::{self, Identity};
 
@@ -141,6 +147,9 @@ pub struct HostInput {
     /// and the counter then.
     trackpad_seen: trackpad::Counters,
     trackpad_reported: u64,
+    /// `--host-cursor on`: mouse motion made the guest's absolute pointer's
+    /// position ([`Self::host_cursor`]).
+    pointer: host_cursor::Pointer,
 }
 
 impl HostInput {
@@ -174,7 +183,16 @@ impl HostInput {
             new_surface: None,
             trackpad_seen: trackpad::Counters::default(),
             trackpad_reported: 0,
+            pointer: host_cursor::Pointer::default(),
         }
+    }
+
+    /// With `--host-cursor on`, turn the pointer inputs [`Self::read`] read
+    /// at TSC `now` into the guest's absolute pointer's, at the host's
+    /// position ([`host_cursor::Pointer::convert`]); otherwise leave them.
+    pub fn host_cursor(&mut self, inputs: &mut Vec<Input>, now: u64, tsc_hz: u64) {
+        self.pointer
+            .convert(&host_cursor::HOST_CURSOR, inputs, now, tsc_hz);
     }
 
     /// `--trackpad`: switch every precision touchpad to frames mode, now

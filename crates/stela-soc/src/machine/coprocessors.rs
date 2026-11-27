@@ -461,6 +461,20 @@ impl AppleDevices {
         Ok(self.smc()?.power_due(now_ms))
     }
 
+    /// `--host-cursor on`: each display shows the guest's pointer where
+    /// `shared`'s is ([`dcp::host_cursor`]).
+    pub fn set_display_host_cursor(&mut self, shared: &'static dcp::host_cursor::Shared) {
+        for master in &self.dcp_masters {
+            if let Some(display) = self
+                .bus
+                .device_mut::<Asc>(master.asc)
+                .and_then(Asc::firmware_mut::<dcp::Coprocessor>)
+            {
+                display.set_host_cursor(shared);
+            }
+        }
+    }
+
     /// Choose per-swap display tracing or bounded presentation reports.
     pub fn set_display_swap_tracing(&mut self, enabled: bool) {
         for master in &self.dcp_masters {

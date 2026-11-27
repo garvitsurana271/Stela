@@ -11,6 +11,13 @@
 //! never torn. A frame the CPU draws first waits for the composition, for
 //! [`SETTLE_MS`] at most.
 //!
+//! A lost device takes the shared buffers with it: the CPU composes until
+//! the service serves a reopened device, a new generation
+//! ([`SharedService::generation`]), and the buffers are then shared with it
+//! again. Before test 5 a loss left the CPU composing for the rest of the
+//! boot: dev64's display composed every frame on the CPU for the 520 s after
+//! WindowServer's restart, its cursor flickering.
+//!
 //! With `--hybrid-scanout on`, a display whose own GPU runs no Metal
 //! service, as an integrated GPU's panel on a laptop without a display mux,
 //! shares its buffers with the service of the GPU that draws instead, as
@@ -20,7 +27,11 @@
 //! display's GPU flips them on its vblank, where the CPU copied each frame.
 //!
 //! [`Scanout::try_present_gpu`]: stela_soc::machine::Scanout::try_present_gpu
-use super::{super::gate, Node};
+//! [`SharedService::generation`]: stela_drivers::gpu::metal::service::SharedService::generation
+use super::{
+    super::{client, gate},
+    Node,
+};
 use crate::{engine::host, output};
 use alloc::{sync::Arc, vec::Vec};
 use core::ops::Range;
@@ -36,6 +47,10 @@ use stela_soc::scanout::{GpuPresent, GpuStats, Layer, PixelFormat};
 
 /// The longest a frame the CPU draws waits for the composition before it.
 pub(super) const SETTLE_MS: u64 = 50;
+
+/// Why the CPU composes while the device that shared the display's buffers
+/// is lost and no reopened one replaced it.
+const LOST: &str = "the display's GPU device was lost";
 
 /// Whether a display without a Metal service of its own is composed by the
 /// GPU that draws (`--hybrid-scanout on`).
@@ -59,6 +74,10 @@ pub(super) struct Composition {
     pending: Option<(u64, u64)>,
     /// Why the GPU composes none of the display's frames.
     refused: Option<&'static str>,
+    /// The generation of the service's device that was lost holding the
+    /// shared buffers: they are not shared again until a reopened device
+    /// replaces it.
+    lost: Option<u64>,
     /// The first refusal's details were reported, and a composition that
     /// outlasted [`SETTLE_MS`].
     reported: bool,
@@ -104,10 +123,10 @@ impl Composition {
             }
             Some(false) => true,
             None => {
-                // Its device was lost: its buffers are shared again.
-                self.pending = None;
-                self.shared = None;
-                return GpuPresent::Declined("the display's GPU device was lost");
+                // Its device was lost: its buffers are shared again with
+                // the device that replaces it.
+                self.forget_lost();
+                return GpuPresent::Declined(LOST);
             }
         };
         let Some(shared) = &self.shared else {
@@ -142,9 +161,8 @@ impl Composition {
                 GpuPresent::Taken
             }
             Err(Error::DeviceLost) => {
-                self.shared = None;
-                self.pending = None;
-                GpuPresent::Declined("the display's GPU device was lost")
+                self.forget_lost();
+                GpuPresent::Declined(LOST)
             }
             Err(Error::Unsupported(_)) => {
                 GpuPresent::Declined("the GPU service was busy past its wait bound")
@@ -171,10 +189,7 @@ impl Composition {
         match self.composed() {
             Some(true) => self.flipped(display, tsc_hz),
             Some(false) => {}
-            None => {
-                self.pending = None;
-                self.shared = None;
-            }
+            None => self.forget_lost(),
         }
     }
 
@@ -256,6 +271,12 @@ impl Composition {
             }
             None => return Err("no Metal service runs on the display's GPU"),
         };
+        // The lost device's generation still serves: no reopened device to
+        // share with yet.
+        let generation = service.generation();
+        if self.lost == Some(generation) {
+            return Err(LOST);
+        }
         let buffers = match display.share_buffers() {
             None => return Err("the display's buffers are shared from the boot CPU first"),
             Some(Err(error)) => {
@@ -270,12 +291,17 @@ impl Composition {
             .collect();
         match service.share_scanouts(&descriptors) {
             Ok(target) => {
+                let again = self.lost.take().is_some();
                 self.shared = Some(Shared {
                     service,
                     target,
                     buffers: buffers.map(|buffer| (buffer.framebuffer, buffer.pitch as u32)),
                 });
                 match drawer {
+                    None if again => output::arguments(format_args!(
+                        "GPU {name}: composes the display's frames into its shared scanout \
+                         buffers again, on the device that replaced the lost one\n"
+                    )),
                     None => output::arguments(format_args!(
                         "GPU {name}: composes the display's frames into its shared scanout buffers\n"
                     )),
@@ -286,11 +312,29 @@ impl Composition {
                 }
                 Ok(())
             }
+            Err(Error::DeviceLost) => {
+                // A lost device took none of the descriptors. Its reopened
+                // successor takes the buffers, exported anew.
+                for (fd, _) in descriptors {
+                    client::close_descriptor(fd);
+                }
+                self.lost = Some(generation);
+                Err(LOST)
+            }
             Err(error) => {
                 // The descriptors stay open: the driver may have taken some.
                 self.report(name, "imports no scanout buffer", error);
                 Err(self.refuse("the display's GPU imports no scanout buffer"))
             }
+        }
+    }
+
+    /// The shared buffers' device was lost or replaced: the CPU composes
+    /// until a device of another generation shares them again.
+    fn forget_lost(&mut self) {
+        self.pending = None;
+        if let Some(shared) = self.shared.take() {
+            self.lost = Some(shared.target.epoch());
         }
     }
 

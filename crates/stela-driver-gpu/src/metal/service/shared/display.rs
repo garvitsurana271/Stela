@@ -26,6 +26,12 @@ pub struct DisplayTarget {
 }
 
 impl DisplayTarget {
+    /// The generation of the device that imported the buffers
+    /// ([`SharedService::generation`]).
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     pub fn len(&self) -> usize {
         self.scanouts.len()
     }
@@ -36,14 +42,26 @@ impl DisplayTarget {
 }
 
 impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
+    /// The generation of the device the service serves now: it advances
+    /// each time a reopened device replaces a lost one, so a display whose
+    /// buffers the lost device held shares them again once it differs.
+    pub fn generation(&self) -> u64 {
+        self.read_backs.generation.current()
+    }
+
     /// Imports a display's scanout buffers, each a dma-buf descriptor and
-    /// its bytes. Every descriptor is the driver's once this succeeds.
-    /// After an error the driver may have taken some, which it closes with
-    /// their memory: the caller leaves them all open.
+    /// its bytes. Every descriptor is the driver's once this succeeds. A
+    /// lost device answers [`Error::DeviceLost`] having taken none, which
+    /// the caller closes. After another error the driver may have taken
+    /// some, which it closes with their memory: the caller leaves them all
+    /// open.
     pub fn share_scanouts(&self, buffers: &[(i32, u64)]) -> Result<DisplayTarget> {
         let epoch = self.read_backs.generation.current();
         self.in_turn(|service| {
             let device = service.device();
+            if device.is_lost() {
+                return Err(Error::DeviceLost);
+            }
             let mut scanouts = Vec::new();
             for &(fd, bytes) in buffers {
                 match device.import_scanout(fd, bytes) {

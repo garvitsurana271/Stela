@@ -433,20 +433,30 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// `variant` for a block of the fetch page holding `physical`: in the
     /// translated variant when the page needs it, through the host's
     /// translation helper.
-    pub(super) fn page_variant(&self, mut variant: Variant, physical: u64) -> Variant {
+    pub(super) fn page_variant(&self, variant: Variant, physical: u64) -> Variant {
+        self.page_variant_of(variant, physical).0
+    }
+
+    /// [`Self::page_variant`], and whether the page's sets touched
+    /// `variant` at all: when not, it is `variant` itself.
+    pub(super) fn page_variant_of(&self, mut variant: Variant, physical: u64) -> (Variant, bool) {
+        let mut touched = false;
         if self.page_translated(physical)
             && let Some(helper) = self.host.translation_helper()
         {
             variant.translated = true;
             variant.checks = variant.checks.with_translation(helper);
+            touched = true;
         }
         if self.page_tagged(physical) {
             variant.checks = variant.checks.with_top_byte(self.regime_top_byte());
+            touched = true;
         }
         if variant.checks.range.one_sided && self.code.two_sided.contains(physical) {
             variant.checks.range = variant.checks.range.one_sided(false);
+            touched = true;
         }
-        variant
+        (variant, touched)
     }
 
     /// An EL0 access of the fetch page holding `physical`, by a block of

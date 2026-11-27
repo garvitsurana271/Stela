@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Garvit Surana <251430630+garvitsurana271@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 18:40:08 +0000
+Subject: [PATCH] fix(i915): a kernel built with CONFIG_STELA says the GPU's
+ clock against what RPS asked for and GT0_PERF_LIMIT_REASONS, every 30 s while
+ the render engine is awake and at each heartbeat that finds it stuck, where
+ only a reset said how fast the GPU ran and a power or thermal limit could not
+ be told from a hang
+
+MGKFN's i5-1235U Iris Xe hung with the GPU at 400 MHz of the 1200 RPS
+asked for, which only the reset's line said. The render engine's
+heartbeat now reads the actual and requested frequency, the RPS range and
+the package's limit reasons (PROCHOT, thermal, RATL, VR thermal alert,
+VR TDC, PL4, PL1, PL2 and the sticky log above them) and says them in one
+line: at most every 30 s while it beats, and at each beat that finds a
+heartbeat request stuck. Engines other than render say nothing.
+---
+ .../gpu/drm/i915/gt/intel_engine_heartbeat.c  | 52 +++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_engine_heartbeat.c b/drivers/gpu/drm/i915/gt/intel_engine_heartbeat.c
+index 6424ecce8bcbeab731ce5ba863972bfb1b060afc..6f42fa31fd5cea67781798a5f3bc0d164f514407 100644
+--- a/drivers/gpu/drm/i915/gt/intel_engine_heartbeat.c
++++ b/drivers/gpu/drm/i915/gt/intel_engine_heartbeat.c
+@@ -15,6 +15,10 @@
+ #include "intel_engine.h"
+ #include "intel_gt.h"
+ #include "intel_reset.h"
++#if IS_ENABLED(CONFIG_STELA)
++#include "i915_reg.h"
++#include "intel_rps.h"
++#endif
+ 
+ /*
+  * While the engine is active, we send a periodic pulse along the engine
+@@ -136,6 +140,48 @@ reset_engine(struct intel_engine_cs *engine, struct i915_request *rq)
+ 			      engine->name);
+ }
+ 
++#if IS_ENABLED(CONFIG_STELA)
++/*
++ * Under Stela: the GPU's clock against what RPS asked for, and why the
++ * package limits it (GT0_PERF_LIMIT_REASONS: its status bits and the
++ * sticky log above them), every 30 s while the render engine is awake and
++ * at each heartbeat that finds it stuck, so a hang can be told from a GPU
++ * held at a low clock by a power or thermal limit.
++ */
++static void stela_report_clock(struct intel_engine_cs *engine, bool stuck)
++{
++	static unsigned long next;
++	struct intel_gt *gt = engine->gt;
++	struct intel_rps *rps = &gt->rps;
++	i915_reg_t reg = intel_gt_perf_limit_reasons_reg(gt);
++	u32 reasons = 0;
++
++	if (engine->class != RENDER_CLASS)
++		return;
++	if (!stuck && next && time_before(jiffies, next))
++		return;
++	next = jiffies + msecs_to_jiffies(30000);
++	if (i915_mmio_reg_valid(reg))
++		reasons = intel_uncore_read(gt->uncore, reg);
++	drm_notice(&gt->i915->drm,
++		   "%s clock%s: gpu %u MHz (asked %u, %u-%u); perf limit reasons %#010x:%s%s%s%s%s%s%s%s\n",
++		   engine->name, stuck ? " at a stuck heartbeat" : "",
++		   intel_rps_read_actual_frequency(rps),
++		   intel_rps_get_requested_frequency(rps),
++		   intel_rps_get_min_frequency(rps),
++		   intel_rps_get_max_frequency(rps),
++		   reasons,
++		   reasons & PROCHOT_MASK ? " prochot" : "",
++		   reasons & THERMAL_LIMIT_MASK ? " thermal" : "",
++		   reasons & RATL_MASK ? " ratl" : "",
++		   reasons & VR_THERMALERT_MASK ? " vr-thermalert" : "",
++		   reasons & VR_TDC_MASK ? " vr-tdc" : "",
++		   reasons & POWER_LIMIT_4_MASK ? " pl4" : "",
++		   reasons & POWER_LIMIT_1_MASK ? " pl1" : "",
++		   reasons & POWER_LIMIT_2_MASK ? " pl2" : "");
++}
++#endif
++
+ static void heartbeat(struct work_struct *wrk)
+ {
+ 	struct i915_sched_attr attr = { .priority = I915_PRIORITY_MIN };
+@@ -174,6 +220,9 @@ static void heartbeat(struct work_struct *wrk)
+ 		if (!time_after(jiffies,
+ 				rq->emitted_jiffies + msecs_to_jiffies(delay)))
+ 			goto out;
++#if IS_ENABLED(CONFIG_STELA)
++		stela_report_clock(engine, true);
++#endif
+ 
+ 		if (!i915_sw_fence_signaled(&rq->submit)) {
+ 			/*
+@@ -211,6 +260,9 @@ static void heartbeat(struct work_struct *wrk)
+ 		goto out;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_STELA)
++	stela_report_clock(engine, false);
++#endif
+ 	serial = READ_ONCE(engine->serial);
+ 	if (engine->wakeref_serial == serial)
+ 		goto out;

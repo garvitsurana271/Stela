@@ -14,11 +14,12 @@
 //! is refused, and closing a connection releases what it still holds, newest
 //! first, so views and aliases go before the resources under them.
 //!
-//! A lost device refuses every call but releases. Once no connection holds
-//! an object of it, a service given a [`Reopen`] serves a new device in the
-//! next epoch, as a Mac's GPU comes back for the clients that start after
-//! its reset; until then new connections are refused. Connections of the
-//! lost epoch that stay open keep refusing every call but releases.
+//! A lost device refuses every call but releases. At the next connection or
+//! close, a service given a [`Reopen`] serves a new device in the next
+//! epoch, as a Mac's GPU comes back for the clients that start after its
+//! reset. Connections of the lost epoch that stay open keep their objects
+//! with the lost device and keep refusing every call but releases, which
+//! let go of their handles alone.
 use super::{
     command_buffer::blit::Region,
     device::{
@@ -606,6 +607,14 @@ impl<B: Backend, C: Compiler> Service<B, C> {
     /// device keeps what in-flight work uses until that work completes.
     pub fn disconnect(&mut self, connection: NonZeroU64) -> Result<(), Fault> {
         let mut closed = self.connections.remove(&connection).ok_or(Fault::CLOSED)?;
+        // A connection of a lost epoch names objects of the lost device,
+        // which keeps them: the device served now has nothing of it.
+        if closed.objects.epoch() != self.epoch {
+            closed.objects.close();
+            drop(closed);
+            self.recover();
+            return Ok(());
+        }
         // Its held work never runs, so nothing it names outlives the close.
         self.device.abandon(connection.get());
         closed.objects.close();
@@ -646,21 +655,17 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         ));
     }
 
-    /// Serves a new device in the next epoch once no connection holds an
-    /// object of the lost one. A connection that stays open holding nothing
-    /// (a process that keeps its `MTLDevice` but made nothing, or released
-    /// all) no longer keeps every later client from the GPU; it stays in
-    /// the lost epoch and is answered `DeviceLost`, as a Mac's `MTLDevice`
-    /// is after a GPU reset. The lost device keeps what its backend could
-    /// not prove stopped.
+    /// Serves a new device in the next epoch at the first connection or
+    /// close after a loss. A connection of the lost epoch that stays open,
+    /// holding objects or not, no longer keeps every later client from the
+    /// GPU: it stays in the lost epoch, its objects stay with the lost
+    /// device, and it is answered `DeviceLost`, as a Mac's `MTLDevice` is
+    /// after a GPU reset. MGKFN's setup screen held 47 objects of a lost
+    /// Iris Xe and every WindowServer after it was refused and crashed. The
+    /// lost device keeps what its backend could not prove stopped.
     fn recover(&mut self) {
         self.retire_step();
-        if !self.device.is_lost()
-            || self
-                .connections
-                .values()
-                .any(|connection| !connection.objects.is_empty())
-        {
+        if !self.device.is_lost() {
             return;
         }
         if self.reopen.is_none() {
@@ -745,6 +750,23 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             prepare(&mut device);
         }
         let clock = self.device.clock();
+        // Connections of the lost epoch that still hold objects keep them
+        // with the lost device: their calls but releases are refused, and
+        // their releases and closes leave the reopened device alone.
+        let (holders, held) = self
+            .connections
+            .values()
+            .filter(|connection| !connection.objects.is_empty())
+            .fold((0usize, 0usize), |(holders, held), connection| {
+                (holders + 1, held + connection.objects.len())
+            });
+        if holders != 0 {
+            self.refused.push(format!(
+                "the lost device reopened while {holders} connections of its epoch hold {held} \
+                 objects: they keep them with the lost device, which keeps what it cannot \
+                 prove the GPU stopped using, and their calls but releases are refused"
+            ));
+        }
         let lost = core::mem::replace(&mut self.device, device);
         if self.keep_lost {
             self.lost_kept.0 += 1;
@@ -1235,6 +1257,14 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         let epoch = self.epoch;
         let handle = ObjectHandle::decode(handle).ok_or(Fault::STALE)?;
         let held = self.connection(connection)?;
+        // An object of a lost epoch stays with the lost device: the
+        // connection lets go of its handle alone.
+        let lost = held.objects.epoch();
+        if lost != epoch {
+            let entry = held.objects.remove(connection, lost, handle)?;
+            held.allocated -= entry.bytes;
+            return Ok(());
+        }
         let entry = held.objects.get(connection, epoch, handle)?;
         let (object, serial) = (entry.object, entry.serial);
         self.destroy(connection, object, serial)?;

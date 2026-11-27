@@ -187,22 +187,67 @@ fn a_lost_device_reopens_once_its_last_connection_closes() {
         PREPARED.fetch_add(1, Ordering::Relaxed);
     }));
     let first = connect(&mut service);
-    let second = connect(&mut service);
     cpu_buffer(&mut service, first, 4096, StorageMode::Shared);
     service.device().mark_lost();
-    assert_eq!(
-        service.connect().unwrap_err().status,
-        Status::DeviceLost,
-        "new clients wait while a connection holds an object of the lost device"
-    );
-    service.disconnect(second).unwrap();
-    assert_eq!(REOPENED.load(Ordering::Relaxed), 0);
     service.disconnect(first).unwrap();
     assert_eq!(REOPENED.load(Ordering::Relaxed), 1);
     assert_eq!(PREPARED.load(Ordering::Relaxed), 1);
     assert!(!service.device().is_lost());
+    // Nothing held an object at the reopen, so nothing says so.
+    assert!(service.refused.is_empty(), "{:?}", service.refused);
     let next = connect(&mut service);
     cpu_buffer(&mut service, next, 4096, StorageMode::Shared);
+    assert_eq!(service.device().current_allocated_size(), 4096);
+}
+
+/// A connection of the lost epoch that keeps its objects, as MGKFN's setup
+/// screen kept 47 of a lost Iris Xe, no longer keeps every later client
+/// from the GPU: the next client reopens the device, the old connection's
+/// objects stay with the lost device, its calls but releases are refused,
+/// and its releases and close leave the reopened device untouched.
+#[test]
+fn a_lost_device_reopens_while_a_connection_still_holds_its_objects() {
+    let mut service = service().with_reopen(Box::new(|| Ok(device_on(MockBackend::new()))));
+    let held = connect(&mut service);
+    let kept = cpu_buffer(&mut service, held, 4096, StorageMode::Shared);
+    cpu_buffer(&mut service, held, 8192, StorageMode::Shared);
+    service.device().mark_lost();
+    let next = connect(&mut service);
+    assert!(!service.device().is_lost());
+    let refused = core::mem::take(&mut service.refused);
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(
+        refused[0].starts_with("the lost device reopened while 1 connections of its epoch hold "),
+        "{refused:?}"
+    );
+    cpu_buffer(&mut service, next, 4096, StorageMode::Shared);
+    assert_eq!(service.device().current_allocated_size(), 4096);
+    // The old connection is refused, and its release lets go of the handle
+    // alone.
+    assert_eq!(
+        status(call::<_, Handle>(
+            &mut service,
+            held,
+            Operation::NewEvent,
+            &Empty {},
+            &mut Memory::default()
+        )),
+        Status::DeviceLost
+    );
+    assert_eq!(
+        status(call::<_, Empty>(
+            &mut service,
+            held,
+            Operation::Release,
+            &Handle {
+                handle: kept.handle
+            },
+            &mut Memory::default()
+        )),
+        Status::Ok
+    );
+    service.disconnect(held).unwrap();
+    assert!(!service.device().is_lost());
     assert_eq!(service.device().current_allocated_size(), 4096);
 }
 

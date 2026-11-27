@@ -1002,6 +1002,65 @@ impl Heap {
         block
     }
 
+    /// Allocate zeroed storage for a Linux nonblocking (`GFP_ATOMIC`) caller.
+    ///
+    /// Unlike [`Self::try_allocate_zeroed`], which returns `NULL` on a single
+    /// contended lock attempt, this serves small objects from this core's
+    /// local cache when cores are tagged and otherwise spins with local
+    /// interrupts masked until another processor releases the heap lock. That
+    /// matches Linux's `kmalloc(GFP_ATOMIC)` (`mm/slub.c`), which never sleeps
+    /// or reclaims but still waits on its spinlock. Without this, concurrent
+    /// allocation on other cores causes `amdgpu_dm_crtc_set_vblank`
+    /// (`amdgpu_dm_crtc.c:370`) to fail spuriously with `-ENOMEM`, triggering
+    /// `CRTC_GET_SEQUENCE` `-ENOMEM` and `drm_vblank_put` underflow warnings
+    /// (`drm_vblank.c:1271`) because `dm_arm_vblank_event_pre_programming`
+    /// (`amdgpu_dm.c:10491`) ignores `drm_crtc_vblank_get`'s return value.
+    ///
+    /// # Safety
+    /// Same ownership, exact-layout `GlobalAlloc::dealloc`, and non-reentrancy
+    /// contract as [`Self::try_allocate`]: NMI, fault handlers, and callers
+    /// already holding this heap's lock on the current processor must not call
+    /// this function.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "nonblocking GFP_ATOMIC entry for the retained Linux GPU heap registration"
+        )
+    )]
+    pub unsafe fn allocate_atomic_zeroed(&self, layout: Layout) -> *mut u8 {
+        if layout.size() == 0 || self.stopping() {
+            return ptr::null_mut();
+        }
+        let class = class(layout);
+        let cpu = self.cpu();
+        let block = if let (Some(class), Some(cpu)) = (class, cpu) {
+            let flags = interrupts_off();
+            // SAFETY: on this core, with interrupts disabled.
+            let block = unsafe { self.take_cached(cpu, class) };
+            restore_interrupts(flags);
+            block
+        } else {
+            let guard = self.lock();
+            // SAFETY: this guard exclusively protects the heap state. The
+            // shared body checks initialization before accessing backing storage.
+            let block = unsafe { allocate_locked(&mut *self.state.get(), layout, class) };
+            drop(guard);
+            block
+        };
+        if !block.is_null() {
+            if class.is_none() {
+                tracked(block, layout.size(), true);
+            }
+            if let Some(cpu) = cpu {
+                self.count_own(cpu, layout, class, true);
+            }
+            // SAFETY: successful allocation gives this full payload exclusively.
+            unsafe { block.write_bytes(0, layout.size()) };
+        }
+        block
+    }
+
     /// Select whole, zeroed pages inside a CPU interval from this same heap.
     /// No reservation or CPU-to-physical relationship is inferred here.
     /// Invalid geometry and exhaustion change no free-list bytes/accounting.

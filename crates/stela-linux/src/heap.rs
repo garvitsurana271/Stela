@@ -121,11 +121,12 @@ pub struct LinuxHeapRegistration {
 /// `alloc::alloc::dealloc`, with the exact supplied layout. Failure transfers
 /// nothing and changes no allocation ownership. The callback supports concurrent
 /// admitted callers, including an entered Linux owner's IRQ-disabled/preempt/
-/// read-side context, without waiting, spinning, sleeping, reclaiming, growing
-/// backing, falling back, reentering Linux or unwinding. It may attempt the real
-/// allocator lock once and may return NULL on contention or exhaustion. This
-/// admits no native ISR, NMI or fault-handler Linux entry. No allocation may
-/// escape into a different image/allocator phase without its real owner.
+/// read-side context, without sleeping, reclaiming, growing backing, falling
+/// back, reentering Linux or unwinding. It may spin on a cross-CPU allocator
+/// lock with local interrupts masked (as Linux's `kmalloc(GFP_ATOMIC)` does on
+/// its slab lock) and returns NULL on exhaustion. This admits no native ISR,
+/// NMI or fault-handler Linux entry. No allocation may escape into a different
+/// image/allocator phase without its real owner.
 pub unsafe fn register(
     callback: TryAllocateZeroed,
 ) -> Result<LinuxHeapRegistration, TryAllocateZeroed> {

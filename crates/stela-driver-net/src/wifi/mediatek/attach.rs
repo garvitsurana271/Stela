@@ -147,7 +147,8 @@ fn retryable(error: &AttachError) -> bool {
 }
 
 /// Run `attempt` until it succeeds, at most [`BRING_UP_ATTEMPTS`] times,
-/// while its failure is [`retryable`].
+/// while its failure is [`retryable`] and the device's start budget has not
+/// expired.
 async fn with_retries<T>(
     mut attempt: impl AsyncFnMut() -> Result<T, AttachError>,
 ) -> Result<T, AttachError> {
@@ -155,7 +156,10 @@ async fn with_retries<T>(
     loop {
         tries += 1;
         match attempt().await {
-            Err(error) if tries < BRING_UP_ATTEMPTS && retryable(&error) => {}
+            Err(error)
+                if tries < BRING_UP_ATTEMPTS
+                    && retryable(&error)
+                    && !stela_driver_base::budget::is_expired() => {}
             outcome => return outcome,
         }
     }
@@ -626,5 +630,32 @@ mod tests {
             );
             assert_eq!(tries, 1);
         }
+    }
+
+    #[test]
+    fn an_expired_start_budget_stops_bring_up_retries_and_keeps_the_prior_error() {
+        let _virtual = stela_driver_base::test_clock::virtualize();
+        let clock = Clock {
+            ticks_per_microsecond: 1,
+        };
+        let budget = stela_driver_base::budget::Budget::start(clock, 1_000).unwrap();
+        let mut tries = 0u32;
+        let error = block_on(with_retries(async || -> Result<(), _> {
+            tries += 1;
+            if tries == 2 {
+                let _ = clock.wait(60_000_000, || false);
+                return Err(AttachError::Bootstrap(bootstrap::Error::FirmwareStatus(42)));
+            }
+            Err(AttachError::Bootstrap(bootstrap::Error::FirmwareStatus(
+                tries,
+            )))
+        }))
+        .unwrap_err();
+        assert_eq!(tries, 2);
+        assert!(budget.expired().is_some());
+        assert!(matches!(
+            error,
+            AttachError::Bootstrap(bootstrap::Error::FirmwareStatus(42))
+        ));
     }
 }

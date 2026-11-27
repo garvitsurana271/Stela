@@ -311,6 +311,59 @@ fn attempted_zeroed_reuse_keeps_other_live_payloads_and_global_free_rules() {
 }
 
 #[test]
+fn atomic_zeroed_allocation_waits_for_a_contended_lock_and_zeroes_reused_bytes() {
+    use core::sync::atomic::AtomicBool;
+    let heap = Heap::new();
+    let mut ram = backing();
+    let layout = Layout::from_size_align(64, 16).unwrap();
+    // SAFETY: uninitialized heap and zero-sized layout return NULL without
+    // touching backing storage.
+    unsafe {
+        assert!(heap.allocate_atomic_zeroed(layout).is_null());
+        heap.initialize(ram.0.as_mut_ptr(), ram.0.len());
+        assert!(
+            heap.allocate_atomic_zeroed(Layout::from_size_align(0, 16).unwrap())
+                .is_null()
+        );
+        let dirty = heap.alloc(layout);
+        assert!(!dirty.is_null());
+        dirty.write_bytes(0xa5, layout.size());
+        heap.dealloc(dirty, layout);
+    }
+
+    let entered = AtomicBool::new(false);
+    let guard = heap.lock();
+    let address = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            entered.store(true, Ordering::Release);
+            // SAFETY: initialized backing stays live across the scope; the
+            // main thread releases its lock below so this spins and succeeds.
+            let block = unsafe { heap.allocate_atomic_zeroed(layout) };
+            block as usize
+        });
+        while !entered.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        // Let the worker enter the spin path before dropping the lock.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        drop(guard);
+        handle.join().unwrap()
+    });
+    let block = address as *mut u8;
+    assert!(!block.is_null());
+    // SAFETY: exclusive freshly allocated block of `layout`.
+    unsafe {
+        assert!(
+            core::slice::from_raw_parts(block, layout.size())
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        heap.dealloc(block, layout);
+    }
+    assert_eq!(heap.usage().live, 0);
+}
+
+#[test]
 fn attempted_general_alignment_zeroing_and_ordinary_free_coalesce() {
     let heap = Heap::new();
     let mut ram = backing();

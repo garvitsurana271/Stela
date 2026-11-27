@@ -607,9 +607,12 @@ unsafe impl Idle for Events {
 }
 
 unsafe fn allocate_zeroed(layout: Layout) -> *mut u8 {
-    // SAFETY: the registration's contract, which this allocator's one attempt
-    // at its lock meets; the C side frees through the global allocator.
-    unsafe { crate::ALLOCATOR.try_allocate_zeroed(layout) }
+    // SAFETY: Linux's GFP_ATOMIC callers do not sleep or reclaim, and no
+    // native ISR, NMI or fault handler enters Linux. Waiting on cross-CPU heap
+    // lock contention avoids spurious -ENOMEM from amdgpu_dm_crtc_set_vblank's
+    // kzalloc_obj(..., GFP_ATOMIC); the C side frees through the global
+    // allocator.
+    unsafe { crate::ALLOCATOR.allocate_atomic_zeroed(layout) }
 }
 
 /// A function's configuration space, which its MSI source shares with Linux.

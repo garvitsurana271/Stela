@@ -11,14 +11,25 @@
 //! admitted input equal to the fetch's bytes, a page-aligned rebase and
 //! recovery rows that rebase.
 //!
-//! The same entries serve code the ring took away and the guest runs
-//! again: a block compiled again within the ring's tenure age (its ghost
-//! says so, [`super::churn::Churn::promotes`]) keeps its stored form too,
-//! and its next return after the ring takes it away again is relocated
-//! from it instead of compiled. Hot code that the ring keeps losing, which
-//! comes back every turn, is what is kept; a host gives the bound
-//! ([`Rebases::set_bound`]) from the bytes it once gave to blocks shared at
-//! compile time alone.
+//! A fetch page the board installed blocks of at two addresses at once
+//! ([`SharedFrames`]: two slides of the shared cache, a program run by two
+//! processes) keeps the stored form of every block compiled there from then
+//! on, at its first PC too: the other address's next install of it, or this
+//! one's after the ring took it away, is relocated. Seen alone, a page that
+//! only two slides run compiles each block at both, as the second PC is the
+//! one that keeps it.
+//!
+//! A block the ring took away and the guest runs again keeps no form for
+//! that alone: its next return comes when the ring takes it from the
+//! tenured generation, about a turn of the window later, and the bound
+//! turns over in seconds (a 16 GiB laptop's Finder window: 182-340 thousand
+//! such forms kept a heartbeat into an 87 MiB bound, relocations never more
+//! than the installs at a page offset another PC held, so none of those
+//! forms came back, while the forms of pages two slides ran left before
+//! their other slide asked: 11-20% of those installs relocated, 95% before
+//! the window). The window's tenured parts keep that code; a host gives
+//! the bound ([`Rebases::set_bound`]) from the code budget beside the
+//! window.
 //!
 //! Keys are content keys (the SHA-256 of the whole fetch page) and the
 //! context digest names every compile input, so a rewritten frame hashes to
@@ -37,6 +48,9 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+#[cfg(test)]
+mod replay;
+
 /// The bytes all parts keep at most.
 #[cfg(not(test))]
 pub(super) const BOUND: usize = 48 << 20;
@@ -44,6 +58,54 @@ pub(super) const BOUND: usize = 48 << 20;
 pub(super) const BOUND: usize = 1 << 20;
 /// Parts by the page key's first byte, each under its own lock.
 const PARTS: usize = 8;
+/// Bits of [`SharedFrames`]: 512 KiB, for the few tens of thousands of
+/// fetch pages a desktop runs at two addresses, each set about one bit in
+/// a hundred.
+#[cfg(not(test))]
+const SHARED_FRAME_BITS: usize = 1 << 22;
+#[cfg(test)]
+const SHARED_FRAME_BITS: usize = 1 << 18;
+
+/// The fetch pages the board installed a block of while a block of
+/// another PC at the same page offset was installed: a bit per hash of the
+/// frame, set under the page's index shard lock ([`Rebases::note_shared`])
+/// and read by compiles without it. A bit set by another frame of the same
+/// hash keeps forms that page did not need, which the bound lets go; none
+/// is cleared, as a frame of shared code stays so for the boot.
+struct SharedFrames {
+    bits: alloc::boxed::Box<[AtomicU64]>,
+}
+
+impl SharedFrames {
+    fn new() -> Self {
+        Self {
+            bits: (0..SHARED_FRAME_BITS / 64)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        }
+    }
+
+    /// The word and bit of the frame holding `physical`.
+    fn bit(physical: u64) -> (usize, u64) {
+        let frame = physical / super::FETCH_PAGE;
+        let hash = frame.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - SHARED_FRAME_BITS.ilog2());
+        (hash as usize / 64, 1 << (hash % 64))
+    }
+
+    fn note(&self, physical: u64) {
+        let (word, bit) = Self::bit(physical);
+        let word = &self.bits[word];
+        // Most installs at a shared frame find it noted: no write then.
+        if word.load(Ordering::Relaxed) & bit == 0 {
+            word.fetch_or(bit, Ordering::Relaxed);
+        }
+    }
+
+    fn holds(&self, physical: u64) -> bool {
+        let (word, bit) = Self::bit(physical);
+        self.bits[word].load(Ordering::Relaxed) & bit != 0
+    }
+}
 
 type Key = (Digest, u16, Digest);
 /// A key's place in the map: its digests' first eight bytes.
@@ -193,6 +255,7 @@ pub(super) struct Rebases {
     hits: AtomicU64,
     kept: AtomicU64,
     unstorable: AtomicU64,
+    shared: SharedFrames,
 }
 
 impl Rebases {
@@ -203,7 +266,22 @@ impl Rebases {
             hits: AtomicU64::new(0),
             kept: AtomicU64::new(0),
             unstorable: AtomicU64::new(0),
+            shared: SharedFrames::new(),
         }
+    }
+
+    /// A block at `physical` is installed while its page offset holds a
+    /// block of another PC: its page's compiles keep their forms from now
+    /// on. Under the page's index shard lock.
+    pub(super) fn note_shared(&self, physical: u64) {
+        self.shared.note(physical);
+    }
+
+    /// Whether the page holding `physical` had a block installed at two
+    /// PCs at once ([`Self::note_shared`]): what [`Self::look`]'s `shared`
+    /// takes. No lock.
+    pub(super) fn shared(&self, physical: u64) -> bool {
+        self.shared.holds(physical)
     }
 
     /// Keep up to `bound` bytes from now on: a part over its share lets its
@@ -229,15 +307,16 @@ impl Rebases {
 
     /// What a fetch at `pc` of the block at `offset` of the page whose
     /// bytes hash to `key`, compiled in `context`, does. A key not known
-    /// yet is noted as compiled at `pc`. `again` says the ring took the
-    /// block away within its tenure age: its compile keeps its form.
+    /// yet is noted as compiled at `pc`. `shared` says the page's frame is
+    /// installed at two addresses ([`Self::shared`]): its compile keeps its
+    /// form, at any PC.
     pub(super) fn look(
         &self,
         key: &Digest,
         offset: u16,
         context: &Digest,
         pc: u64,
-        again: bool,
+        shared: bool,
     ) -> Found {
         let slot = (*key, offset, *context);
         let mut part = self.part(key);
@@ -254,12 +333,14 @@ impl Rebases {
             Some(Held {
                 slot: Slot::Seen(seen),
                 ..
-            }) if *seen != pc || again => Found::Keep,
+            }) if *seen != pc || shared => Found::Keep,
             Some(_) => Found::Compile,
+            // Its keep puts the form in the slot.
+            None if shared => Found::Keep,
             None => {
                 let bound = self.bound();
                 part.put(slot, Slot::Seen(pc), bound);
-                if again { Found::Keep } else { Found::Compile }
+                Found::Compile
             }
         }
     }
@@ -383,11 +464,11 @@ mod tests {
         assert_eq!((counts.kept, counts.unstorable), (1, 1));
     }
 
-    /// A block the ring took away and the guest runs again keeps its form
-    /// at the same PC: its next return is relocated, not compiled. One the
-    /// ring did not take compiles again at its PC, as before.
+    /// A block of a page installed at two addresses keeps its form at the
+    /// same PC: its next install at either address is relocated, not
+    /// compiled. One of another page compiles again at its PC, as before.
     #[test]
-    fn a_block_compiled_again_after_the_ring_took_it_keeps_its_entry() {
+    fn a_block_of_a_shared_page_keeps_its_entry_at_its_first_pc() {
         let rebases = Rebases::new(BOUND);
         let (key, context) = (Digest([4; 32]), Digest([5; 32]));
         assert!(matches!(
@@ -403,16 +484,47 @@ mod tests {
             Found::Keep
         ));
         rebases.keep(&key, 16, &context, Some(entry(16, 64)));
-        assert!(matches!(
-            rebases.look(&key, 16, &context, 0x2010, false),
-            Found::Entry(..)
-        ));
-        // Never seen before, and taken away already (its ghost is older than
-        // the store's note of it): kept at once.
+        for pc in [0x2010, 0xdf8a010] {
+            assert!(matches!(
+                rebases.look(&key, 16, &context, pc, false),
+                Found::Entry(..)
+            ));
+        }
+        // Never seen before on a shared page: kept at its first compile,
+        // with no note of its PC first.
         assert!(matches!(
             rebases.look(&key, 32, &context, 0x2020, true),
             Found::Keep
         ));
+        assert!(matches!(
+            rebases.look(&key, 32, &context, 0x2020, false),
+            Found::Compile
+        ));
+        rebases.keep(&key, 32, &context, Some(entry(32, 64)));
+        assert!(matches!(
+            rebases.look(&key, 32, &context, 0xdf8a020, false),
+            Found::Entry(..)
+        ));
+    }
+
+    /// A frame is shared once noted, by its page and not its offset, and
+    /// another frame is not; a frame's bit stays.
+    #[test]
+    fn a_frame_noted_shared_stays_shared_whatever_its_offset() {
+        let rebases = Rebases::new(BOUND);
+        let frame = 0x8_1234_5000;
+        assert!(!rebases.shared(frame + 0x40));
+        rebases.note_shared(frame + 0x40);
+        rebases.note_shared(frame + 0x40);
+        for offset in [0, 0x40, 0xffc] {
+            assert!(rebases.shared(frame + offset));
+        }
+        let others = (1..64u64)
+            .map(|page| frame + page * super::super::FETCH_PAGE)
+            .filter(|&other| rebases.shared(other))
+            .count();
+        // A bit in about 2^18 another frame shares: none of 63.
+        assert_eq!(others, 0);
     }
 
     /// An install keeps its origin with the entry, and the next look hands

@@ -152,6 +152,18 @@ impl PackedRecovery {
     }
 
     /// The rows given to [`Self::new`].
+    /// The rows of the same position independent code run `delta` bytes
+    /// from where these were minted (`Options::with_position_independent`):
+    /// every row's instruction PC moves with it, its host sites and
+    /// bindings stay. Only minted rows are packed, so these are too.
+    pub fn rebased(&self, delta: u64) -> Self {
+        let mut rows = self.rows();
+        for row in &mut rows {
+            row.retirement = row.retirement.moved(delta);
+        }
+        Self::new(&rows)
+    }
+
     pub fn rows(&self) -> Vec<FaultRecovery> {
         let mut rows = Vec::new();
         self.decode(None, &mut rows);

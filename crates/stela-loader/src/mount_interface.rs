@@ -71,6 +71,9 @@ pub const MARKER_BYTES: usize = MAGIC.len() + 4 * FIELDS;
 /// So do the fork's `--tier2 on|off` and `--tier2-check`, hand-written
 /// opt-ins that run (and check) the engine's second compilation tier: no
 /// line setup writes holds them.
+/// So does the fork's `--share-aliases on|off`, a hand-written opt-in that
+/// runs one translation at every virtual alias of its physical code: no
+/// line setup writes holds it.
 pub const OPTIONS_REVISION: u32 = 13;
 
 /// The startup choices, beside `stela.cfg` on the ESP.

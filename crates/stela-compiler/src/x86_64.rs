@@ -76,12 +76,16 @@ pub(crate) struct Emitted {
 }
 
 impl Emitted {
+    /// Position independent code ([`asm::Code::is_position_independent`])
+    /// has no fields to relocate: `relocations` is `None`, as it moves to
+    /// another address as it is.
     pub(crate) fn into_native(self) -> crate::NativeBlock {
+        let independent = self.x86_64_code.is_position_independent();
         let (x86_64_code, relocations) = self.x86_64_code.into_parts();
         crate::NativeBlock {
             x86_64_code,
             source_map: self.source_map,
-            relocations: Some(relocations),
+            relocations: (!independent).then_some(relocations),
         }
     }
 }

@@ -47,6 +47,9 @@ pub(crate) struct Asm<'a> {
     /// instruction needs them: every instruction builds an encoder.
     vectors: Option<&'a super::vector_cache::VectorCache>,
     unguarded: bool,
+    /// The block's page in position independent code
+    /// ([`Code::set_position_independent`]).
+    position_independent: Option<u64>,
 }
 
 impl<'a> Asm<'a> {
@@ -57,6 +60,11 @@ impl<'a> Asm<'a> {
     /// The block whose exits keep a link slot, if this code's do.
     pub(crate) const fn linked_block(&self) -> Option<u64> {
         self.linked_block
+    }
+    /// The block's page in position independent code
+    /// ([`code::Code::set_position_independent`]).
+    pub(crate) const fn independent_page(&self) -> Option<u64> {
+        self.position_independent
     }
     /// `emit` given the frame's NZCV word from byte `offset`, which pinned
     /// code reaches through [`super::flag_word`] alone.
@@ -79,6 +87,7 @@ impl<'a> Asm<'a> {
             linked_block: None,
             vectors: None,
             unguarded: false,
+            position_independent: None,
         }
     }
     /// Host XMM registers that hold guest vectors, which no instruction
@@ -387,7 +396,30 @@ impl<'a> Asm<'a> {
     /// code records among its relocations so that the block, stored, moves
     /// with its page. Every guest address a block's code holds is emitted
     /// here; [`Self::mov_imm64`] takes no [`crate::GuestAddress`].
+    ///
+    /// In position independent code ([`Code::set_position_independent`]) it
+    /// is `mov destination, [rdi + page_base]` and `lea destination,
+    /// [destination + offset]`, the address's offset from the block's page:
+    /// neither changes RFLAGS, as `movabs` does not, and nothing is recorded
+    /// to relocate. An offset past 32 bits takes the field, which leaves the
+    /// code not position independent.
     pub(crate) fn guest_imm64(&mut self, destination: Gpr, address: crate::GuestAddress) {
+        const PAGE_BASE: i32 = core::mem::offset_of!(crate::GuestState, page_base) as i32;
+        if let Some(page) = self.position_independent
+            && let Ok(offset) = i32::try_from(address.0.wrapping_sub(page) as i64)
+        {
+            self.mov_load(
+                Size::Qword,
+                destination,
+                Mem::base_disp32(Gpr::Rdi, PAGE_BASE),
+            );
+            self.lea(
+                Size::Qword,
+                destination,
+                Mem::base_disp32(destination, offset),
+            );
+            return;
+        }
         self.opcode_reg(Size::Qword, 0xb8, destination);
         let at = self.code.len();
         self.data(&address.0.to_le_bytes());

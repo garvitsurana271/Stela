@@ -114,6 +114,14 @@ impl RetirementPoint {
     pub const fn instruction_pc(self) -> GuestAddress {
         self.instruction_pc
     }
+    /// The same point of the same code run `delta` bytes away: position
+    /// independent code at another address its page is mapped at.
+    pub(crate) const fn moved(self, delta: u64) -> Self {
+        Self {
+            instruction_pc: GuestAddress(self.instruction_pc.0.wrapping_add(delta)),
+            ..self
+        }
+    }
     pub const fn retired_before(self) -> u16 {
         self.retired_before
     }

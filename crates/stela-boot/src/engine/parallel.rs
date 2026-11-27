@@ -104,6 +104,9 @@ pub(crate) struct Settings {
     /// `--tlbi-keep` and `--tlbi-verify-check` ([`stela_boot_core::options::System::tlbi_keep`]),
     /// as on the home machine.
     pub tlbi_keep: (bool, bool),
+    /// `--share-aliases` ([`stela_boot_core::options::System::share_aliases`]),
+    /// as on the home machine.
+    pub share_aliases: bool,
     /// `--hle` and `--hle-off`: the functions native routines replace, as
     /// on the home machine.
     pub hle: stela_engine::hle::Config,
@@ -142,6 +145,7 @@ pub(crate) fn spawn<H: Host>(
             step_timing: settings.step_timing,
             amx_model: settings.amx_model,
             tlbi_keep: settings.tlbi_keep,
+            share_aliases: settings.share_aliases,
             hle: settings.hle.clone(),
             tier2: settings.tier2,
         };
@@ -168,6 +172,7 @@ struct Pe {
     step_timing: bool,
     amx_model: u32,
     tlbi_keep: (bool, bool),
+    share_aliases: bool,
     hle: stela_engine::hle::Config,
     tier2: Option<stela_engine::machine::engine::tier2::Tier2Options>,
 }
@@ -184,6 +189,7 @@ impl Pe {
             step_timing,
             amx_model,
             tlbi_keep,
+            share_aliases,
             hle,
             tier2,
         } = self;
@@ -210,6 +216,7 @@ impl Pe {
         machine.set_step_timing(step_timing);
         machine.set_amx_model(amx_model);
         machine.set_tlbi_keep(tlbi_keep.0, tlbi_keep.1);
+        machine.set_share_aliases(share_aliases);
         machine.set_hle(hle);
         machine.set_tier2(tier2);
         if step_timing {

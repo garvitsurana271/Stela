@@ -24,7 +24,7 @@ mod testing;
 pub mod wkdm;
 pub mod x86_64;
 
-pub use state::{Anchor, Anchors, ExitStack, GuestState, Limit, Place};
+pub use state::{Anchor, Anchors, ExitStack, GuestState, Limit, PageBase, Place};
 pub use target::{TargetCpu, TargetParseError};
 
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,7 @@ pub struct Options {
     numerical: aarch64::floating::features::NumericalFeatures,
     checks: x86_64::MemoryChecks,
     native: x86_64::NativeSystem,
+    position_independent: bool,
 }
 
 impl Options {
@@ -107,6 +108,7 @@ impl Options {
             numerical: aarch64::floating::features::NumericalFeatures::new(false, false, false),
             checks: x86_64::MemoryChecks::DEFAULT,
             native: x86_64::NativeSystem::NONE,
+            position_independent: false,
         }
     }
     /// The guest's scalable specialization, which [`block::Features::CONTEXT`]
@@ -143,8 +145,26 @@ impl Options {
         Self { native, ..self }
     }
 
+    /// Compile a system-mode block position independent where it can be
+    /// (`x86_64::block::emit_system_mode_position_independent`): each guest
+    /// address it holds is its offset from the block's page added to the
+    /// page it runs at (`GuestState::page_base`), so one copy serves every
+    /// address the page is mapped at. Only the direct system-mode profile
+    /// admits it; a region, or a block ending in a System or PAC
+    /// instruction the engine completes natively through its own address,
+    /// compiles as before.
+    pub const fn with_position_independent(self, position_independent: bool) -> Self {
+        Self {
+            position_independent,
+            ..self
+        }
+    }
+
     pub const fn profile(&self) -> block::BlockProfile {
         self.profile
+    }
+    pub const fn position_independent(&self) -> bool {
+        self.position_independent
     }
     pub const fn target(&self) -> TargetCpu {
         self.target

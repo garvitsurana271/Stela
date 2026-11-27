@@ -387,6 +387,83 @@ fn lines() -> Vec<String> {
     lines
 }
 
+/// `--share-aliases on` compiles the corpus position independent wherever
+/// it can (`Options::with_position_independent`): such a block compiled at
+/// the shared cache's two slides, 0xdf88000 apart, is one copy, the same
+/// code with no field to relocate, its source map, exits and fault rows
+/// those of the other moved by the slide; every other block is the plain
+/// compile byte for byte, and a refusal refuses either way.
+#[test]
+fn position_independent_blocks_are_one_copy_at_every_slide() {
+    use stela_compiler::block::PackedRecovery;
+    const SLIDE: u64 = 0xdf8_8000;
+    let (mut independent, mut compiled) = (0, 0);
+    for index in 0..CASES {
+        let (words, pc) = case(index);
+        let source: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        for options in variants() {
+            let sharing = options.with_position_independent(true);
+            let at = |pc| stela_compiler::compile(&source, GuestAddress(pc), &sharing);
+            let plain = stela_compiler::compile(&source, GuestAddress(pc), &options);
+            let (here, there) = (at(pc), at(pc + SLIDE));
+            let (Ok(here), Ok(there)) = (&here, &there) else {
+                assert!(here.is_err() && there.is_err() && plain.is_err(), "{index}");
+                continue;
+            };
+            compiled += 1;
+            assert_eq!(
+                here.position_independent, there.position_independent,
+                "{index}"
+            );
+            if !here.position_independent {
+                assert_eq!(digest(&Ok(here.clone())), digest(&plain), "{index}");
+                continue;
+            }
+            independent += 1;
+            let plain = plain.expect("the plain compile");
+            assert_eq!(here.source_bytes, plain.source_bytes, "{index}");
+            assert_eq!(here.native.x86_64_code, there.native.x86_64_code, "{index}");
+            assert_eq!(here.native.relocations, None, "{index}");
+            assert_eq!(here.cold, there.cold, "{index}");
+            let moved: Vec<_> = here
+                .native
+                .source_map
+                .iter()
+                .map(|&(pc, offset)| (GuestAddress(pc.0 + SLIDE), offset))
+                .collect();
+            assert_eq!(moved, there.native.source_map, "{index}");
+            assert_eq!(here.direct_exits.len(), there.direct_exits.len(), "{index}");
+            for (exit, other) in here.direct_exits.iter().zip(&there.direct_exits) {
+                assert_eq!(exit.offset, other.offset, "{index}");
+                assert_eq!(exit.target.0 + SLIDE, other.target.0, "{index}");
+                assert_eq!((exit.kind, exit.skipped), (other.kind, other.skipped));
+                // Every exit is one the plain block has, to the same target.
+                assert!(
+                    plain.direct_exits.iter().any(|plain| (
+                        plain.target,
+                        plain.kind,
+                        plain.skipped
+                    ) == (
+                        exit.target,
+                        exit.kind,
+                        exit.skipped
+                    )),
+                    "{index}"
+                );
+            }
+            assert_eq!(
+                PackedRecovery::new(&here.fault_recovery).rebased(SLIDE),
+                PackedRecovery::new(&there.fault_recovery),
+                "{index}"
+            );
+        }
+    }
+    // Most of the corpus shares: only regions and System or PAC terminals
+    // compile apart.
+    std::println!("POSITION INDEPENDENT {independent} of {compiled} compiled blocks");
+    assert!(independent * 2 > compiled, "{independent} of {compiled}");
+}
+
 #[test]
 fn tier1_golden_output_is_unchanged() {
     let lines = lines();

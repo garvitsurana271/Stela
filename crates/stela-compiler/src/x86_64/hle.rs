@@ -227,7 +227,7 @@ pub fn compose(request: Request, bail: CompiledBlock) -> Result<Composite, Refus
         (0, 0) => (0, 0),
         (start, end) => (start + shift, end + shift),
     };
-    super::block::align_exits(&mut bytes, &exits, Some(pc.0));
+    super::block::align_exits(&mut bytes, &exits, Some(pc.0), None);
     Ok(Composite {
         block: CompiledBlock {
             native: NativeBlock {
@@ -242,6 +242,7 @@ pub fn compose(request: Request, bail: CompiledBlock) -> Result<Composite, Refus
             self_loop: false,
             region: false,
             cold,
+            position_independent: false,
         },
         prefix_end: shift,
     })

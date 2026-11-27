@@ -134,6 +134,23 @@ pub const DYNAMIC_EXIT_BYTES: usize = EXIT_POINT_BYTES + 5 + EXIT_RETURN_BYTES;
 pub const EXIT_POINT_BYTES: usize = MAX_PAD + PATCH_BYTES;
 /// [`crate::GuestState::exit_rsp`], from RDI.
 pub const EXIT_RSP_OFFSET: i32 = core::mem::offset_of!(crate::GuestState, exit_rsp) as i32;
+/// [`crate::GuestState::page_base`], from RDI: the page of the guest code
+/// native code runs, which position independent code adds its addresses'
+/// offsets to.
+pub const PAGE_BASE_OFFSET: i32 = core::mem::offset_of!(crate::GuestState, page_base) as i32;
+
+/// With aliases shared (`sharing`), the page of the target in `from` as the
+/// state's page base ([`crate::GuestState::page_base`]), through `scratch`:
+/// every transfer that enters a block of another page sets it, so code
+/// compiled position independent finds the page it runs at. It clobbers the
+/// flags, as every tail and probe may. Nothing without sharing.
+fn enter_page(asm: &mut crate::x86_64::asm::Asm, sharing: bool, from: Gpr, scratch: Gpr) {
+    if sharing {
+        asm.mov(Qword, scratch, from);
+        asm.alu_imm32(Alu::And, Qword, scratch, -(LINK_PAGE as i32));
+        asm.mov_store(Qword, Mem::base(Gpr::Rdi, PAGE_BASE_OFFSET), scratch);
+    }
+}
 /// Bytes of [`EXIT_RETURN`].
 pub const EXIT_RETURN_BYTES: usize = 8;
 /// Every return of native code to the engine: `mov rsp, [rdi + exit_rsp]`
@@ -2770,6 +2787,91 @@ fn direct_exit_padded(target: GuestAddress, word: u32, pad: usize) -> [u8; DIREC
     bytes
 }
 
+/// Bytes in a position independent block's direct exit: a direct exit
+/// whose target is `mov rax, [rdi + page_base]` and `lea rax, [rax +
+/// offset]` ([`relative_target`]), its offset from the page the code runs
+/// at, in place of the MOVABS.
+pub const RELATIVE_EXIT_BYTES: usize = DIRECT_EXIT_BYTES + 4;
+/// Where a relative exit's LEA displacement lies, however it is padded.
+const RELATIVE_OFFSET: usize = EXIT_POINT_BYTES + 7 + 3;
+
+fn relative_exit_padded(offset: i32, word: u32, pad: usize) -> [u8; RELATIVE_EXIT_BYTES] {
+    let mut bytes = [0; RELATIVE_EXIT_BYTES];
+    bytes[..EXIT_POINT_BYTES].copy_from_slice(&exit_point(pad));
+    let mut code = Code::new();
+    relative_target(&mut code.asm(), offset);
+    let target = code.into_bytes();
+    debug_assert_eq!(target.len(), RELATIVE_OFFSET + 4 - EXIT_POINT_BYTES);
+    bytes[EXIT_POINT_BYTES..RELATIVE_OFFSET + 4].copy_from_slice(&target);
+    bytes[RELATIVE_OFFSET + 4..].copy_from_slice(&word_return(word));
+    bytes
+}
+
+/// The offset and encoded word of the relative exit `bytes` are, of any
+/// padding.
+fn relative_exit_of(bytes: &[u8]) -> Option<(i32, u32)> {
+    let offset = i32::from_le_bytes(
+        bytes
+            .get(RELATIVE_OFFSET..RELATIVE_OFFSET + 4)?
+            .try_into()
+            .ok()?,
+    );
+    let field = RELATIVE_OFFSET + 4 + 1;
+    let word = u32::from_le_bytes(bytes.get(field..field + 4)?.try_into().ok()?);
+    (0..=MAX_PAD)
+        .any(|pad| bytes == relative_exit_padded(offset, word, pad))
+        .then_some((offset, word))
+}
+
+/// The bytes of a direct exit in code whose addresses are relative to the
+/// page `home` ([`RELATIVE_EXIT_BYTES`]), or absolute without one.
+pub const fn exit_bytes(home: Option<u64>) -> usize {
+    match home {
+        Some(_) => RELATIVE_EXIT_BYTES,
+        None => DIRECT_EXIT_BYTES,
+    }
+}
+
+/// [`is_direct_exit`] in code whose addresses are relative to the page
+/// `home`, or absolute without one: a relative exit's offset is the
+/// target's from `home`.
+pub fn is_exit(
+    bytes: &[u8],
+    target: GuestAddress,
+    kind: impl Into<ExitWord>,
+    home: Option<u64>,
+) -> bool {
+    let Some(home) = home else {
+        return is_direct_exit(bytes, target, kind);
+    };
+    let word = kind.into().encoded();
+    i32::try_from(target.0.wrapping_sub(home) as i64).is_ok_and(|offset| {
+        (0..=MAX_PAD).any(|pad| bytes == relative_exit_padded(offset, word, pad))
+    })
+}
+
+/// Whether `bytes` are a relative direct exit of any offset, kind and
+/// padding.
+pub fn is_relative_exit_of_any_kind(bytes: &[u8]) -> bool {
+    relative_exit_of(bytes).is_some()
+}
+
+/// [`align_direct_exit`] of a relative exit ([`RELATIVE_EXIT_BYTES`]).
+pub fn align_relative_exit(code: &mut [u8], offset: usize, at: u64) -> bool {
+    let Some(bytes) = code.get_mut(offset..offset + RELATIVE_EXIT_BYTES) else {
+        return false;
+    };
+    let Some((target, word)) = relative_exit_of(bytes) else {
+        return false;
+    };
+    bytes.copy_from_slice(&relative_exit_padded(
+        target,
+        word,
+        patch_pad(at + offset as u64),
+    ));
+    true
+}
+
 /// A NOP of `pad` bytes, the unlinked patch point ([`RET_ROOM`]) and a NOP
 /// of the rest of [`MAX_PAD`]: the start of every exit.
 pub(crate) const fn exit_point(pad: usize) -> [u8; EXIT_POINT_BYTES] {
@@ -3337,7 +3439,17 @@ pub(crate) fn paired_call(
 /// discards the frames. A block retired meanwhile, by any PE, advances
 /// the epoch, which every frame of the run then fails, so a return never
 /// enters a retired block's continuation through its frame.
+#[cfg(test)]
 pub(crate) fn paired_return(asm: &mut crate::x86_64::asm::Asm, ran: u32) -> Option<()> {
+    paired_return_for(asm, ran, false)
+}
+
+/// [`paired_return`] for code whose aliases share translations
+/// (`sharing`): the continuation runs at the page of the frame's address,
+/// which the state's page base takes first ([`enter_page`]). A position
+/// independent block pairs only a call whose return address is in its
+/// own page (`x86_64::block::paired_exit`), so that page is the caller's.
+fn paired_return_for(asm: &mut crate::x86_64::asm::Asm, ran: u32, sharing: bool) -> Option<()> {
     let ran = i32::try_from(i64::from(ran) << ACCOUNT_LANE_BITS).ok()?;
     let frame = |word: FrameWord| Mem::base(Gpr::Rsp, word as i32);
     asm.alu_load(
@@ -3373,6 +3485,7 @@ pub(crate) fn paired_return(asm: &mut crate::x86_64::asm::Asm, ran: u32) -> Opti
         Mem::base(Rcx, PairCount::Matched.offset()),
         1,
     );
+    enter_page(asm, sharing, Rax, R8);
     // ret 40: into the continuation, the rest of the frame taken.
     asm.fixed(&[0xc2, (FRAME_BYTES - 8) as u8, 0]);
     for miss in misses {
@@ -3433,14 +3546,24 @@ pub const CELL_TAIL_BYTES: usize = 10 + 10 + TAIL_BYTES;
 /// and its indirect jump into the found block, are shared: the host's
 /// indirect predictor tells sites apart by the path into it.
 pub fn lookup_dispatcher(btype: u8) -> Option<Vec<u8>> {
-    dispatcher_with_policy(btype, Interruption::Quiet)
+    dispatcher_with(btype, Interruption::Quiet, false)
 }
+/// [`lookup_dispatcher`] for code whose aliases share translations
+/// (`sharing`): each probe that enters a block sets the state's page base
+/// to the target's page first ([`crate::GuestState::page_base`]).
+pub fn lookup_dispatcher_for(btype: u8, sharing: bool) -> Option<Vec<u8>> {
+    dispatcher_with(btype, Interruption::Quiet, sharing)
+}
+#[cfg(test)]
 fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
+    dispatcher_with(btype, policy, false)
+}
+fn dispatcher_with(btype: u8, policy: Interruption, sharing: bool) -> Option<Vec<u8>> {
     if btype > 3 {
         return None;
     }
     let mut code = Code::new();
-    let (to_table, to_probe) = cell_probe(&mut code, policy, false, btype);
+    let (to_table, to_probe) = cell_probe(&mut code, policy, false, btype, sharing);
     let padding = CELL_PROBE_BYTES
         .checked_sub(code.len())
         .expect("the cell probe fits its bytes");
@@ -3496,7 +3619,7 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     fill_jump_cache(&mut asm);
     entered_btype(&mut asm, R8, btype);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
-    found(&mut asm);
+    found(&mut asm, sharing);
     for miss in misses {
         asm.bind(miss);
     }
@@ -3510,7 +3633,7 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     for _ in 0..padding {
         code.asm().int3();
     }
-    let (to_table, to_probe) = cell_probe(&mut code, policy, true, btype);
+    let (to_table, to_probe) = cell_probe(&mut code, policy, true, btype, sharing);
     crate::x86_64::asm::resolve(&mut code, to_table, table);
     crate::x86_64::asm::resolve(&mut code, to_probe, PROBE_ENTRY);
     Some(code.into_bytes())
@@ -3540,6 +3663,7 @@ fn cell_probe(
     policy: Interruption,
     stamping: bool,
     btype: u8,
+    sharing: bool,
 ) -> (crate::x86_64::asm::Patch, crate::x86_64::asm::Patch) {
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
@@ -3572,7 +3696,7 @@ fn cell_probe(
     if stamping {
         stamp(&mut asm);
     }
-    found(&mut asm);
+    found(&mut asm, sharing);
     for miss in misses {
         asm.bind(miss);
     }
@@ -3695,6 +3819,7 @@ pub fn stamped_tail(
         probe,
         0,
         Interruption::Quiet,
+        false,
     )
 }
 
@@ -3718,6 +3843,28 @@ pub fn stamped_branch_tail(
     probe: u64,
     btype: u8,
 ) -> Option<[u8; STAMPED_TAIL_BYTES]> {
+    stamped_branch_tail_for(
+        at, cell, number, target, word, ran, block, entry, probe, btype, false,
+    )
+}
+
+/// [`stamped_branch_tail`] for code whose aliases share translations
+/// (`sharing`): its hit sets the state's page base to the target's page
+/// before it enters the block ([`crate::GuestState::page_base`]).
+#[allow(clippy::too_many_arguments)]
+pub fn stamped_branch_tail_for(
+    at: u64,
+    cell: u64,
+    number: u32,
+    target: u64,
+    word: impl Into<ExitWord>,
+    ran: u32,
+    block: u32,
+    entry: u64,
+    probe: u64,
+    btype: u8,
+    sharing: bool,
+) -> Option<[u8; STAMPED_TAIL_BYTES]> {
     if btype > 3 {
         return None;
     }
@@ -3733,6 +3880,7 @@ pub fn stamped_branch_tail(
         probe,
         btype,
         Interruption::Quiet,
+        sharing,
     )
 }
 
@@ -3749,6 +3897,7 @@ fn stamped_with_policy(
     probe: u64,
     btype: u8,
     policy: Interruption,
+    sharing: bool,
 ) -> Option<[u8; STAMPED_TAIL_BYTES]> {
     if number as usize >= STAMPED_CELLS || ran >= 1 << (u32::BITS - ExitWord::RAN_SHIFT) {
         return None;
@@ -3782,6 +3931,10 @@ fn stamped_with_policy(
         let named = u64::from(block as u32) | u64::from(btype) << BLOCK_BTYPE_SHIFT;
         asm.mov_imm64(R9, named);
         asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R9);
+    }
+    if sharing {
+        asm.mov_imm64(R9, target & !(LINK_PAGE - 1));
+        asm.mov_store(Qword, Mem::base(Gpr::Rdi, PAGE_BASE_OFFSET), R9);
     }
     let transfer = asm.jmp();
     let distance = relative(at + transfer.end() as u64, entry)?;
@@ -3914,7 +4067,9 @@ fn itlb_compare(
 
 /// A probe's transfer, counted: back to the tail that called it, whose
 /// `jmp r9` enters the block at R9.
-fn found(asm: &mut crate::x86_64::asm::Asm) {
+fn found(asm: &mut crate::x86_64::asm::Asm, sharing: bool) {
+    // The block is entered at the target's page ([`enter_page`]).
+    enter_page(asm, sharing, Rax, R11);
     asm.ret();
 }
 
@@ -3958,7 +4113,79 @@ pub fn lookup_tail(
     probe: u64,
     btype: u8,
 ) -> Option<[u8; LOOKUP_TAIL_BYTES]> {
-    lookup_tail_with_policy(at, word.into(), ran, probe, btype, Interruption::Quiet)
+    lookup_tail_with_policy(
+        at,
+        word.into(),
+        ran,
+        probe,
+        btype,
+        Interruption::Quiet,
+        false,
+    )
+}
+
+/// [`lookup_tail`] for code whose aliases share translations (`sharing`):
+/// its jump cache's hit sets the state's page base to the target's page
+/// before it enters the block, as the probes do
+/// ([`lookup_dispatcher_for`]).
+pub fn lookup_tail_for(
+    at: u64,
+    word: impl Into<ExitWord>,
+    ran: u32,
+    probe: u64,
+    btype: u8,
+    sharing: bool,
+) -> Option<[u8; LOOKUP_TAIL_BYTES]> {
+    lookup_tail_with_policy(
+        at,
+        word.into(),
+        ran,
+        probe,
+        btype,
+        Interruption::Quiet,
+        sharing,
+    )
+}
+
+/// The tail at host address `at` of a position independent block's direct
+/// exit out of its page, whose target lies `offset` bytes from the page the
+/// block runs at: the target in RAX from the state's page base
+/// ([`crate::GuestState::page_base`]), which the exit's patch point did not
+/// load, then a [`lookup_tail_for`] with sharing. One copy of the block
+/// serves every address its page is mapped at, so no target is built in: a
+/// cell's or a stamp's would be one address's. `None` as for a
+/// [`lookup_tail`].
+pub fn relative_lookup_tail(
+    at: u64,
+    offset: i32,
+    word: impl Into<ExitWord>,
+    ran: u32,
+    probe: u64,
+) -> Option<[u8; LOOKUP_TAIL_BYTES]> {
+    let mut code = Code::new();
+    relative_target(&mut code.asm(), offset);
+    lookup_tail_code(
+        &mut code,
+        at,
+        word.into(),
+        ran,
+        probe,
+        0,
+        Interruption::Quiet,
+        true,
+    )?;
+    let padding = LOOKUP_TAIL_BYTES.checked_sub(code.len())?;
+    for _ in 0..padding {
+        code.asm().int3();
+    }
+    code.try_into().ok()
+}
+
+/// `mov rax, [rdi + page_base]` and `lea rax, [rax + offset]`: the target
+/// `offset` bytes from the page the code runs at, leaving the flags.
+fn relative_target(asm: &mut crate::x86_64::asm::Asm, offset: i32) {
+    asm.mov_load(Qword, Rax, Mem::base_disp32(Gpr::Rdi, PAGE_BASE_OFFSET));
+    asm.lea(Qword, Rax, Mem::base_disp32(Rax, offset));
 }
 
 fn lookup_tail_with_policy(
@@ -3968,9 +4195,10 @@ fn lookup_tail_with_policy(
     probe: u64,
     btype: u8,
     policy: Interruption,
+    sharing: bool,
 ) -> Option<[u8; LOOKUP_TAIL_BYTES]> {
     let mut code = Code::new();
-    lookup_tail_code(&mut code, at, word, ran, probe, btype, policy)?;
+    lookup_tail_code(&mut code, at, word, ran, probe, btype, policy, sharing)?;
     let padding = LOOKUP_TAIL_BYTES.checked_sub(code.len())?;
     for _ in 0..padding {
         code.asm().int3();
@@ -4009,8 +4237,21 @@ pub fn paired_tail(
     ran: u32,
     probe: u64,
 ) -> Option<[u8; PAIRED_TAIL_BYTES]> {
+    paired_tail_for(at, word, ran, probe, false)
+}
+
+/// [`paired_tail`] for code whose aliases share translations (`sharing`):
+/// the frame's return and the lookup's hits set the state's page base
+/// ([`paired_return_for`], [`lookup_tail_for`]).
+pub fn paired_tail_for(
+    at: u64,
+    word: impl Into<ExitWord>,
+    ran: u32,
+    probe: u64,
+    sharing: bool,
+) -> Option<[u8; PAIRED_TAIL_BYTES]> {
     let mut code = Code::new();
-    paired_return(&mut code.asm(), ran)?;
+    paired_return_for(&mut code.asm(), ran, sharing)?;
     lookup_tail_code(
         &mut code,
         at,
@@ -4019,6 +4260,7 @@ pub fn paired_tail(
         probe,
         0,
         Interruption::Quiet,
+        sharing,
     )?;
     let padding = PAIRED_TAIL_BYTES.checked_sub(code.len())?;
     for _ in 0..padding {
@@ -4028,6 +4270,7 @@ pub fn paired_tail(
 }
 
 /// [`lookup_tail`]'s code, appended to `code`, which runs from `at`.
+#[allow(clippy::too_many_arguments)]
 fn lookup_tail_code(
     code: &mut Code,
     at: u64,
@@ -4036,6 +4279,7 @@ fn lookup_tail_code(
     probe: u64,
     btype: u8,
     policy: Interruption,
+    sharing: bool,
 ) -> Option<()> {
     if btype > 3 || ran >= 1 << (u32::BITS - ExitWord::RAN_SHIFT) {
         return None;
@@ -4074,6 +4318,7 @@ fn lookup_tail_code(
     asm.mov_load(Dword, R8, entry(JUMP_BLOCK));
     entered_btype(&mut asm, R8, btype);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
+    enter_page(&mut asm, sharing, Rax, R11);
     asm.jmp_rm(entry(JUMP_CODE));
     for miss in misses {
         asm.bind(miss);
@@ -6169,6 +6414,8 @@ mod tests {
     mod predicted;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod shared;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    mod sharing;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod stamped;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

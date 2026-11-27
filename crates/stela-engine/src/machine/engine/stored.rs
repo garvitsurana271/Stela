@@ -271,7 +271,7 @@ pub trait Translations {
         None
     }
     /// The bytes of stored forms the board keeps for blocks compiled at a
-    /// second address or compiled again after the ring took them away (its
+    /// second address or on a page installed at two addresses at once (its
     /// rebase entries), when the store sizes them (a fixed bound
     /// otherwise).
     fn kept_entry_bytes(&mut self) -> Option<usize> {

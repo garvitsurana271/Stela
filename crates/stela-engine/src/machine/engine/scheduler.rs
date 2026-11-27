@@ -448,6 +448,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.enter_events();
         self.cpu.state.anchors = self.anchors();
         self.cpu.state.lower_limit = self.lower_limit();
+        // Position independent code runs at the entered block's page
+        // ([`super::share_aliases`]).
+        if self.share.on {
+            self.cpu.state.page_base =
+                stela_compiler::PageBase(self.code.blocks[index].pc & !(FETCH_PAGE - 1));
+        }
         let entered = self.timing_start();
         self.set_doing(0);
         // SAFETY: installed by this machine since the last discard, for the system-mode block ABI;
@@ -538,6 +544,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
         {
             return Err(self.fail_native(index, fault, NativeFailureReason::UnknownCode));
         }
+        // Shared code reached through a link another alias made ends at the
+        // alias of the page it ran at ([`Self::shared_block`]).
+        let last = match self.share.on {
+            true => self.shared_block(last, self.cpu.state.page_base.0)?,
+            false => last,
+        };
         // Tier 2's heat: where the run started, and where its budget ran out.
         self.tier2_heat(index, last, exhausted);
         // A sampled run whose budget ran out was in `last` at a uniformly
@@ -814,6 +826,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// ([`Machine::direct_exit`]). Whether the exit is linked now.
     pub(super) fn link(&mut self, index: usize, next_pc: u64, word: impl Into<ExitWord>) -> bool {
         let word = word.into();
+        // Shared code links through its owner's record.
+        let Some((index, next_pc)) = self.link_owner(index, next_pc) else {
+            return false;
+        };
         let unlinked = |code: &board::Code| {
             let block = &code.blocks[index];
             let record = code.blocks.record(index);
@@ -905,6 +921,22 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return false;
         };
         let retired = u32::from(block.instructions) - u32::from(word.skipped);
+        // Shared code's exit out of its page takes the target from the
+        // page it runs at: no cell or stamp names one address's.
+        if block.marks.independent() && (next_pc ^ block.pc) & !(FETCH_PAGE - 1) != 0 {
+            let point = chain::direct_patch(block.successors[position].site);
+            let Ok(offset) =
+                i32::try_from(next_pc.wrapping_sub(block.pc & !(FETCH_PAGE - 1)) as i64)
+            else {
+                return false;
+            };
+            let mut table = code.cache_at(board::LockSite::Link);
+            if self.link_relative(&mut table, point, offset, retired, word) {
+                record.settle(position);
+                return true;
+            }
+            return false;
+        }
         if (next_pc ^ block.pc) & !(FETCH_PAGE - 1) != 0 {
             // A cell needs the entry this PE's translation of the target
             // names: without one it would hold none, and every transfer
@@ -933,6 +965,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.direct_exit = Some((index, record.incarnation(), next_pc, word));
             return false;
         };
+        // Shared code runs at every alias's page: it enters only code that
+        // does too.
+        if block.marks.independent() && !code.blocks[target].marks.shared() {
+            return false;
+        }
         let exit = block.successors[position];
         let site = exit.site;
         let entry = code.blocks[target].code.0 as u64;
@@ -1046,6 +1083,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// becomes the site's second, whose own predicted tail the miss then
     /// jumps to, its miss the lookup ([`Self::link_second`]).
     pub(super) fn link_dynamic(&mut self, index: usize, btype: u8, target: u64) {
+        // Shared code links through its owner's record; its lookups take
+        // the target in RAX.
+        let Some((index, _)) = self.link_owner(index, target) else {
+            return;
+        };
         // Decided on the board borrowed: nearly every such exit has its
         // dispatcher already, and a clone of the board's `Arc` would write
         // a count every PE's exits write.
@@ -1222,8 +1264,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let at = tail.0 as u64;
         let probe = probe + chain::PROBE_ENTRY as u64;
         let code = match returning {
-            true => chain::paired_tail(at, word, retired, probe).map(|code| code.to_vec()),
-            false => chain::lookup_tail(at, word, retired, probe, btype).map(|code| code.to_vec()),
+            true => chain::paired_tail_for(at, word, retired, probe, self.share.on)
+                .map(|code| code.to_vec()),
+            false => chain::lookup_tail_for(at, word, retired, probe, btype, self.share.on)
+                .map(|code| code.to_vec()),
         };
         let (Some(code), Some(jump)) = (code, chain::jump(site, at)) else {
             return false;
@@ -1232,6 +1276,44 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.profile_code(tail, code.len(), step_timing::CodeRegion::Lookup);
         self.patch_point(NativeCode(site as usize), jump);
         self.statistics.lookups += 1;
+        true
+    }
+
+    /// Send the direct exit of `word` out of its page whose patch point is at
+    /// host address `site`, from shared code that ran `retired`
+    /// instructions, to a tail of its own that takes its target `offset`
+    /// bytes from the page the code runs at and calls the table probe
+    /// ([`chain::relative_lookup_tail`]): one copy serves every alias.
+    fn link_relative(
+        &mut self,
+        cache: &mut board::Cache,
+        site: u64,
+        offset: i32,
+        retired: u32,
+        word: ExitWord,
+    ) -> bool {
+        if !chain::patchable(site) {
+            return false;
+        }
+        let Some((probe, tail)) = self.probe_and_tail(cache, site, 0, chain::LOOKUP_TAIL_BYTES)
+        else {
+            return false;
+        };
+        let at = tail.0 as u64;
+        let code = chain::relative_lookup_tail(
+            at,
+            offset,
+            word,
+            retired,
+            probe + chain::PROBE_ENTRY as u64,
+        );
+        let (Some(code), Some(jump)) = (code, chain::jump(site, at)) else {
+            return false;
+        };
+        self.patch_native(tail, &code);
+        self.profile_code(tail, code.len(), step_timing::CodeRegion::Lookup);
+        self.patch_point(NativeCode(site as usize), jump);
+        self.statistics.links += 1;
         true
     }
 
@@ -1311,7 +1393,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 if btype != 0 && current.targets & 1 << btype == 0 {
                     return None;
                 }
-                chain::stamped_branch_tail(
+                chain::stamped_branch_tail_for(
                     at,
                     cell,
                     number,
@@ -1322,6 +1404,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     current.entry,
                     probe + chain::STAMPING_PROBE_ENTRY as u64,
                     btype,
+                    self.share.on,
                 )
                 .map(|code| (code, number))
             })
@@ -1464,7 +1547,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         let at = tail.0 as u64;
         let (Some(code), Some(jump)) = (
-            chain::stamped_branch_tail(
+            chain::stamped_branch_tail_for(
                 at,
                 cache.targets.cell_address(cell),
                 cell,
@@ -1475,6 +1558,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 held.entry,
                 probe + chain::STAMPING_PROBE_ENTRY as u64,
                 link.btype,
+                self.share.on,
             ),
             chain::jump(link.site, at),
         ) else {
@@ -1530,7 +1614,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return Some((probe, tail));
         }
         self.install_stream = stream;
-        let dispatcher = chain::lookup_dispatcher(btype)?;
+        let dispatcher = chain::lookup_dispatcher_for(btype, self.share.on)?;
         let probe = self.install_native(&dispatcher, false).ok()?;
         self.profile_code(probe, dispatcher.len(), step_timing::CodeRegion::Probe);
         // The part filled between the two: the tail waits for the next.
@@ -1550,7 +1634,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if let Some(code) = self.lookup_dispatchers[usize::from(btype)] {
             return Some(code.0 as u64);
         }
-        let code = chain::lookup_dispatcher(btype)?;
+        let code = chain::lookup_dispatcher_for(btype, self.share.on)?;
         let installed = self.host.install(&code).ok()?;
         self.profile_code(installed, code.len(), step_timing::CodeRegion::Probe);
         self.lookup_dispatchers[usize::from(btype)] = Some(installed);

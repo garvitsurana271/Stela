@@ -126,7 +126,28 @@ pub struct GuestState {
     /// it: `x86_64::pinned::settled_account`) and clears it, so between
     /// native calls it is 0.
     pub account: u64,
+    /// The address of the 4 KiB page of the guest code that native code
+    /// runs, which every entry from another page sets: the engine's own and
+    /// each probe's and frame's (`x86_64::chain`). Code compiled position
+    /// independent (`x86_64::asm::Code::set_position_independent`) adds it
+    /// to each guest address it holds, so one copy serves every address its
+    /// page is mapped at; other code never reads it.
+    pub page_base: PageBase,
 }
+
+/// [`GuestState::page_base`]: where native code runs, no part of the
+/// guest's state, so any two compare equal.
+#[repr(transparent)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct PageBase(pub u64);
+
+impl PartialEq for PageBase {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for PageBase {}
 
 /// [`GuestState::exit_rsp`]: a host stack address of the native run in
 /// progress, no part of the guest's state, so any two compare equal and
@@ -190,6 +211,7 @@ impl Default for GuestState {
             loop_retired: 0,
             exit_rsp: ExitStack(0),
             account: 0,
+            page_base: PageBase(0),
         }
     }
 }
@@ -205,7 +227,11 @@ mod tests {
         for profile in [BlockProfile::ORDINARY, BlockProfile::new(Features::LEAF)] {
             assert!(profile.abi().starts_with("x86_64-sysv-guest-state-v15-"));
         }
-        assert_eq!(size_of::<GuestState>(), 920);
+        // The page base comes last: every earlier offset, which compiled
+        // and stored code holds, is the ABI's as before, and only position
+        // independent code reads it.
+        assert_eq!(size_of::<GuestState>(), 928);
+        assert_eq!(offset_of!(GuestState, page_base), 920);
         assert_eq!(align_of::<GuestState>(), 8);
         assert_eq!(offset_of!(GuestState, x), 0);
         assert_eq!(offset_of!(GuestState, sp), 248);

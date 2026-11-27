@@ -240,7 +240,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             };
             // An HLE composite is never promoted: it is a routine, not
             // translated code.
-            if block.tier2 || block.device_stub || block.hle.is_some() {
+            // Nor is shared code: tier 2 holds absolute addresses.
+            if block.tier2
+                || block.marks.device_stub()
+                || block.marks.shared()
+                || block.hle.is_some()
+            {
                 continue;
             }
             let key = (block.pc, block.physical, block.variant.0);
@@ -319,7 +324,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let Some(block) = self.code.blocks.get(slot) else {
             return Promotion::Refused;
         };
-        if block.tier2 || block.device_stub || block.hle.is_some() {
+        if block.tier2 || block.marks.device_stub() || block.marks.shared() || block.hle.is_some() {
             return Promotion::Refused;
         }
         let (pc, physical) = (block.pc, block.physical);

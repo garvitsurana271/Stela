@@ -60,6 +60,16 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateTlbiKeep);
                 }
             }
+            SHARE_ALIASES => {
+                let on = match value() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => return Err(Error::ShareAliases),
+                };
+                if options.share_aliases.replace(on).is_some() {
+                    return Err(Error::DuplicateShareAliases);
+                }
+            }
             TLBI_VERIFY_CHECK => flag(
                 &mut options.tlbi_verify_check,
                 Error::DuplicateTlbiVerifyCheck,

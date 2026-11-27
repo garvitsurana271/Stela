@@ -195,9 +195,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.entered(entry.block);
             return Ok(Fetched::Block(entry.block));
         }
-        let indexed = variant_id
+        let mut indexed = variant_id
             .or_else(|| self.known_variant(variant))
             .and_then(|id| self.code.find(pc, physical, id));
+        // Another address of the frame holds the block's code already: an
+        // alias runs it ([`super::share_aliases`]).
+        if indexed.is_none()
+            && self.share.on
+            && !single
+            && let Some(id) = variant_id.or_else(|| self.known_variant(variant))
+        {
+            indexed = self.share_on_miss(pc, physical, id)?;
+        }
         self.statistics.fetches[if indexed.is_some() { 3 } else { 4 }] += 1;
         let index = match indexed {
             Some(index) => index,
@@ -1002,14 +1011,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 }
             }
             // The same page content, compiled at another address of this
-            // boot: its kept entry, rebased to this page.
-            // A block the ring took away and the guest runs again: its
-            // form is kept, and its next return relocated from it.
-            let again = self.ring_took(pc, physical, variant);
+            // boot: its kept entry, rebased to this page. A page installed
+            // at two addresses keeps the form of each block compiled there,
+            // for the other address and for its returns.
+            let shared = self.code.rebases.shared(physical);
             match self
                 .code
                 .rebases
-                .look(key, offset as u16, context, pc, again)
+                .look(key, offset as u16, context, pc, shared)
             {
                 super::rebase::Found::Entry(entry, origin) => {
                     if entry.input.len() > available && !whole {
@@ -1346,20 +1355,23 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 .expect("a timing variant has its target"),
             false => self.target,
         };
-        let preparation = Arc::new(Preparation::new(
-            self.profile.chip,
-            self.admit_table.clone(),
-            target,
-            variant.fp,
-            variant.checks,
-            variant.scalable,
-            // A single instruction's variant leaves every PAC instruction to
-            // the engine, as it installs no thunk for one.
-            NativeSystem {
-                pointer: variant.system.pointer.filter(|_| !variant.single),
-                ..variant.system
-            },
-        ));
+        let preparation = Arc::new(
+            Preparation::new(
+                self.profile.chip,
+                self.admit_table.clone(),
+                target,
+                variant.fp,
+                variant.checks,
+                variant.scalable,
+                // A single instruction's variant leaves every PAC instruction to
+                // the engine, as it installs no thunk for one.
+                NativeSystem {
+                    pointer: variant.system.pointer.filter(|_| !variant.single),
+                    ..variant.system
+                },
+            )
+            .with_position_independent(self.share.on),
+        );
         self.preparations.insert(variant, preparation.clone());
         preparation
     }
@@ -1509,6 +1521,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }))
         .then(|| (code.0 + code_bytes.len() - chain::DYNAMIC_EXIT_BYTES) as u64);
         let first = self.admit(u32::from_le_bytes(source[..4].try_into().expect("a word")));
+        // A native completion's thunk names its own addresses: its block
+        // is not shared ([`super::share_aliases`]).
+        let (plain_successors, plain_dynamic) = (successors.len(), dynamic_site);
         // A device site's stub completes only a plain device load natively.
         if !single && self.installing_stub {
             successors.extend(self.complete_device_read_natively(
@@ -1538,6 +1553,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 (last / INSTRUCTION as usize) as u32,
             ));
         }
+        let completed = successors.len() != plain_successors || dynamic_site != plain_dynamic;
+        let position_independent = compiled.position_independent();
+        let independent = self.share.on
+            && !single
+            && position_independent
+            && !completed
+            && !self.installing_stub
+            && self.hle.installing.is_none()
+            && !self.installing_tier2;
+        if self.share.on && position_independent && !independent {
+            self.statistics.share_aliases.unshared += 1;
+        }
         // The record keeps a bit per successor; any more stay exits.
         successors.truncate(board::MAX_SUCCESSORS);
         // The slot's last block leaves its box for this one.
@@ -1559,7 +1586,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             source_hash: source_hash(&source[..source_bytes]),
             installer: self.current as u8,
             part: shared_part(&self.code, code),
-            device_stub: self.installing_stub,
+            marks: share_aliases::Marks::new(self.installing_stub, independent),
             hle: self.hle.installing,
             tier2: self.installing_tier2,
         };
@@ -1639,7 +1666,22 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.note_churn(&mut cache, slot);
         if let Some(replaced) = cache.index.insert(&shared.blocks, slot) {
             // Only indexed blocks are reached, which eviction relies on.
-            self.detach(&mut cache, &[replaced as u32]);
+            // An owner's aliases go with it: its record holds the links
+            // their code takes ([`super::share_aliases`]).
+            let mut gone = alloc::vec![replaced as u32];
+            if shared.blocks[replaced].marks.independent() {
+                let aliases = self.aliases_of(replaced);
+                let frame = physical & !(FETCH_PAGE - 1);
+                cache
+                    .index
+                    .forget_marked(frame, |slot| aliases.contains(&slot));
+                gone.extend(aliases);
+            }
+            self.detach(&mut cache, &gone);
+        }
+        if independent {
+            self.note_owner(slot);
+            self.statistics.share_aliases.owners += 1;
         }
         // The fetch that compiled the block would take the lock again right
         // after, to link the direct exit of its page that waits for it or
@@ -2448,7 +2490,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             record.incarnation(),
             record.live(),
             block.installer,
-            block.device_stub,
+            block.marks.device_stub(),
             self.device_site(block.physical.wrapping_add(pc.wrapping_sub(block.pc))),
             block.pc,
             block.physical,

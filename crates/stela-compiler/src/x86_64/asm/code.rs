@@ -46,6 +46,12 @@ pub(crate) struct Code {
     /// left there is kept.
     defer_nzcv: bool,
     deferred_nzcv: Option<bool>,
+    /// The address of the block's page, in code compiled position
+    /// independent ([`Self::set_position_independent`]).
+    pub(super) position_independent: Option<u64>,
+    /// Whether position independent code took in a guest address field
+    /// after all: code appended from a buffer that was not.
+    absolute: bool,
 }
 
 /// Exact faulting instruction interval, separate from source retirement.
@@ -126,7 +132,24 @@ impl Code {
             vectors: Default::default(),
             defer_nzcv: false,
             deferred_nzcv: None,
+            position_independent: None,
+            absolute: false,
         }
+    }
+    /// Emit each guest address from here on as the page base the code runs
+    /// at ([`crate::GuestState::page_base`]) plus its offset from `page`,
+    /// the address of the block's own page, instead of a field a stored
+    /// block relocates ([`super::Asm::guest_imm64`]): the code is then the
+    /// same at every address of its page.
+    pub(crate) fn set_position_independent(&mut self, page: u64) {
+        debug_assert!(page.is_multiple_of(4096));
+        self.position_independent = Some(page);
+    }
+    /// Whether every guest address this code holds is relative to the page
+    /// base it runs at: it was made position independent and holds no
+    /// relocated field, its own or one appended from other code.
+    pub(crate) fn is_position_independent(&self) -> bool {
+        self.position_independent.is_some() && !self.absolute && self.relocations.is_empty()
     }
     /// Code that keeps [`super::super::pinned`] guest registers in host
     /// registers.
@@ -264,6 +287,7 @@ impl Code {
             linked_block: self.linked_block,
             vectors: Some(&self.vectors),
             unguarded: false,
+            position_independent: self.position_independent,
         }
     }
     /// [`Self::asm`] for the vector cache's own moves, which may write the
@@ -319,6 +343,17 @@ impl Code {
     pub(crate) fn append(&mut self, other: Code) {
         debug_assert!(other.locals.is_none());
         let base = self.bytes.len();
+        // An empty buffer (moved slow paths) takes the page of the code it
+        // collects.
+        if base == 0 && self.position_independent.is_none() && !self.absolute {
+            self.position_independent = other.position_independent;
+        }
+        // Other code relative to another page holds absolute addresses
+        // here; its relocated fields stay fields.
+        debug_assert!(self.position_independent.is_some() || other.position_independent.is_none());
+        self.absolute |= other.absolute
+            || (other.position_independent.is_some()
+                && other.position_independent != self.position_independent);
         self.relocations
             .extend(other.relocations.iter().map(|at| base as u32 + at));
         self.sites
@@ -362,6 +397,9 @@ impl Code {
             span.end.bytes <= source.bytes.len() && span.end.instructions <= source.instructions
         );
         let base = self.bytes.len();
+        self.absolute |= source.absolute
+            || (source.position_independent.is_some()
+                && source.position_independent != self.position_independent);
         self.bytes
             .extend_from_slice(&source.bytes[span.start.bytes..span.end.bytes]);
         for &at in &source.relocations {
@@ -467,6 +505,8 @@ impl Code {
             vectors: Default::default(),
             defer_nzcv: false,
             deferred_nzcv: None,
+            position_independent: self.position_independent,
+            absolute: self.absolute,
         };
         self.instructions = at.instructions;
         tail

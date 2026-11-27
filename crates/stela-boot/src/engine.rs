@@ -1325,6 +1325,15 @@ fn run_machine<H: Host>(
             "TLBI KEEP off: --tlbi-verify-check does nothing without --tlbi-keep on\n"
         ));
     }
+    machine.set_share_aliases(options.share_aliases());
+    if options.share_aliases() {
+        output::arguments(format_args!(
+            "SHARE ALIASES on (--share-aliases on): system-mode blocks compile position \
+             independent where they can, and every virtual alias of their physical code runs one \
+             copy; each beat logs PES SHARE ALIASES checks=... mismatches=..., mismatches 0 in a \
+             correct engine\n"
+        ));
+    }
     let hle = stela_engine::hle::Config::boot(options.hle, &options.hle_off);
     if options.hle {
         output::arguments(format_args!("HLE {}\n", hle.describe(&options.hle_off)));

@@ -2824,6 +2824,29 @@ impl Heartbeat {
                 }
             }
             output::arguments(format_args!("{line}\n{sampled}"));
+            // `--share-aliases on`: what one translation per physical code
+            // did, every PE's together; mismatches are runs that reached
+            // code that is not position independent at a page base not its
+            // own, zero in a correct engine.
+            if per_pe.iter().any(|counts| !counts.share_aliases.is_empty()) {
+                let mut share = stela_engine::machine::engine::ShareAliasCounts::default();
+                for counts in per_pe.iter() {
+                    share.add(&counts.share_aliases);
+                }
+                output::arguments(format_args!(
+                    "PES SHARE ALIASES checks={} mismatches={} mapped={} owners={} \
+                     unshared={} shared_fetches={} made={} unindexed={} failed={}\n",
+                    share.checks,
+                    share.mismatches,
+                    share.mapped,
+                    share.owners,
+                    share.unshared,
+                    share.shared_fetches,
+                    share.made,
+                    share.unindexed,
+                    share.failed,
+                ));
+            }
             // `--tlbi-keep on`: what keeping the contexts across those TLBIs
             // did, every PE's together and then each PE's kept/dropped, and
             // every mismatch `--tlbi-verify-check` found.

@@ -267,6 +267,7 @@ impl Prefix {
             source_bytes: self.source_bytes,
             direct_exits: Vec::new(),
             fault_recovery: Vec::new(),
+            position_independent: false,
             self_loop: false,
             region: false,
             cold: (0, 0),

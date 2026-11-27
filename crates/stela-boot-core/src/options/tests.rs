@@ -115,6 +115,30 @@ fn an_asus_laptop_runs_in_performance_unless_asus_mode_says_otherwise() {
 }
 
 #[test]
+fn sharing_aliases_is_off_unless_asked_for() {
+    let plain = System::parse("--system").unwrap();
+    assert!(!plain.share_aliases());
+    for (text, on) in [
+        ("--system --share-aliases on", true),
+        ("--system --share-aliases off", false),
+    ] {
+        let options = System::parse(text).unwrap();
+        assert_eq!(options.share_aliases(), on, "{text}");
+        assert_eq!(options.to_string(), text);
+    }
+    for (text, error) in [
+        ("--system --share-aliases", Error::ShareAliases),
+        ("--system --share-aliases yes", Error::ShareAliases),
+        (
+            "--system --share-aliases on --share-aliases off",
+            Error::DuplicateShareAliases,
+        ),
+    ] {
+        assert_eq!(System::parse(text).err(), Some(error), "{text}");
+    }
+}
+
+#[test]
 fn the_tlbi_keep_is_off_unless_asked_for_and_its_check_needs_it() {
     let plain = System::parse("--system").unwrap();
     assert_eq!(plain.tlbi_keep(), (false, false));

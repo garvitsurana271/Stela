@@ -99,7 +99,7 @@ fn on(option: &str) -> bool {
     value(option) == "on"
 }
 
-fn forks() -> [Fork; 12] {
+fn forks() -> [Fork; 13] {
     [
         Fork {
             valid: &["--acpi-hardware"],
@@ -138,6 +138,17 @@ fn forks() -> [Fork; 12] {
                 ("--tlbi-keep 1", Error::TlbiKeep),
             ],
             duplicate: Some(Error::DuplicateTlbiKeep),
+        },
+        Fork {
+            valid: &["--share-aliases on", "--share-aliases off"],
+            set: |o, t| o.share_aliases = Some(on(t)),
+            bad: &[
+                ("--share-aliases", Error::ShareAliases),
+                ("--share-aliases yes", Error::ShareAliases),
+                ("--share-aliases ON", Error::ShareAliases),
+                ("--share-aliases 1", Error::ShareAliases),
+            ],
+            duplicate: Some(Error::DuplicateShareAliases),
         },
         Fork {
             valid: &["--tlbi-verify-check"],

@@ -5827,6 +5827,137 @@ fn a_submission_the_driver_refuses_fails_only_its_command_buffer() {
 }
 
 #[test]
+fn an_unsignaled_oom_submission_fails_only_its_command_buffer() {
+    let mut device = device_on(MockBackend::new());
+    let event = device.new_event().unwrap();
+    let semaphore = device.event_semaphore(event).unwrap();
+    // ANV's execbuf returns OOM without making the submission's signals.
+    device.backend().submit_error = Some(Error::OutOfMemory);
+    let mut commands = device.new_command_buffer();
+    commands
+        .encode_signal_event(&mut device.resolver(), semaphore, 3)
+        .unwrap();
+    assert_eq!(device.commit_for(1, commands), Err(Error::OutOfMemory));
+    let serial = device.submitted_serial();
+    assert!(!device.is_lost(), "an allocation failure is not a loss");
+    assert!(
+        !device.backend().promised.contains_key(&semaphore.0),
+        "ANV made no signal the mock could finish"
+    );
+    assert_eq!(
+        device.signaled_value(event),
+        Ok(3),
+        "its event is reached without a driver signal"
+    );
+    assert_eq!(device.submit_failed_for(1), serial);
+    assert_eq!(device.poll(), Ok(serial), "its completion ends locally");
+    assert_eq!(
+        device.take_submit_failure(1, serial),
+        Some(Error::OutOfMemory)
+    );
+    assert_eq!(device.take_submit_failure(1, serial), None, "answered once");
+    // The device goes on.
+    let next = device.commit_for(1, device.new_command_buffer()).unwrap();
+    device.backend().finish();
+    assert_eq!(device.poll(), Ok(next));
+}
+
+#[test]
+fn an_oom_after_earlier_segments_submitted_keeps_the_flight_pinned() {
+    use EventStep::{Signal, Wait};
+    let mut device = device_on(MockBackend::new());
+    let (ids, e) = new_events(&mut device, 2);
+    // Its first segment reaches the GPU; the wait holds the rest.
+    let serial = commit_events(
+        &mut device,
+        &e,
+        [1, 1],
+        &[Signal(1, 1), Wait(0, 1), Signal(1, 2)],
+    );
+    assert_eq!(device.backend().submissions.len(), 1);
+    assert_eq!(device.freeable(), serial - 1);
+    // Releasing the wait submits the refused tail. ANV returns OOM without
+    // signaling it, as it did in the boot that lost the i915 context.
+    device.backend().submit_error = Some(Error::OutOfMemory);
+    assert_eq!(
+        device.set_signaled_value(ids[0], 1),
+        Err(Error::OutOfMemory)
+    );
+    assert!(!device.is_lost(), "an allocation failure is not a loss");
+    assert_eq!(
+        device.freeable(),
+        serial - 1,
+        "the first segment still reads what the failed one released"
+    );
+    assert_eq!(device.submit_failed_for(1), serial);
+    assert_eq!(
+        device.backend().submissions.len(),
+        1,
+        "the refused tail never reached the GPU"
+    );
+    device.backend().submit_error = None;
+    device.backend().finish();
+    assert_eq!(device.poll(), Ok(serial), "the submitted part completes");
+    assert_eq!(device.freeable(), serial, "only now may it be freed");
+    assert_eq!(
+        device.signaled_value(ids[1]),
+        Ok(2),
+        "waiters on the failed command buffer still wake"
+    );
+    assert_eq!(
+        device.take_submit_failure(1, serial),
+        Some(Error::OutOfMemory)
+    );
+}
+
+#[test]
+fn a_refused_tail_signal_reaches_the_gpu_when_its_flight_completes() {
+    use EventStep::{Signal, Wait};
+    let mut device = device_on(MockBackend::new());
+    let (ids, e) = new_events(&mut device, 2);
+    // One segment reaches the GPU, then the tail waiting on e0 is refused.
+    let serial = commit_events(
+        &mut device,
+        &e,
+        [1, 1],
+        &[Signal(1, 1), Wait(0, 1), Signal(1, 2)],
+    );
+    assert_eq!(device.backend().submissions.len(), 1);
+    device.backend().submit_error = Some(Error::OutOfMemory);
+    assert_eq!(
+        device.set_signaled_value(ids[0], 1),
+        Err(Error::OutOfMemory)
+    );
+    // ANV made no signal for the refused tail, so a later GPU wait still
+    // needs one when this flight really completes.
+    assert_eq!(device.backend().promised.get(&e[1].0), Some(&1));
+    assert_eq!(
+        device.backend().semaphores.get(&e[1].0),
+        Some(&0),
+        "the first segment has not completed yet"
+    );
+    let waiting = commit_events(&mut device, &e, [1, 1], &[Wait(1, 2)]);
+    assert!(
+        device.backend().unpromised.contains(&(e[1], 2)),
+        "the wait has no driver signal yet"
+    );
+    assert_eq!(device.backend().semaphores.get(&e[1].0), Some(&0));
+    device.backend().finish();
+    assert_eq!(device.poll(), Ok(waiting));
+    assert_eq!(
+        device.backend().semaphores.get(&e[1].0),
+        Some(&2),
+        "Stela made the signal ANV never made"
+    );
+    assert_eq!(device.signaled_value(ids[1]), Ok(2));
+    assert_eq!(device.poll(), Ok(waiting));
+    assert_eq!(
+        device.take_submit_failure(1, serial),
+        Some(Error::OutOfMemory)
+    );
+}
+
+#[test]
 fn a_refusal_no_command_buffer_takes_is_forgotten_once_nothing_is_in_flight() {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU32, Ordering};

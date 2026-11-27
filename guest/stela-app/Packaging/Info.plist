@@ -3,8 +3,8 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    <key>CFBundleName</key><string>Stela</string>
-    <key>CFBundleDisplayName</key><string>Stela</string>
+    <key>CFBundleName</key><string>Stambha</string>
+    <key>CFBundleDisplayName</key><string>Stambha</string>
     <key>CFBundleIdentifier</key><string>org.stela.Stela</string>
     <key>CFBundleExecutable</key><string>Stela</string>
     <key>CFBundlePackageType</key><string>APPL</string>

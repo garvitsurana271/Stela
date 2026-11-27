@@ -4,13 +4,13 @@
 
   enum Brand {
     static let icon: NSImage = {
-      let bundled = Bundle.main.url(forResource: "stela-icon", withExtension: "png")
+      let bundled = Bundle.main.url(forResource: "stambha-icon", withExtension: "png")
       let development = URL(fileURLWithPath: #filePath)
-        .deletingLastPathComponent().appendingPathComponent("../../../../assets/stela-icon.png")
+        .deletingLastPathComponent().appendingPathComponent("../../../../assets/stambha-icon.png")
         .standardizedFileURL
       return bundled.flatMap(NSImage.init(contentsOf:))
         ?? NSImage(contentsOf: development)
-        ?? NSImage(systemSymbolName: "cpu", accessibilityDescription: "Stela")!
+        ?? NSImage(systemSymbolName: "cpu", accessibilityDescription: "Stambha")!
     }()
   }
 #endif

@@ -41,7 +41,7 @@ public struct SetupSummary: Codable, Equatable, Sendable {
       case .tooLarge: return "The setup record exceeds the 1 MiB inspection limit."
       case .wrongKind:
         return
-          "This file is not a Stela setup record. Select EFI/stela/setup.json from your setup volume."
+          "This file is not a Stambha setup record. Select EFI/stela/setup.json from your setup volume."
       case .unsupportedSchema(let schema):
         return
           "Setup record schema \(schema) is not supported by this app. This build reads schema 9."

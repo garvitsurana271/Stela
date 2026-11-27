@@ -91,9 +91,9 @@
 
     func inspectSetup() {
       let panel = NSOpenPanel()
-      panel.title = "Inspect Stela Setup"
+      panel.title = "Inspect Stambha Setup"
       panel.message =
-        "Select EFI/stela/setup.json on a mounted Stela setup volume. Inspection does not change any files."
+        "Select EFI/stela/setup.json on a mounted Stambha setup volume. Inspection does not change any files."
       panel.allowedContentTypes = [.json]
       panel.allowsMultipleSelection = false
       panel.canChooseDirectories = false
@@ -136,7 +136,7 @@
         guard let data = try report() else { return }
         let panel = NSSavePanel()
         panel.title = "Export System Report"
-        panel.nameFieldStringValue = "Stela-system-report.json"
+        panel.nameFieldStringValue = "Stambha-system-report.json"
         panel.allowedContentTypes = [.json]
         panel.message =
           "Includes system specifications and CPU feature observations. Excludes setup keys, machine IDs, disk paths and network settings. Review before sharing."

@@ -13,7 +13,7 @@
     }
 
     var body: some Scene {
-      Window("Stela", id: "main") {
+      Window("Stambha", id: "main") {
         ContentView(model: model)
           .frame(minWidth: 640, minHeight: 600)
           .task {
@@ -44,7 +44,7 @@
             .keyboardShortcut("e", modifiers: [.command, .shift])
             .disabled(model.snapshot == nil)
           Divider()
-          Button("Inspect Stela Setup…", action: model.inspectSetup)
+          Button("Inspect Stambha Setup…", action: model.inspectSetup)
           Button("Open System Information…") { model.openSystemApp("System Information") }
         }
       }
@@ -67,7 +67,7 @@
   enum UnsupportedPlatform {
     static func main() {
       fputs(
-        "Stela.app requires macOS 13 or later. The inspection library can be tested on this platform.\n",
+        "Stambha requires macOS 13 or later. The inspection library can be tested on this platform.\n",
         stderr)
       exit(1)
     }

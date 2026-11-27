@@ -1301,16 +1301,18 @@ impl GuestNetwork {
             self.retargeted = true;
             let apic = RECEIVE_CORE.load(core::sync::atomic::Ordering::Relaxed);
             if let Some(message) = super::host::network_signal(apic) {
-                let moved = self.link.retarget(message);
-                output::arguments(format_args!(
-                    "GUEST NETWORK receive signal {} processor apic={apic:#x} vector={:#x}\n",
-                    if moved {
-                        "moved to"
-                    } else {
-                        "stays: no MSI-X entry for"
-                    },
-                    super::interrupts::NETWORK_VECTOR
-                ));
+                // Only an adapter that signals is asked to move its signal;
+                // a polled one says so rather than naming a missing entry.
+                let signals = self.link.signals();
+                let link = &mut self.link;
+                let signal = network_link::receive_signal(signals, || link.retarget(message));
+                let line = network_link::receive_signal_line(
+                    signal,
+                    self.link.device.location(),
+                    apic,
+                    super::interrupts::NETWORK_VECTOR,
+                );
+                output::arguments(format_args!("{line}"));
             }
         }
         if self.up != Some(up) {

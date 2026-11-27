@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 /// The protocol version a connection negotiates. A major version changes
 /// records; a minor version only adds operations.
 pub const MAJOR: u32 = 4;
-pub const MINOR: u32 = 0;
+pub const MINOR: u32 = 1;
 
 /// A fixed-width wire record.
 ///
@@ -402,6 +402,16 @@ records! {
     /// buffer takes the memory's handle.
     pub struct NewImportedBufferRequest {
         pub memory: u64,
+        pub length: u64,
+        pub options: u64,
+    }
+
+    /// [`NewImportedBufferRequest`] for an app's bytes `offset` into the
+    /// imported pages: `newBufferWithBytesNoCopy:` of an address within a
+    /// page, whose enclosing pages the frontend imports.
+    pub struct NewImportedBufferAtRequest {
+        pub memory: u64,
+        pub offset: u64,
         pub length: u64,
         pub options: u64,
     }
@@ -1232,6 +1242,8 @@ operations! {
     NewImportedBuffer = 0x0210 => NewImportedBufferRequest, BufferResponse;
     FormatAlignments = 0x0211 => PixelFormatRequest, FormatAlignmentsResponse;
     SparseTileSize = 0x0212 => SparseTileRequest, SparseTileResponse;
+    /// `NewImportedBuffer` of bytes within the imported pages (minor 1).
+    NewImportedBufferAt = 0x0213 => NewImportedBufferAtRequest, BufferResponse;
     NewRenderPipeline = 0x0301 => NewRenderPipelineRequest, RenderPipelineResponse;
     NewMeshPipeline = 0x0302 => NewMeshPipelineRequest, RenderPipelineResponse;
     NewComputePipeline = 0x0303 => NewComputePipelineRequest, ComputePipelineResponse;

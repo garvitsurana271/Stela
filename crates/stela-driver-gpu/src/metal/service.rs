@@ -961,6 +961,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             Operation::ArgumentLayout => reflection::argument_layout(&mut call),
             Operation::NewBuffer => self.new_buffer(&mut call),
             Operation::NewImportedBuffer => self.new_imported_buffer(&mut call),
+            Operation::NewImportedBufferAt => self.new_imported_buffer_at(&mut call),
             Operation::FormatAlignments => self.format_alignments(&mut call),
             Operation::SparseTileSize => self.sparse_tile_size(&mut call),
             Operation::BufferDidModifyRange => self.buffer_did_modify_range(&mut call),

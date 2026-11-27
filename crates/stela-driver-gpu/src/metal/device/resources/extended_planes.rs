@@ -257,7 +257,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 "two-plane extended-range textures on this device",
             ));
         }
-        let buffer = self.resources.buffers.get(buffer_id.0)?;
+        let buffer = self.whole_buffer(buffer_id)?;
         let (vk_buffer, memory, memory_offset, length) = (
             buffer.buffer,
             buffer.memory,

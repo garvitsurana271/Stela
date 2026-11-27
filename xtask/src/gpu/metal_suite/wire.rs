@@ -96,6 +96,12 @@ const OPERATIONS: &[(&str, Reach)] = &[
         Reach::Call("newBufferWithBytesNoCopy:"),
     ),
     (
+        "NewImportedBufferAt",
+        Reach::Without(
+            "newBufferWithBytesNoCopy: of an address within a page; the runner imports page-aligned memory",
+        ),
+    ),
+    (
         "FormatAlignments",
         Reach::Call("minimumLinearTextureAlignmentForPixelFormat:"),
     ),

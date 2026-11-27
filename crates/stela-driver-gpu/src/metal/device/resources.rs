@@ -131,7 +131,13 @@ impl Backing {
 struct BufferObject {
     buffer: Buffer,
     memory: Memory,
+    /// Where the Metal buffer's first byte lies in `memory`.
     memory_offset: u64,
+    /// Where it lies in `buffer`: zero but for an app's imported bytes at
+    /// an address the `VkBuffer` cannot start at
+    /// ([`Device::new_imported_buffer_at`]).
+    start: u64,
+    /// The device address of the Metal buffer's first byte.
     address: u64,
     length: u64,
     options: ResourceOptions,
@@ -453,6 +459,72 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         Ok(buffer)
     }
 
+    /// [`Self::new_imported_buffer`] for bytes `offset` into the imported
+    /// pages: `newBufferWithBytesNoCopy:` of an address within a page, whose
+    /// enclosing pages the frontend imports. The `VkBuffer` starts at the
+    /// driver's buffer alignment below the bytes, and the Metal buffer
+    /// `start` bytes into it; textures over such a buffer are refused.
+    /// Apple GPUs take such an address: Espresso in mediaanalysisd passes
+    /// 16-byte buffers 8 bytes into a page, and until test 5 the nil it got
+    /// crashed it every few minutes, each crash a ReportCrash run.
+    pub fn new_imported_buffer_at(
+        &mut self,
+        id: MemoryId,
+        offset: u64,
+        length: u64,
+        options: ResourceOptions,
+    ) -> Result<BufferId> {
+        if offset == 0 {
+            return self.new_imported_buffer(id, length, options);
+        }
+        ensure(
+            matches!(
+                options.storage_mode,
+                StorageMode::Shared | StorageMode::Managed
+            ),
+            "imported buffers are shared or managed",
+        )?;
+        let ImportObject { memory, bytes } = *self.resources.imports.get(id.0)?;
+        ensure(
+            length > 0 && offset.checked_add(length).is_some_and(|end| end <= bytes),
+            "the buffer is longer than its memory",
+        )?;
+        let plan = resource::buffer(&self.capabilities, length, options)?;
+        let alignment = self
+            .backend
+            .buffer_requirements(&plan.info)?
+            .alignment
+            .max(1);
+        ensure(alignment.is_power_of_two(), "requirements")?;
+        let start = offset % alignment;
+        let info = BufferInfo {
+            size: length + start,
+            ..plan.info
+        };
+        let (buffer, base) = self
+            .backend
+            .create_placed_buffer(&info, memory, offset - start)?;
+        // The import's bytes, counted when it was made, are the buffer's.
+        self.resources.imports.remove(id.0)?;
+        self.book_memory(memory, bytes, || {
+            format!("imported buffer of {length} bytes {offset} bytes into its pages")
+        });
+        if base != 0 {
+            self.book.learn_address(memory, base - (offset - start));
+        }
+        Ok(BufferId(self.resources.buffers.insert(BufferObject {
+            buffer,
+            memory,
+            memory_offset: offset,
+            start,
+            address: if base == 0 { 0 } else { base + start },
+            length,
+            options,
+            backing: Backing::Owned(bytes),
+            dependents: 0,
+        })))
+    }
+
     fn own_buffer(
         &mut self,
         allocation: BufferAllocation,
@@ -471,6 +543,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             buffer: allocation.buffer,
             memory: allocation.memory,
             memory_offset: 0,
+            start: 0,
             address: allocation.address,
             length,
             options,
@@ -499,10 +572,21 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let buffer = self.resources.buffers.get(id.0)?;
         Ok(BufferRef {
             buffer: buffer.buffer,
-            offset: 0,
+            offset: buffer.start,
             address: buffer.address,
             length: buffer.length,
         })
+    }
+
+    /// The `VkBuffer` of a buffer that starts it, for the textures made over
+    /// a buffer's rows, which address them from the `VkBuffer`'s start.
+    fn whole_buffer(&self, id: BufferId) -> Result<&BufferObject> {
+        let buffer = self.resources.buffers.get(id.0)?;
+        ensure(
+            buffer.start == 0,
+            "textures over a no-copy buffer at an address a buffer cannot start at",
+        )?;
+        Ok(buffer)
     }
 
     pub fn buffer_placement(&self, id: BufferId) -> Result<Placement> {
@@ -945,7 +1029,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         offset: u64,
         bytes_per_row: u64,
     ) -> Result<TextureId> {
-        let buffer = self.resources.buffers.get(buffer_id.0)?;
+        let buffer = self.whole_buffer(buffer_id)?;
         let (vk_buffer, memory, memory_offset, length) = (
             buffer.buffer,
             buffer.memory,
@@ -1146,7 +1230,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 "two-plane textures' usages beyond reading; rendering to subsampled ones"
             });
         }
-        let buffer = self.resources.buffers.get(buffer_id.0)?;
+        let buffer = self.whole_buffer(buffer_id)?;
         let (vk_buffer, memory, memory_offset, length) = (
             buffer.buffer,
             buffer.memory,
@@ -2687,6 +2771,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             buffer,
             memory,
             memory_offset,
+            start: 0,
             address,
             length,
             options,

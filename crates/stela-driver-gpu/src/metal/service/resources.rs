@@ -5,9 +5,10 @@ use super::{
         AUTOMATIC, BufferRangeRequest, BufferResponse, Empty, Fault, FormatAlignmentsResponse,
         Handle, HeapBufferSizeRequest, HeapDescriptorRecord, HeapUsageRequest, HeapUsageResponse,
         NewBufferRequest, NewBufferTextureRequest, NewHeapBufferRequest, NewHeapTextureRequest,
-        NewImportedBufferRequest, NewTextureViewRequest, PixelFormatRequest,
-        SamplerDescriptorRecord, SamplerResponse, SizeAndAlignRecord, Span, SparseTileRequest,
-        SparseTileResponse, Status, TextureBytesRequest, TextureDescriptorRecord, TextureResponse,
+        NewImportedBufferAtRequest, NewImportedBufferRequest, NewTextureViewRequest,
+        PixelFormatRequest, SamplerDescriptorRecord, SamplerResponse, SizeAndAlignRecord, Span,
+        SparseTileRequest, SparseTileResponse, Status, TextureBytesRequest,
+        TextureDescriptorRecord, TextureResponse,
     },
 };
 use crate::metal::{
@@ -108,6 +109,18 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         let buffer = self
             .device
             .new_imported_buffer(memory, request.length, options)?;
+        self.take_memory(call.connection, request.memory)?;
+        let response = self.adopt_buffer(call.connection, buffer)?;
+        call.reply(&response)
+    }
+
+    pub(super) fn new_imported_buffer_at(&mut self, call: &mut Call) -> Result<(), Fault> {
+        let request: NewImportedBufferAtRequest = call.request()?;
+        let options = options(request.options)?;
+        let memory = self.object::<MemoryId>(call.connection, request.memory)?;
+        let buffer =
+            self.device
+                .new_imported_buffer_at(memory, request.offset, request.length, options)?;
         self.take_memory(call.connection, request.memory)?;
         let response = self.adopt_buffer(call.connection, buffer)?;
         call.reply(&response)

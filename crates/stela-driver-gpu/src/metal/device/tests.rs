@@ -4937,6 +4937,55 @@ fn imported_memory_stays_until_the_gpu_is_done_with_it() {
     assert_eq!(device.retired(), None);
 }
 
+/// An app's no-copy bytes within a page, as Espresso's 16-byte buffers 8
+/// bytes into one, start their buffer that far into the imported pages:
+/// its `VkBuffer` at the driver's alignment below the bytes, the commands'
+/// offset and the buffer's address at them. A texture over it is refused,
+/// and the pages stay the import's until the GPU is done with them.
+#[test]
+fn no_copy_bytes_within_a_page_start_their_buffer_there() {
+    let mut device = device();
+    let token = core::num::NonZeroU64::new(13).unwrap();
+    let ranges = [stela_contracts::gate::MemoryRange {
+        address: 0x8_0000_0000,
+        bytes: 16384,
+    }];
+    let memory = device.import_memory(&ranges, token).unwrap();
+    assert_eq!(
+        device.new_imported_buffer_at(memory, 16380, 16, options(StorageMode::Shared)),
+        Err(Error::Invalid("the buffer is longer than its memory"))
+    );
+    let buffer = device
+        .new_imported_buffer_at(memory, 0x3f58, 16, options(StorageMode::Shared))
+        .unwrap();
+    let bound = device.buffer(buffer).unwrap();
+    // The fixture aligns buffers to 256 bytes and answers a placed buffer's
+    // address as its id above its offset.
+    assert_eq!((bound.offset, bound.length), (0x58, 16));
+    assert_eq!(bound.address & 0xffff_ffff, 0x3f58);
+    assert_eq!(device.buffer_memory(buffer).unwrap().1, 0x3f58);
+    assert_eq!(device.current_allocated_size(), 16384);
+
+    let mut descriptor = texture(PixelFormat::R32Float, TextureUsage::SHADER_READ);
+    descriptor.texture_type = TextureType::TextureBuffer;
+    descriptor.width = 4;
+    descriptor.height = 1;
+    descriptor.options = options(StorageMode::Shared);
+    assert_eq!(
+        device.new_texture_from_buffer(buffer, &descriptor, 0, 16),
+        Err(Error::Invalid(
+            "textures over a no-copy buffer at an address a buffer cannot start at"
+        ))
+    );
+
+    let serial = submit(&mut device);
+    device.destroy_buffer(buffer).unwrap();
+    assert_eq!(device.retired(), None);
+    complete(&mut device, serial);
+    assert_eq!(device.current_allocated_size(), 0);
+    assert_eq!(device.retired(), Some(token));
+}
+
 #[test]
 fn imported_heap_allocations_are_counted_once_through_retirement() {
     let mut device = device();

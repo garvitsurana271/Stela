@@ -1149,15 +1149,29 @@ StelaGPUEvent *stela_event(StelaGPUDevice *device, id event)
 		return nil;
 	}
 	StelaFailure failure;
-	uint64_t memory = [self importAddress:bytes length:page_aligned(length) failure:&failure];
+	/* An address within a page, as Espresso's 16-byte buffers 8 bytes into
+	 * one in mediaanalysisd, imports the whole pages around the bytes, and
+	 * the buffer starts that far into them. Apple GPUs take such an address;
+	 * the nil this answered crashed mediaanalysisd every few minutes. */
+	uint64_t base = (uint64_t)bytes & ~(uint64_t)(PAGE - 1);
+	uint64_t offset = (uint64_t)bytes - base;
+	uint64_t memory = [self importAddress:(void *)base length:page_aligned(offset + length) failure:&failure];
 	if (memory == 0) {
 		stela_report([[NSString stringWithFormat:@"newBufferWithBytesNoCopy:%p length:%lu", bytes, length] UTF8String],
 			     &failure);
 		return nil;
 	}
-	StelaNewImportedBufferRequest request = {.memory = memory, .length = length, .options = options};
 	StelaBufferResponse response;
-	if (STELA_CALL(&_gate, NewImportedBuffer, &request, &response, &failure) != StelaStatusOk) {
+	uint32_t status;
+	if (offset == 0) {
+		StelaNewImportedBufferRequest request = {.memory = memory, .length = length, .options = options};
+		status = STELA_CALL(&_gate, NewImportedBuffer, &request, &response, &failure);
+	} else {
+		StelaNewImportedBufferAtRequest request = {
+		    .memory = memory, .offset = offset, .length = length, .options = options};
+		status = STELA_CALL(&_gate, NewImportedBufferAt, &request, &response, &failure);
+	}
+	if (status != StelaStatusOk) {
 		stela_report("newBufferWithBytesNoCopy:", &failure);
 		[self releaseHandle:memory];
 		return nil;

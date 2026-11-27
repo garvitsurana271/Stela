@@ -473,11 +473,14 @@ impl Adapter {
 
 impl Link for Adapter {
     /// The driver's own state line, where it keeps one: the RTL8168
-    /// family's registers, and an RTL8852CE station's progress (M3 spec
-    /// S14.6), which names no address.
+    /// family's registers, an Intel PCH MAC's PHY, MAC, ring and frame
+    /// counts, and an RTL8852CE station's progress (M3 spec S14.6), none
+    /// naming an address. The PCH line was written but never reached here,
+    /// so an I219 whose DHCP went unanswered logged no state at all.
     fn diagnostic(&mut self) -> Option<String> {
         match self {
             Self::Realtek(device) => device.diagnostic(),
+            Self::Pch(device) => device.diagnostic(),
             Self::UsbVendor(device) => device.diagnostic(),
             Self::Rtw89Wifi(device) => device.diagnostic(),
             _ => None,

@@ -317,5 +317,51 @@ pub fn address<T>(
     (result, retried)
 }
 
+/// What became of the host adapter's receive signal once the guest's link
+/// came up ([`receive_signal`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiveSignal {
+    /// The adapter raises no receive signal: its driver polls, and its
+    /// frames are read at each host service turn, wherever that runs.
+    Polled,
+    /// The signal now goes to the processor asked for.
+    Moved,
+    /// The adapter signals, but its driver could not move the signal.
+    Kept,
+}
+
+/// Where the receive signal of an adapter that `signals` goes: moved by
+/// `retarget` (`Link::retarget`), which is asked only of an adapter that
+/// signals. Every adapter but a virtio one polled or kept its signal and
+/// logged "stays: no MSI-X entry for processor apic=…" on 0.6.1, which read
+/// as a missing entry for that processor when the processor was one of the
+/// boot's own and the adapter (an I219, an RTL8168, an RTL8156) had no
+/// signal to move.
+pub fn receive_signal(signals: bool, retarget: impl FnOnce() -> bool) -> ReceiveSignal {
+    match (signals, signals && retarget()) {
+        (false, _) => ReceiveSignal::Polled,
+        (true, true) => ReceiveSignal::Moved,
+        (true, false) => ReceiveSignal::Kept,
+    }
+}
+
+/// The log line for `signal`, of the adapter at `location`, asked to
+/// signal processor `apic` on `vector`.
+pub fn receive_signal_line(signal: ReceiveSignal, location: &str, apic: u64, vector: u8) -> String {
+    match signal {
+        ReceiveSignal::Polled => alloc::format!(
+            "GUEST NETWORK receive polled: host adapter {location} raises no receive signal, \
+             its frames are read at each host service turn\n"
+        ),
+        ReceiveSignal::Moved => alloc::format!(
+            "GUEST NETWORK receive signal moved to processor apic={apic:#x} vector={vector:#x}\n"
+        ),
+        ReceiveSignal::Kept => alloc::format!(
+            "GUEST NETWORK receive signal stays where host adapter {location}'s driver set it: \
+             the driver cannot move it to processor apic={apic:#x} vector={vector:#x}\n"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests;

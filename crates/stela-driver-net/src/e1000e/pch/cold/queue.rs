@@ -60,6 +60,20 @@ const TXDCTL: u32 = 0x3828;
 const TADV: u32 = 0x382c;
 const TARC: u32 = 0x3840;
 const QUEUE_STRIDE: u32 = 0x100;
+const MANC: u32 = 0x5820;
+/// The MAC's statistics registers a state line gives (`e1000e_update_stats`
+/// names), each clearing when read: frames received good, broadcast and
+/// multicast, missed for lack of room, met with no free buffer, and with a
+/// bad CRC; and frames transmitted good.
+const STATISTICS: [(&str, u32); 7] = [
+    ("good_rx", 0x4074),
+    ("broadcast_rx", 0x4078),
+    ("multicast_rx", 0x407c),
+    ("missed_rx", 0x4010),
+    ("no_buffer_rx", 0x40a0),
+    ("crc_errors", 0x4000),
+    ("good_tx", 0x4080),
+];
 const ENABLE: u32 = 2;
 const LINK_UP: u32 = 2;
 const LINK_EVENT: u32 = 1 << 2;
@@ -684,6 +698,51 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone + 'static> Ethernet<R, D> {
         Self::modify_in(c, super::CTRL, PAUSE, 0)?;
         Ok((Some(status), true))
     }
+    /// The rings as the driver and the MAC hold them, and the MAC's own
+    /// frame counts since the last state line (its statistics registers
+    /// clear when read, and nothing else reads them), with RCTL, TCTL,
+    /// MANC and whether the station address is valid, never the address:
+    /// `good_tx` is what reached the wire, so a network that never answers
+    /// is told from frames that never left. Nothing past the driver's own
+    /// indices while a link change holds the controller or it is stopped.
+    fn traffic(&mut self) -> alloc::string::String {
+        let mut line = format!(
+            " tx next={} clean={} rx next={}",
+            self.next_tx, self.clean_tx, self.next_rx
+        );
+        if self.change.is_some() || self.stopped || self.controller.is_poisoned() {
+            return line;
+        }
+        let shown = |value: Option<u32>| match value {
+            Some(value) => format!("{value}"),
+            None => alloc::string::String::from("failed"),
+        };
+        let words = |value: Option<u32>| match value {
+            Some(value) => format!("{value:#010x}"),
+            None => alloc::string::String::from("failed"),
+        };
+        for (name, at) in [
+            ("tx_head", TDH),
+            ("tx_tail", TDT),
+            ("rx_head", RDH),
+            ("rx_tail", RDT),
+        ] {
+            line += &format!(" {name}={}", shown(self.controller.read(at).ok()));
+        }
+        line += " counted";
+        for (name, at) in STATISTICS {
+            line += &format!(" {name}={}", shown(self.controller.read(at).ok()));
+        }
+        let station = self.controller.read(RAH).ok();
+        for (name, at) in [("rctl", super::RCTL), ("tctl", super::TCTL), ("manc", MANC)] {
+            line += &format!(" {name}={}", words(self.controller.read(at).ok()));
+        }
+        line += &match station {
+            Some(high) => format!(" station_valid={}", u8::from(high & VALID_ADDRESS != 0)),
+            None => alloc::string::String::from(" station_valid=?"),
+        };
+        line
+    }
     fn offer(&mut self, index: usize) {
         let base = index * DESCRIPTOR;
         self.receive
@@ -834,14 +893,16 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone + 'static> Link for Etherne
         self.station
     }
     /// The MAC's and PHY's state ([`Controller::state`]), the link status
-    /// last seen and the failure that stopped the adapter, if any.
+    /// last seen, the failure that stopped the adapter, if any, and its
+    /// rings and frames ([`Self::traffic`]).
     fn diagnostic(&mut self) -> Option<alloc::string::String> {
         let state = match self.change {
             Some(_) => alloc::string::String::from("phy=held-by-link-change"),
             None => self.controller.state(),
         };
+        let traffic = self.traffic();
         Some(format!(
-            "{state} link_seen={} failure={:?}",
+            "{state} link_seen={} failure={:?}{traffic}",
             self.link
                 .map_or(alloc::string::String::from("none"), |status| format!(
                     "{status:#010x}"

@@ -1782,3 +1782,67 @@ fn an_adapter_without_a_cable_starts_and_reports_no_link() {
         assert_eq!(released.load(Ordering::SeqCst), 1);
     }
 }
+
+/// The state line an I219 gives when macOS's DHCP goes unanswered names
+/// its rings and the MAC's own frame counts, so frames that never left
+/// (`good_tx=0` while the driver queued some) are told from a network
+/// that never answered (`good_tx` counting them, `good_rx` without a
+/// reply); with RCTL, TCTL, MANC and the station address's valid bit, but
+/// not the address. A 0.6.1 I219 whose guest sent 3 473 lookups and saw no
+/// answer logged no state at all.
+#[test]
+fn the_state_line_gives_rings_frame_counts_and_filters_but_no_address() {
+    let mut memory = Memory::new();
+    let (state, _, controller) = setup();
+    let mut net = open(controller, &mut memory);
+    assert!(net.carrier());
+    for _ in 0..3 {
+        net.transmit(&[0x5a; 60]).unwrap();
+    }
+    {
+        let mut m = state.borrow_mut();
+        for (at, value) in [
+            (0x4074, 41),
+            (0x4078, 15),
+            (0x407c, 20),
+            (0x4010, 0),
+            (0x40a0, 2),
+            (0x4000, 1),
+            (0x4080, 3),
+            (MANC, 0x0002_0000),
+            (TDH, 3),
+        ] {
+            m.mac.insert(at, value);
+        }
+    }
+    let line = net.diagnostic().unwrap();
+    assert!(
+        line.contains(" tx next=3 clean=0 rx next=0 tx_head=3 tx_tail=3 rx_head=0 rx_tail="),
+        "{line}"
+    );
+    assert!(
+        line.contains(
+            " counted good_rx=41 broadcast_rx=15 multicast_rx=20 missed_rx=0 no_buffer_rx=2 \
+             crc_errors=1 good_tx=3 rctl="
+        ),
+        "{line}"
+    );
+    assert!(line.contains(" manc=0x00020000 station_valid=1"), "{line}");
+    assert!(line.contains(&format!(
+        " tctl={:#010x}",
+        state.borrow().mac[&super::super::TCTL]
+    )));
+    let station = net.mac().0;
+    for pair in station.windows(2) {
+        assert!(
+            !line.contains(&format!("{:02x}:{:02x}", pair[0], pair[1])),
+            "{line}"
+        );
+    }
+    // A stopped adapter gives only the driver's own indices.
+    net.shutdown().unwrap();
+    let accesses = state.borrow().accesses;
+    let traffic = net.traffic();
+    assert_eq!(traffic, " tx next=3 clean=0 rx next=0");
+    assert_eq!(state.borrow().accesses, accesses);
+}

@@ -210,6 +210,19 @@ struct Partial {
     validator: Option<String>,
 }
 
+/// Whether catalog entries `a` and `b` name the same object: the same
+/// build at the same address with the same checksum. The models an entry
+/// lists may grow when Apple adds a Mac, and the image stays the same.
+pub fn same_object(a: &Image, b: &Image) -> bool {
+    a.build == b.build
+        && a.url == b.url
+        && match (&a.sha1, &b.sha1) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
 /// The validator [`Partial`] keeps from an answer's headers.
 fn validator(headers: &header::HeaderMap) -> Option<String> {
     let value = |name| {
@@ -450,7 +463,7 @@ fn download_with_client(image: &Image, output: &Path, client: &Client) -> Result
         // within its size; any other is removed and the download restarts.
         let resumable = stela_engine::read_json::<Partial>(&metadata)
             .ok()
-            .filter(|previous| previous.image == *image)
+            .filter(|previous| same_object(&previous.image, image))
             .and_then(|previous| {
                 let bytes = part.metadata().ok()?.len();
                 previous
@@ -462,11 +475,25 @@ fn download_with_client(image: &Image, output: &Path, client: &Client) -> Result
             Some((bytes, total, validator)) => {
                 (offset, previous_total, previous_validator) = (bytes, total, validator)
             }
-            None => remove_partial(&part, &metadata)?,
+            None => {
+                eprintln!(
+                    "note: {} is not resumed because it is of another catalog entry than \
+                     Apple lists now, or its record is missing; downloading anew",
+                    part.display()
+                );
+                remove_partial(&part, &metadata)?
+            }
         }
         if offset > 0 && previous_total == Some(offset) {
             // Recover interruption after the last byte but before publishing.
             return publish(image, output, &part, &metadata, offset);
+        }
+        if offset > 0 {
+            eprintln!(
+                "Resuming the macOS download from {:.1} GB, where it stopped ({})",
+                offset as f64 / 1e9,
+                part.display()
+            );
         }
     }
     let mut response = crate::net::send("downloading macOS", || {
@@ -587,23 +614,9 @@ fn publish(
     metadata: &Path,
     written: u64,
 ) -> Result<Receipt> {
-    let mut file = File::open(part)?;
-    let mut buffer = vec![0u8; 1024 * 1024];
-    let mut sha256 = Sha256::new();
-    let mut sha1 = sha1::Sha1::new();
     let progress = crate::progress::Phase::bytes("Verifying downloaded macOS", written);
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        sha256.update(&buffer[..n]);
-        sha1.update(&buffer[..n]);
-        progress.advance(n as u64);
-    }
-    if let Some(expected) = &image.sha1
-        && hex::encode(sha1.finalize()) != *expected
-    {
+    let (sha256, sha1) = digests(part, &progress)?;
+    if !matches_catalog(image, &sha1) {
         remove_partial(part, metadata)?;
         bail!(
             "the downloaded macOS image does not match Apple's checksum and was removed; run \
@@ -614,13 +627,84 @@ fn publish(
         schema_version: 1,
         image: image.clone(),
         bytes: written,
-        sha256: hex::encode(sha256.finalize()),
+        sha256,
         catalog_sha1_verified: image.sha1.is_some(),
     };
-    // Never replacing an image created meanwhile.
+    // Never replacing an image created meanwhile. A stop between the
+    // rename and the receipt leaves an image without one, which
+    // [`adopt`] checks and keeps.
     crate::efi::rename_new(part, output).context("publish completed image")?;
     stela_engine::write_json(&sidecar(output, ".json"), &receipt)?;
     std::fs::remove_file(metadata)?;
+    progress.finish();
+    Ok(receipt)
+}
+
+/// The SHA-256 and SHA-1 of the file at `path`, in hex.
+fn digests(path: &Path, progress: &crate::progress::Phase) -> Result<(String, String)> {
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut sha256 = Sha256::new();
+    let mut sha1 = sha1::Sha1::new();
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        sha256.update(&buffer[..n]);
+        sha1.update(&buffer[..n]);
+        progress.advance(n as u64);
+    }
+    Ok((hex::encode(sha256.finalize()), hex::encode(sha1.finalize())))
+}
+
+/// Whether `sha1` is the checksum Apple's catalog names for `image`; an
+/// entry without one names none to miss.
+fn matches_catalog(image: &Image, sha1: &str) -> bool {
+    image
+        .sha1
+        .as_deref()
+        .is_none_or(|expected| expected.eq_ignore_ascii_case(sha1))
+}
+
+/// The download receipt's path beside the image `image`.
+pub fn receipt_path(image: &Path) -> PathBuf {
+    sidecar(image, ".json")
+}
+
+/// The bytes a stopped download of `output` left to resume from.
+pub fn partial_bytes(output: &Path) -> u64 {
+    std::fs::metadata(sidecar(output, ".part")).map_or(0, |metadata| metadata.len())
+}
+
+/// Give the complete image at `output` that has no receipt (a download
+/// stopped after the image was published and before its receipt was
+/// written, or a copy put there by hand) the receipt of `image`, once its
+/// bytes match the checksum Apple's catalog names for it. An image that
+/// does not match is left as it is.
+pub fn adopt(image: &Image, output: &Path) -> Result<Receipt> {
+    ensure!(
+        image.sha1.is_some(),
+        "{} has no download receipt, and Apple's catalog names no checksum to check it by",
+        output.display()
+    );
+    let bytes = std::fs::metadata(output)?.len();
+    let progress = crate::progress::Phase::bytes("Checking the downloaded macOS", bytes);
+    let (sha256, sha1) = digests(output, &progress)?;
+    ensure!(
+        matches_catalog(image, &sha1),
+        "{} does not match Apple's checksum for macOS {}",
+        output.display(),
+        image.build
+    );
+    let receipt = Receipt {
+        schema_version: 1,
+        image: image.clone(),
+        bytes,
+        sha256,
+        catalog_sha1_verified: true,
+    };
+    stela_engine::write_json(&receipt_path(output), &receipt)?;
     progress.finish();
     Ok(receipt)
 }
@@ -763,6 +847,115 @@ mod tests {
         let receipt = download_with_client(&image, &out, &Client::new())?;
         assert_eq!(receipt.bytes, 8);
         assert_eq!(std::fs::read(out)?, b"complete");
+        Ok(())
+    }
+
+    #[test]
+    fn a_partial_resumes_when_the_catalog_lists_more_models_for_the_same_image() -> Result<()> {
+        // The catalog entry gained a Mac since the download stopped; the
+        // object is the same, so the bytes on disk are kept.
+        let (url, server) = serve("HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 5-9/10\r\nConnection: close\r\n\r\n56789".into());
+        let image = Image {
+            version: "test".into(),
+            build: "TEST".into(),
+            models: vec!["Mac14,3".into(), "Mac16,1".into()],
+            url,
+            sha1: Some(hex::encode(sha1::Sha1::digest(b"0123456789"))),
+        };
+        let dir = tempfile::tempdir()?;
+        let out = dir.path().join("test.ipsw");
+        std::fs::write(sidecar(&out, ".part"), b"01234")?;
+        stela_engine::write_json(
+            &sidecar(&out, ".part.json"),
+            &Partial {
+                image: Image {
+                    models: vec!["Mac14,3".into()],
+                    sha1: image.sha1.as_ref().map(|sha1| sha1.to_uppercase()),
+                    ..image.clone()
+                },
+                total_bytes: Some(10),
+                validator: None,
+            },
+        )?;
+        download_with_client(&image, &out, &Client::new())?;
+        assert_eq!(std::fs::read(&out)?, b"0123456789");
+        let request = server.join().unwrap().to_lowercase();
+        assert!(request.contains("range: bytes=5-"), "{request}");
+        Ok(())
+    }
+
+    #[test]
+    fn same_object_needs_the_build_address_and_checksum() {
+        let image = Image {
+            version: "27.2".into(),
+            build: "26C5".into(),
+            models: vec!["Mac14,3".into()],
+            url: "https://updates.cdn-apple.com/a.ipsw".into(),
+            sha1: Some("ab".repeat(20)),
+        };
+        let more_models = Image {
+            models: vec!["Mac14,3".into(), "Mac16,1".into()],
+            ..image.clone()
+        };
+        assert!(same_object(&image, &more_models));
+        assert!(!same_object(
+            &image,
+            &Image {
+                sha1: Some("cd".repeat(20)),
+                ..image.clone()
+            }
+        ));
+        assert!(!same_object(
+            &image,
+            &Image {
+                url: "https://updates.cdn-apple.com/b.ipsw".into(),
+                ..image.clone()
+            }
+        ));
+        assert!(!same_object(
+            &image,
+            &Image {
+                sha1: None,
+                ..image.clone()
+            }
+        ));
+    }
+
+    #[test]
+    fn an_image_left_without_its_receipt_is_kept_once_it_matches_the_checksum() -> Result<()> {
+        // A stop after the image was renamed into place and before its
+        // receipt was written leaves the whole image with no receipt.
+        let dir = tempfile::tempdir()?;
+        let out = dir.path().join("test.ipsw");
+        std::fs::write(&out, b"0123456789")?;
+        let image = Image {
+            version: "test".into(),
+            build: "TEST".into(),
+            models: vec![],
+            url: "http://127.0.0.1:1/unused".into(),
+            sha1: Some(hex::encode(sha1::Sha1::digest(b"0123456789"))),
+        };
+        let other = Image {
+            sha1: Some(hex::encode(sha1::Sha1::digest(b"something else"))),
+            ..image.clone()
+        };
+        let error = adopt(&other, &out).unwrap_err().to_string();
+        assert!(error.contains("does not match Apple's checksum"), "{error}");
+        assert!(receipt(&out)?.is_none());
+        let unchecked = Image {
+            sha1: None,
+            ..image.clone()
+        };
+        assert!(adopt(&unchecked, &out).is_err());
+        assert!(receipt(&out)?.is_none());
+        let adopted = adopt(&image, &out)?;
+        assert!(adopted.catalog_sha1_verified);
+        assert_eq!(adopted.bytes, 10);
+        assert_eq!(receipt(&out)?.unwrap().image, image);
+        assert_eq!(std::fs::read(&out)?, b"0123456789");
+        assert_eq!(partial_bytes(&out), 0);
+        std::fs::write(sidecar(&out, ".part"), b"0123")?;
+        assert_eq!(partial_bytes(&out), 4);
         Ok(())
     }
     #[test]

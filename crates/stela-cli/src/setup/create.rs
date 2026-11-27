@@ -8,8 +8,8 @@ use super::{
     host::{self, Host},
     image_is_remote, installed, locate_esp, machines, medium,
     prepare::{
-        Prepared, PreparedSetup, copy_bundles, download_dir, prepare_kind, prepare_restore_bundles,
-        supported,
+        Prepared, PreparedSetup, copy_bundles, download_dir, fetch_image_of, fetch_inputs,
+        image_not_kept, prepare_kind, prepare_restore_bundles, supported,
     },
     read_efi,
     record::{RECORD_KIND, RECORD_SCHEMA, Record, publish, write_record},
@@ -900,6 +900,8 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
         builds::find_in(environment.builds, &command.build)?;
     }
     let mut erase = None;
+    // Whether the stick holds a stopped create, which goes on.
+    let mut resumed = false;
     if let Some(disk) = host.whole_disk(&command.usb)? {
         let found = host.disks()?.into_iter().find(|d| d.identifier == disk);
         let found = found.with_context(|| format!("this computer lists no disk {disk}"))?;
@@ -968,6 +970,7 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
                 super::START_OVER
             );
             command.install_image = Some(kind);
+            resumed = true;
         } else if !esp.join(RECORD).exists() {
             let capacity = usb_capacity(host, &command.usb)?;
             command.install_image = Some(choose_installer(
@@ -997,35 +1000,53 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
         command.ipsw = Some(path);
         command.fetch = false;
     }
-    // Downloaded boot archives are kept in one place until setup finishes,
-    // so a setup run again after a stop reuses them, and removed once it
-    // has. A full image goes directly to the stick after preparation and
-    // signing; an explicit cache directory keeps what it holds.
-    let temporary = (command.fetch && command.download_dir.is_none() && !command.dry_run)
-        .then(|| download_dir().join("setup"));
-    if let Some(temporary) = &temporary {
-        fs::create_dir_all(temporary)?;
-    }
+    // Downloads stay in the per-user cache after setup finishes, so the
+    // next stick of the same build, or this one made again after a stop
+    // or an erase, reuses them. An Offline installer's whole image is
+    // kept there too when the computer has room for it with 16 GiB left
+    // over (`prepare::KEEP_RESERVE`); else it goes straight to the stick,
+    // and only its boot files are kept.
     let mut download = None;
-    let ipsw = if let Some(temporary) = &temporary
+    let ipsw = if command.fetch
+        && command.download_dir.is_none()
+        && !command.dry_run
         && command.install_image == Some(InstallImage::Full)
     {
+        let directory = download_dir();
         let image = restore::select(
             &restore::catalog()?,
             Some(&command.build),
             Some(command.model()),
         )?;
-        let boot = temporary.join("boot.ipsw");
-        download = Some(medium::download::Download::prepare(
-            image,
-            command.model(),
-            Some(&boot),
-        )?);
-        boot
-    } else {
-        if let Some(temporary) = &temporary {
-            command.download_dir = Some(temporary.clone());
+        // A stopped Offline create goes on from the pieces on its stick.
+        let streamed = match resumed {
+            true => Some(None),
+            false => image_not_kept(&directory, &image)?.map(Some),
+        };
+        match streamed {
+            None => {
+                let path = fetch_image_of(&directory, &image)?;
+                command.ipsw = Some(path.clone());
+                command.fetch = false;
+                path
+            }
+            Some(why) => {
+                if let Some(why) = why {
+                    eprintln!(
+                        "note: macOS goes straight onto the stick and is not kept on this \
+                         computer, because {why}; making another stick downloads it again"
+                    );
+                }
+                let boot = fetch_inputs(&directory, &command.build, command.model())?;
+                download = Some(medium::download::Download::prepare(
+                    image,
+                    command.model(),
+                    None,
+                )?);
+                boot
+            }
         }
+    } else {
         command.image()?
     };
     if ipsw.is_file() {
@@ -1116,10 +1137,6 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
     // Before "Done": a USB taken out right after holds everything.
     for volume in &volumes {
         host.flush(volume)?;
-    }
-    if let Some(temporary) = &temporary {
-        // The boot files are on the stick now.
-        let _ = fs::remove_dir_all(temporary);
     }
     let start = match disk {
         disk if disk.is_chosen() => format!(

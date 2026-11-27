@@ -762,20 +762,32 @@ fn tessellation(features: &Features) -> Requirement {
     }
 }
 
-/// Whether shaders on `device` access storage copies of depth and stencil
-/// attachments, multisampled ones included, which image copies between
-/// depth or stencil aspects and color images fill.
-pub fn depth_stencil_copies(device: &PhysicalDevice) -> bool {
+/// Whether shaders on `device` access storage copies of single-sample depth
+/// and stencil attachments, which image copies between depth or stencil
+/// aspects and color images fill.
+pub fn single_sample_depth_stencil_copies(device: &PhysicalDevice) -> bool {
     let features = &device.features;
-    features.maintenance8
-        && features.shader_storage_image_multisample
-        && features.shader_storage_image_read_without_format
+    features.maintenance8 && features.shader_storage_image_read_without_format
+}
+
+/// Whether shaders on `device` access storage copies of depth and stencil
+/// attachments, multisampled ones included.
+pub fn depth_stencil_copies(device: &PhysicalDevice) -> bool {
+    single_sample_depth_stencil_copies(device) && device.features.shader_storage_image_multisample
 }
 
 /// Whether a fragment function on `device` can run the fragment tests
 /// itself: on storage copies of the attachments in its interlock section.
+/// A device without multisampled storage images (ANV on every Intel GPU)
+/// runs them for single-sample attachments alone: a pipeline that would
+/// test multisampled ones itself is refused
+/// ([`crate::metal::pipeline`]), as multisampled framebuffer reads are.
+/// Before test 5 such a device ran none, and RenderBox's
+/// `accumulator_coverage_fragment_depth`, which reads its color attachment
+/// and writes depth, was refused on dev64's Iris Xe in every boot: the
+/// Dock's icons, which RenderBox draws, stayed grey squares.
 pub fn fragment_tests(device: &PhysicalDevice) -> bool {
-    device.features.fragment_shader_pixel_interlock && depth_stencil_copies(device)
+    device.features.fragment_shader_pixel_interlock && single_sample_depth_stencil_copies(device)
 }
 
 impl Derivation<'_> {

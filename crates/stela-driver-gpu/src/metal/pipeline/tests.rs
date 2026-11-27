@@ -772,3 +772,31 @@ fn framebuffer_reads_of_multisampled_attachments_take_multisampled_storage() {
     );
     assert!(tile_target(&nvk, &formats, 4, false).is_ok());
 }
+
+/// RenderBox's `accumulator_coverage_fragment_depth` reads its color
+/// attachment and writes depth, so its pipeline cannot test fragments before
+/// it runs and the function tests them itself, on storage copies of the
+/// depth attachment. ANV makes those copies single-sample alone: the
+/// pipeline is made for a single-sample pass, where dev64's Iris Xe refused
+/// it in every boot before test 5 and the Dock's icons stayed grey, and
+/// refused for a multisampled one.
+#[test]
+fn a_framebuffer_reading_depth_writer_tests_single_sample_fragments_on_anv() {
+    let anv = crate::metal::capabilities::tests::anv_gen12();
+    assert!(anv.fragment_tests && anv.single_sample_storage);
+    let mut fragment = interface(Stage::Fragment);
+    fragment.attachment_reads = 1;
+    fragment.writes_depth = true;
+    let mut targets = RenderTargets::default();
+    targets.color_attachments[0] = color(PixelFormat::Rgba16Float);
+    targets.depth_attachment_pixel_format = Some(PixelFormat::Depth32Float);
+    assert!(!tests_first(&fragment, &targets));
+    let attachments = storage_attachments(&anv, &fragment, &targets).unwrap();
+    assert!(attachments[0].is_some());
+
+    targets.raster_sample_count = 4;
+    assert_eq!(
+        storage_attachments(&anv, &fragment, &targets).unwrap_err(),
+        Error::Unsupported("framebuffer reads of multisampled attachments")
+    );
+}

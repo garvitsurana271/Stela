@@ -923,6 +923,12 @@ fn targets(
             outputs.writes_stencil && !capabilities.stencil_export
                 || outputs.storage_attachments != 0 && !tests_first(outputs, targets)
         });
+    // The tests run on storage copies of the attachments' samples, which a
+    // device without multisampled storage images makes single-sample alone.
+    require(
+        !tests_fragments || !multisampled || !capabilities.single_sample_storage,
+        "fragment tests of multisampled attachments",
+    )?;
 
     let mut dynamic_states = BASE_DYNAMIC_STATES.to_vec();
     if capabilities.programmable_sample_positions {

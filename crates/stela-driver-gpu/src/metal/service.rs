@@ -469,6 +469,9 @@ pub struct Service<B: Backend, C: Compiler> {
     keep_lost: bool,
     /// Lost devices let go with their memory kept, and its bytes.
     lost_kept: (u64, u64),
+    /// The pipelines whose unlinked fragment inputs the log named, by
+    /// their log line ([`Self::note_unlinked_varyings`]).
+    unlinked_noted: alloc::collections::BTreeSet<String>,
     /// The platform's ticks a reopened device's first submission has to
     /// signal in before it serves ([`Self::check_reopened`]).
     first_work_ticks: Option<u64>,
@@ -520,6 +523,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             replaced: Vec::new(),
             keep_lost: false,
             lost_kept: (0, 0),
+            unlinked_noted: alloc::collections::BTreeSet::new(),
             first_work_ticks: None,
             probing: None,
         }

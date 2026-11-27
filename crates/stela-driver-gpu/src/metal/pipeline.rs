@@ -565,14 +565,70 @@ fn stage_in(function: &Interface, declared: &[Attribute]) -> Result<()> {
 pub fn link_varyings(producer: &Interface, consumer: Option<&Interface>) -> Result<Vec<Varying>> {
     for input in consumer.iter().flat_map(|consumer| &consumer.varyings) {
         ensure(
-            producer.varyings.iter().any(|output| {
-                (&output.identifier, output.scalar, output.components)
-                    == (&input.identifier, input.scalar, input.components)
-            }),
-            "fragment input without a matching vertex or mesh output",
+            producer.varyings.iter().any(|output| links(output, input)),
+            UNLINKED_VARYING,
         )?;
     }
     Ok(producer.varyings.clone())
+}
+
+/// Why [`link_varyings`] refuses a fragment function's inputs.
+pub const UNLINKED_VARYING: &str = "fragment input without a matching vertex or mesh output";
+
+/// Whether the fragment input `input` reads the vertex or mesh output
+/// `output`: the same identifier, scalar type and component count.
+fn links(output: &Varying, input: &Varying) -> bool {
+    (&output.identifier, output.scalar, output.components)
+        == (&input.identifier, input.scalar, input.components)
+}
+
+/// What keeps `consumer`'s inputs from `producer`'s outputs, for the
+/// platform's log: each input no output links to, then every output, as
+/// `identifier:type xcomponents`, with an output of an unlinked input's
+/// identifier named beside it; `None` when every input links.
+pub fn varying_mismatch(
+    producer: &Interface,
+    consumer: &Interface,
+) -> Option<alloc::string::String> {
+    use alloc::{format, string::String};
+    let describe = |varying: &Varying| {
+        format!(
+            "{}:{:?}x{}{}",
+            varying.identifier,
+            varying.scalar,
+            varying.components,
+            if varying.per_primitive {
+                " per-primitive"
+            } else {
+                ""
+            }
+        )
+    };
+    let unlinked: Vec<String> = consumer
+        .varyings
+        .iter()
+        .filter(|input| !producer.varyings.iter().any(|output| links(output, input)))
+        .map(|input| {
+            let named = producer
+                .varyings
+                .iter()
+                .find(|output| output.identifier == input.identifier)
+                .map_or(String::from(" (no output of its identifier)"), |output| {
+                    format!(" (the output of its identifier is {})", describe(output))
+                });
+            format!("{}{named}", describe(input))
+        })
+        .collect();
+    if unlinked.is_empty() {
+        return None;
+    }
+    let outputs: Vec<String> = producer.varyings.iter().map(describe).collect();
+    Some(format!(
+        "VARYINGS unlinked fragment inputs [{}] of {} inputs; vertex or mesh outputs [{}]",
+        unlinked.join(", "),
+        consumer.varyings.len(),
+        outputs.join(", ")
+    ))
 }
 
 pub fn mesh_render_pipeline(

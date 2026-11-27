@@ -729,6 +729,32 @@ fn varyings_link_by_identifier_and_type() {
     }
 }
 
+/// The log line of a fragment function whose inputs do not link names
+/// each unlinked input, the output of its identifier when there is one,
+/// and every output.
+#[test]
+fn an_unlinked_fragment_input_is_named_with_the_outputs() {
+    let mut vertex = interface(Stage::Vertex);
+    vertex.varyings = alloc::vec![
+        varying("user(color)", Scalar::Half, 4),
+        varying("user(uv)", Scalar::Float, 2),
+    ];
+    let mut fragment = interface(Stage::Fragment);
+    fragment.varyings = alloc::vec![varying("user(uv)", Scalar::Float, 2)];
+    assert_eq!(super::varying_mismatch(&vertex, &fragment), None);
+    fragment.varyings = alloc::vec![
+        varying("user(uv)", Scalar::Float, 2),
+        varying("user(color)", Scalar::Float, 4),
+        varying("user(coverage)", Scalar::Float, 1),
+    ];
+    assert_eq!(
+        super::varying_mismatch(&vertex, &fragment).unwrap(),
+        "VARYINGS unlinked fragment inputs [user(color):Floatx4 (the output of its identifier \
+         is user(color):Halfx4), user(coverage):Floatx1 (no output of its identifier)] of 3 \
+         inputs; vertex or mesh outputs [user(color):Halfx4, user(uv):Floatx2]"
+    );
+}
+
 /// ANV has no multisampled storage images: its framebuffer reads reach
 /// single-sample attachments, and a multisampled pipeline that would
 /// access an attachment as storage, or tile pipeline, is refused, where

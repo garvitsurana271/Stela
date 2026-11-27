@@ -78,8 +78,40 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             archives: self.archives(connection, &mut *memory, &request.archives)?,
         };
         self.noted = Some(self.describe_render_pipeline(&pipeline));
-        let pipeline = self.device.new_render_pipeline(&pipeline)?;
-        self.adopt_render_pipeline(call, pipeline)
+        let made = self.device.new_render_pipeline(&pipeline);
+        if matches!(made, Err(crate::metal::error::Error::Invalid(reason)) if reason == pipeline::UNLINKED_VARYING)
+        {
+            self.note_unlinked_varyings(&pipeline);
+        }
+        self.adopt_render_pipeline(call, made?)
+    }
+
+    /// Adds to the platform's log line of a pipeline whose fragment inputs
+    /// do not link what they lack ([`pipeline::varying_mismatch`]), once
+    /// for each pair of functions: dev64's RenderBox pipeline
+    /// `plane__vertex` + `uber_resolve_fragment` was refused every boot with
+    /// nothing saying which input.
+    fn note_unlinked_varyings(&mut self, request: &RenderPipelineRequest) {
+        let Some(fragment) = request.fragment_function else {
+            return;
+        };
+        let (Ok(vertex), Ok(fragment)) = (
+            self.device.function_interface(request.vertex_function),
+            self.device.function_interface(fragment),
+        ) else {
+            return;
+        };
+        let Some(mismatch) = pipeline::varying_mismatch(vertex, fragment) else {
+            return;
+        };
+        let pair = self.noted.clone().unwrap_or_default();
+        if !self.unlinked_noted.insert(pair) {
+            return;
+        }
+        if let Some(noted) = self.noted.as_mut() {
+            noted.push(' ');
+            noted.push_str(&mismatch);
+        }
     }
 
     /// A render pipeline's functions and vertex fetch, for the platform's

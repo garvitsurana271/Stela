@@ -21,6 +21,21 @@ pub mod runtime;
 const TX_HEADER: usize = 64;
 const MAX_TX_BYTES: usize = u16::MAX as usize;
 
+/// `txd[1]` for an MCU command (`MT_HDR_FORMAT_CMD`).
+///
+/// Connac3 (`mt76_connac3_mac.h`, included by `mt7925/mcu.c` via `mac.h`)
+/// places `MT_TXD1_HDR_FORMAT` in bits 15..=14 (`1 << 14 = 0x4000`) and has no
+/// `MT_TXD1_LONG_FORMAT`. Connac2 (`mt76_connac2_mac.h`) places
+/// `MT_TXD1_HDR_FORMAT` in bits 17..=16 alongside `MT_TXD1_LONG_FORMAT`
+/// (`(1 << 31) | (1 << 16) = 0x8001_0000`).
+pub(super) const fn mcu_txd1(chip: Chip) -> u32 {
+    if matches!(chip, Chip::Mt7925) {
+        1 << 14
+    } else {
+        (1 << 31) | (1 << 16)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Command {
@@ -119,7 +134,7 @@ impl Encoder {
         let length = payload.len() + TX_HEADER;
         let mut bytes = vec![0u8; length];
         let txd0 = length as u32 | (2 << 23) | (0x20 << 25);
-        let txd1: u32 = (1 << 16) | if chip == Chip::Mt7925 { 0 } else { 1 << 31 };
+        let txd1 = mcu_txd1(chip);
         bytes[0..4].copy_from_slice(&txd0.to_le_bytes());
         bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
         bytes[32..34].copy_from_slice(&((length - 32) as u16).to_le_bytes());
@@ -244,7 +259,7 @@ mod tests {
                 assert_eq!(
                     &p.bytes[4..8],
                     &(if chip == Chip::Mt7925 {
-                        0x10000u32
+                        0x4000u32
                     } else {
                         0x80010000
                     })
@@ -371,6 +386,36 @@ mod tests {
                 trace.extend_from_slice(&packet.bytes);
             }
             assert_eq!(trace, expected, "chip {number}");
+        }
+    }
+
+    #[test]
+    fn connac3_mcu_commands_place_hdr_format_at_bit_14_while_connac2_uses_bit_16() {
+        for chip in [Chip::Mt7921, Chip::Mt7922, Chip::Mt7925] {
+            let expected = if chip == Chip::Mt7925 {
+                0x4000u32.to_le_bytes()
+            } else {
+                0x8001_0000u32.to_le_bytes()
+            };
+            let mut enc = Encoder::default();
+            let boot = enc
+                .encode(chip, Command::PatchSemaphore, &[1, 0, 0, 0])
+                .unwrap();
+            let caps = enc.encode_capabilities(chip);
+            let eeprom = enc.encode_encapsulation_query(chip);
+            let uni = enc
+                .encode_uni(chip, runtime::Command::DeviceInfo, &[0; 8])
+                .unwrap();
+            let restart = enc.encode_bootstrap(&init::Request::restart(chip));
+            for bytes in [
+                boot.bytes.as_slice(),
+                caps.bytes(),
+                eeprom.bytes(),
+                uni.bytes(),
+                restart.bytes(),
+            ] {
+                assert_eq!(&bytes[4..8], &expected, "chip {chip:?}");
+            }
         }
     }
 }

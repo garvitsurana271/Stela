@@ -86,7 +86,7 @@ impl Encoder {
         let length = HEADER + payload.len();
         let mut bytes = vec![0; length];
         let txd0 = length as u32 | (2 << 23) | (0x20 << 25);
-        let txd1 = (1u32 << 16) | if chip == Chip::Mt7925 { 0 } else { 1 << 31 };
+        let txd1 = super::mcu_txd1(chip);
         bytes[..4].copy_from_slice(&txd0.to_le_bytes());
         bytes[4..8].copy_from_slice(&txd1.to_le_bytes());
         bytes[32..34].copy_from_slice(&((length - 32) as u16).to_le_bytes());

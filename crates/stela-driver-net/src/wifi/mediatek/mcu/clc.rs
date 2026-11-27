@@ -40,7 +40,7 @@ impl Encoder {
         let length = header + request.body().len();
         let mut bytes = vec![0; length];
         bytes[..4].copy_from_slice(&(length as u32 | (2 << 23) | (0x20 << 25)).to_le_bytes());
-        bytes[4..8].copy_from_slice(&(1u32 << 16 | if c3 { 0 } else { 1 << 31 }).to_le_bytes());
+        bytes[4..8].copy_from_slice(&super::mcu_txd1(chip).to_le_bytes());
         bytes[32..34].copy_from_slice(&((length - 32) as u16).to_le_bytes());
         bytes[37] = 0xa0;
         bytes[39] = sequence;

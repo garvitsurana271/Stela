@@ -288,6 +288,19 @@ pub struct MemoryReport {
     pub device: crate::metal::device::DeviceMemory,
     pub dropped: Dropped,
     pub connections: Vec<ConnectionMemory>,
+    /// Lost devices a reopened one replaced: those still proving their
+    /// queues idle, and those let go with what they allocated kept, as
+    /// their backends could not prove the GPU stopped using it.
+    pub lost: LostDevices,
+}
+
+/// Lost devices a reopened one replaced ([`MemoryReport::lost`]).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LostDevices {
+    pub retiring: usize,
+    pub kept: u64,
+    /// The bytes the kept ones had allocated, which stay allocated.
+    pub kept_bytes: u64,
 }
 
 /// A connection's objects and the bytes it counts.
@@ -453,6 +466,8 @@ pub struct Service<B: Backend, C: Compiler> {
     /// Whether a lost device the reopened one replaces is kept unreleased
     /// ([`Self::keep_lost_devices`]).
     keep_lost: bool,
+    /// Lost devices let go with their memory kept, and its bytes.
+    lost_kept: (u64, u64),
     /// The platform's ticks a reopened device's first submission has to
     /// signal in before it serves ([`Self::check_reopened`]).
     first_work_ticks: Option<u64>,
@@ -503,6 +518,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             prepare: None,
             replaced: Vec::new(),
             keep_lost: false,
+            lost_kept: (0, 0),
             first_work_ticks: None,
             probing: None,
         }
@@ -731,6 +747,8 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         let clock = self.device.clock();
         let lost = core::mem::replace(&mut self.device, device);
         if self.keep_lost {
+            self.lost_kept.0 += 1;
+            self.lost_kept.1 += lost.memory().allocated;
             core::mem::forget(lost);
         } else {
             self.replaced.push(lost);
@@ -782,7 +800,15 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         let Some(oldest) = self.replaced.first_mut() else {
             return;
         };
-        if oldest.backend().idle_step() != IdleStep::Waiting {
+        let step = oldest.backend().idle_step();
+        if step == IdleStep::Unproven {
+            // Its backend keeps every handle as it drops, the memory too
+            // ([`crate::metal::native`]'s drop): dev64's Iris Xe kept 3.5 GB
+            // of a lost device after i915 reset the hung context.
+            self.lost_kept.0 += 1;
+            self.lost_kept.1 += oldest.memory().allocated;
+        }
+        if step != IdleStep::Waiting {
             drop(self.replaced.remove(0));
         }
     }
@@ -852,6 +878,11 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                     allocated: held.allocated,
                 })
                 .collect(),
+            lost: LostDevices {
+                retiring: self.replaced.len(),
+                kept: self.lost_kept.0,
+                kept_bytes: self.lost_kept.1,
+            },
         }
     }
 

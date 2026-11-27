@@ -634,6 +634,11 @@ fn an_unproven_replaced_device_is_dropped_at_its_step() {
     service.device().mark_lost();
     service.disconnect(first).unwrap();
     assert_eq!(service.retiring_devices(), 1);
+    assert_eq!(service.memory().lost.retiring, 1);
+    assert_eq!(service.memory().lost.kept, 0);
     connect(&mut service);
     assert_eq!(service.retiring_devices(), 0);
+    // The platform's memory line says it was let go with its memory kept.
+    let lost = service.memory().lost;
+    assert_eq!((lost.retiring, lost.kept), (0, 1));
 }

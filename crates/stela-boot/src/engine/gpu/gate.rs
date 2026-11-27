@@ -845,7 +845,7 @@ fn report_memory(service: &Shared) {
     let mib = |bytes: u64| bytes >> 20;
     let device = memory.device;
     output::arguments(format_args!(
-        "GPU MEMORY allocated={}M deferred={}/{}M pinned={}/{}M/{}M in_flight={} completed={}/{} recycled={}/{}M reused={}/{} heap_nils={}/{} heap_cleared={} blocks={}/{}M placed={}/{}M own={} chunks={}/{}M oom={} dropped={}/{} connections={}",
+        "GPU MEMORY allocated={}M deferred={}/{}M pinned={}/{}M/{}M in_flight={} completed={}/{} recycled={}/{}M reused={}/{} heap_nils={}/{} heap_cleared={} blocks={}/{}M placed={}/{}M own={} chunks={}/{}M oom={} dropped={}/{} lost_devices=retiring:{}/kept:{}/{}M connections={}",
         mib(device.allocated),
         device.deferred,
         mib(device.deferred_bytes),
@@ -872,6 +872,9 @@ fn report_memory(service: &Shared) {
         device.out_of_memory,
         memory.dropped.command_buffers,
         memory.dropped.out_of_memory,
+        memory.lost.retiring,
+        memory.lost.kept,
+        mib(memory.lost.kept_bytes),
         memory.connections.len(),
     ));
     memory

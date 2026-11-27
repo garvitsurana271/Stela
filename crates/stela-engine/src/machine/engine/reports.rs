@@ -854,49 +854,101 @@ impl WholeTlbiSites {
 
 /// The samples a [`WholeTlbiTrigger`] keeps.
 pub const WHOLE_TLBI_SAMPLES: usize = 4;
-/// One TLBI of everything in this many is sampled, under step timing.
-pub const WHOLE_TLBI_SAMPLE_EVERY: u64 = 4096;
+/// One TLBI of everything in this many is sampled, under step timing: in
+/// boot 35's Finder a PE issued about 90 a second.
+pub const WHOLE_TLBI_SAMPLE_EVERY: u64 = 512;
+/// The words of one sample ([`WholeTlbiTrigger::samples`]): its PC, X16 and
+/// X30; the root at the PE's previous one, at it, and of the next context
+/// made at EL0; the three ASIDs (previous in bits 47:32, its own in 31:16,
+/// the next in 15:0); the shared region at it and at the next ([`region`]);
+/// and the address the regions were read at, 0 for none.
+///
+/// [`region`]: WholeTlbiTrigger
+pub const WHOLE_TLBI_SAMPLE_WORDS: usize = 10;
 
-/// What came before a PE's own TLBIs of everything, to find what makes a
-/// guest flush everything at context-switch rate: whether TTBR0_EL1
-/// changed since the PE's previous one (an address-space switch between
-/// the two, natively or not), and, under step timing (`--profile`), a
-/// rate-limited sample of where it was called from.
+/// What came before and after a PE's own TLBIs of everything, to find what
+/// makes a guest flush everything at context-switch rate. The root is TTBR0
+/// of the regime EL0 translates in: TTBR0_EL2 under HCR_EL2.TGE (XNU's
+/// processes on an M2, whose kernel runs at EL2 and leaves TTBR0_EL1 at 0),
+/// else TTBR0_EL1; its ASID is the one that regime's TCR.A1 selects.
+///
+/// Every one counts whether its root's table base and its ASID are the ones
+/// the PE's previous one found, and how the first context the PE made at
+/// EL0 after it translates: through the root it found (the switch came
+/// before the flush), through another (after it), or none before the PE's
+/// next one. Under step timing (`--profile`) one in
+/// [`WHOLE_TLBI_SAMPLE_EVERY`] is sampled ([`WHOLE_TLBI_SAMPLE_WORDS`]),
+/// with the shared region each root maps at a lower-half global code
+/// address the PE ran since its contexts were last forgotten: the physical
+/// address of the last descriptor a walk of it reads, the shared region's
+/// own table where its tables are nested in every process's (XNU's shared
+/// region), so two roots of one shared region give one address.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(
     all(feature = "std", feature = "native-profile"),
     derive(serde::Serialize)
 )]
 pub struct WholeTlbiTrigger {
-    /// Those that found TTBR0_EL1 as the PE's previous one left it, and
-    /// those that found it changed.
+    /// Those whose root's table base was the previous one's, and those
+    /// whose was another.
     pub switched: [u64; 2],
-    /// One in [`WHOLE_TLBI_SAMPLE_EVERY`] under step timing: its PC, X16,
-    /// X30, and TTBR0_EL1 at the PE's previous one and now; the latest
-    /// first, `[0; 5]` none.
-    pub samples: [[u64; 5]; WHOLE_TLBI_SAMPLES],
+    /// Likewise by ASID.
+    pub asids: [u64; 2],
+    /// By the next context made at EL0: through the same root, another,
+    /// none before the next TLBI of everything.
+    pub next: [u64; 3],
+    /// The latest first, all zero none.
+    pub samples: [[u64; WHOLE_TLBI_SAMPLE_WORDS]; WHOLE_TLBI_SAMPLES],
 }
 
 impl WholeTlbiTrigger {
-    /// Count one with TTBR0_EL1 `switched` or not, and keep `sample`.
-    pub fn note(&mut self, switched: bool, sample: Option<[u64; 5]>) {
-        self.switched[usize::from(switched)] += 1;
+    /// Count one whose root and ASID were `switched` or not, and keep
+    /// `sample`.
+    pub fn note(
+        &mut self,
+        [root, asid]: [bool; 2],
+        sample: Option<[u64; WHOLE_TLBI_SAMPLE_WORDS]>,
+    ) {
+        self.switched[usize::from(root)] += 1;
+        self.asids[usize::from(asid)] += 1;
         if let Some(sample) = sample {
             self.samples.copy_within(..WHOLE_TLBI_SAMPLES - 1, 1);
             self.samples[0] = sample;
         }
     }
 
+    /// The next context made at EL0 after the latest one translates through
+    /// `other` a root than it found, or none was made (`None`); its root,
+    /// ASID and shared region go in the latest sample when it is the one
+    /// sampled (`sampled`).
+    pub fn next_context(&mut self, other: Option<bool>, sampled: Option<(u64, u16, u64)>) {
+        self.next[other.map_or(2, usize::from)] += 1;
+        if let Some((root, asid, region)) = sampled {
+            let sample = &mut self.samples[0];
+            sample[5] = root;
+            sample[6] = sample[6] & !0xffff | u64::from(asid);
+            sample[8] = region;
+        }
+    }
+
     /// Add `other`'s counts; its samples go first.
     pub fn add(&mut self, other: &Self) {
-        self.switched[0] += other.switched[0];
-        self.switched[1] += other.switched[1];
-        let mut samples = [[0; 5]; WHOLE_TLBI_SAMPLES];
+        for (total, more) in self
+            .switched
+            .iter_mut()
+            .chain(&mut self.asids)
+            .chain(&mut self.next)
+            .zip(other.switched.iter().chain(&other.asids).chain(&other.next))
+        {
+            *total += more;
+        }
+        let none = [0; WHOLE_TLBI_SAMPLE_WORDS];
+        let mut samples = [none; WHOLE_TLBI_SAMPLES];
         let kept = other
             .samples
             .iter()
             .chain(&self.samples)
-            .filter(|sample| **sample != [0; 5]);
+            .filter(|sample| **sample != none);
         for (into, sample) in samples.iter_mut().zip(kept) {
             *into = *sample;
         }

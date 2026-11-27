@@ -10610,64 +10610,158 @@ fn whole_tlbi_benchmark() {
 /// The census of TLBIs of everything keeps the most frequent PCs, merges a
 /// PC it holds and orders them most first; a new PC takes the least
 /// frequent's place and count.
-/// A PE's own TLBIs of everything count by whether TTBR0_EL1 changed since
-/// its previous one, natively written or not, and only under step timing
-/// is one in [`WHOLE_TLBI_SAMPLE_EVERY`] sampled with its PC, X16, X30 and
-/// both TTBR0 values; mail's TLBIs of everything count in neither.
+/// A PE's own TLBIs of everything count by whether the root (TTBR0's table
+/// base) and the ASID of the regime EL0 translates in changed since its
+/// previous one, natively written or not, and by how the first context made
+/// at EL0 after each translates: through the same root, another, or none
+/// before the next. Under HCR_EL2.TGE that root is TTBR0_EL2, which XNU on
+/// an M2 switches while TTBR0_EL1 stays 0. Only under step timing is one in
+/// [`WHOLE_TLBI_SAMPLE_EVERY`] sampled with its PC, X16, X30, roots and
+/// ASIDs; mail's TLBIs of everything count in none of it.
 #[test]
-fn whole_tlbis_count_the_address_space_switches_before_them() {
+fn whole_tlbis_count_the_address_space_switches_around_them() {
     use mmu::tlbi::{Everywhere, Reach};
     const RET: u32 = 0xd65f_03c0;
+    const E2H_TGE: u64 = 1 << 34 | 1 << 27;
     let mut machine = machine(&[RET]);
     let all = |machine: &mut Machine<FakeHost, NoDevices>| {
         machine.tlb_maintained(Reach::All, Everywhere::All, None)
     };
     let trigger = |machine: &Machine<FakeHost, NoDevices>| machine.statistics.whole_tlbi_trigger;
+    let counts = |machine: &Machine<FakeHost, NoDevices>| {
+        let seen = trigger(machine);
+        (seen.switched, seen.asids, seen.next)
+    };
+    let variant = machine.current_variant(false, false);
+    let base = machine.cpu.read(SystemRegister::TTBR0_EL1);
     all(&mut machine);
     all(&mut machine);
-    assert_eq!(trigger(&machine).switched, [2, 0]);
-    // TTBR0 as a native switch leaves it, the engine not told.
+    assert_eq!(counts(&machine), ([2, 0], [2, 0], [0, 0, 1]));
+    // TTBR0 as a native switch leaves it, the engine not told: a new table,
+    // then the same table with another ASID.
     machine
         .cpu
         .registers
         .set(SystemRegister::TTBR0_EL1, 0, 0x1234_0000);
     all(&mut machine);
-    all(&mut machine);
-    assert_eq!(trigger(&machine).switched, [3, 1]);
-    assert_eq!(trigger(&machine).samples, [[0; 5]; WHOLE_TLBI_SAMPLES]);
-    // Mail's TLBI of everything is another PE's.
-    machine.applying_mail = true;
+    assert_eq!(counts(&machine), ([2, 1], [3, 0], [0, 0, 2]));
     machine
         .cpu
         .registers
-        .set(SystemRegister::TTBR0_EL1, 0, 0x5678_0000);
+        .set(SystemRegister::TTBR0_EL1, 0, 0x1234_0000 | 7 << 48);
+    all(&mut machine);
+    assert_eq!(counts(&machine), ([3, 1], [3, 1], [0, 0, 3]));
+    // The next EL0 context: through the root the TLBI found; a context at
+    // EL1 first is none of it; then through another root.
+    machine.contexts(1, variant);
+    machine.contexts(0, variant);
+    assert_eq!(counts(&machine).2, [1, 0, 3]);
+    all(&mut machine);
+    machine
+        .cpu
+        .registers
+        .set(SystemRegister::TTBR0_EL1, 0, base);
+    machine.contexts(0, variant);
+    assert_eq!(counts(&machine).2, [1, 1, 3]);
+    assert_eq!(
+        trigger(&machine).samples,
+        [[0; WHOLE_TLBI_SAMPLE_WORDS]; WHOLE_TLBI_SAMPLES]
+    );
+    // Mail's TLBI of everything is another PE's.
+    let before = counts(&machine);
+    machine.applying_mail = true;
     all(&mut machine);
     machine.applying_mail = false;
-    assert_eq!(trigger(&machine).switched, [3, 1]);
-    // Under step timing: the next one taken is the 5th, not sampled, until
-    // WHOLE_TLBI_SAMPLE_EVERY of them.
+    assert_eq!(counts(&machine), before);
+    // Under TGE the root is TTBR0_EL2's.
+    machine
+        .cpu
+        .registers
+        .set(SystemRegister::HCR_EL2, 0, E2H_TGE);
+    let root = 0x4444_0000 | 3 << 48;
+    machine
+        .cpu
+        .registers
+        .set(SystemRegister::TTBR0_EL2, 0, root);
+    assert_eq!(machine.lower_controls().ttbr0, root);
+    // Under step timing one in WHOLE_TLBI_SAMPLE_EVERY is sampled.
     machine.set_step_timing(true);
     machine.cpu.state.x[16] = 0x16;
     machine.cpu.state.x[30] = 0x30;
     let pc = machine.cpu.pc;
-    for _ in 4..WHOLE_TLBI_SAMPLE_EVERY + 1 {
+    let mut flushes = 0;
+    while trigger(&machine).samples[0][0] == 0 {
         all(&mut machine);
+        flushes += 1;
+        assert!(flushes <= WHOLE_TLBI_SAMPLE_EVERY, "one sampled");
     }
+    let next = 0x5555_0000 | 9 << 48;
+    machine
+        .cpu
+        .registers
+        .set(SystemRegister::TTBR0_EL2, 0, next);
+    machine.contexts(0, variant);
     let seen = trigger(&machine);
+    let previous = if flushes == 1 { base } else { root };
+    let asid = if flushes == 1 { 0 } else { 3 };
     assert_eq!(
-        seen.switched[0] + seen.switched[1],
-        WHOLE_TLBI_SAMPLE_EVERY + 1
+        seen.samples[0],
+        [
+            pc,
+            0x16,
+            0x30,
+            previous,
+            root,
+            next,
+            asid << 32 | 3 << 16 | 9,
+            0,
+            0,
+            0
+        ]
     );
-    assert_eq!(seen.samples[0], [pc, 0x16, 0x30, 0x5678_0000, 0x5678_0000]);
-    assert_eq!(seen.samples[1], [0; 5]);
+    assert_eq!(seen.samples[1], [0; WHOLE_TLBI_SAMPLE_WORDS]);
     // Merged over PEs: counts add, samples of both are kept.
     let mut merged = seen;
     merged.add(&seen);
-    assert_eq!(
-        merged.switched,
-        [seen.switched[0] * 2, seen.switched[1] * 2]
-    );
+    assert_eq!(merged.switched, seen.switched.map(|count| count * 2));
+    assert_eq!(merged.asids, seen.asids.map(|count| count * 2));
+    assert_eq!(merged.next, seen.next.map(|count| count * 2));
     assert_eq!(merged.samples[..2], [seen.samples[0]; 2]);
+}
+
+/// A sampled TLBI of everything names the shared region each root maps at a
+/// lower-half global code address the PE ran: the physical address of the
+/// last descriptor a walk of it reads, under the root the TLBI found and
+/// under the next EL0 context's. Two address spaces of their own tables
+/// give two.
+#[test]
+fn a_sampled_whole_tlbi_names_the_shared_region_of_each_root() {
+    use mmu::tlbi::{Everywhere, Reach};
+    const RET: u32 = 0xd65f_03c0;
+    const MSR_TTBR0_EL1_X0: u32 = 0xd518_2000;
+    let mut machine = machine(&[RET]);
+    paged_space(&mut machine, 1, &[BASE]);
+    paged_space(&mut machine, 0, &[BASE]);
+    machine.set_step_timing(true);
+    assert!(matches!(
+        machine.fetch_block(BASE, false),
+        Ok(Fetched::Block(_))
+    ));
+    machine.tlb_maintained(Reach::All, Everywhere::All, None);
+    let [l1_other, _, l3_other] = SPACES_TABLES[1];
+    machine.cpu.state.x[0] = BASE + l1_other;
+    machine.system_instruction(MSR_TTBR0_EL1_X0).unwrap();
+    let variant = machine.current_variant(false, false);
+    machine.contexts(0, variant);
+    let sample = machine.statistics.whole_tlbi_trigger.samples[0];
+    let [l1, _, l3] = SPACES_TABLES[0];
+    assert_eq!(sample[4], BASE + l1);
+    assert_eq!(sample[5], BASE + l1_other);
+    assert_eq!(
+        [sample[7], sample[8], sample[9]],
+        [BASE + l3, BASE + l3_other, BASE]
+    );
+    assert_eq!(machine.statistics.whole_tlbi_trigger.next, [0, 1, 0]);
 }
 
 #[test]

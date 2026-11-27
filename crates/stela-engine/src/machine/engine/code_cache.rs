@@ -46,6 +46,10 @@ struct StaleBlock {
     installer: u8,
 }
 
+/// The table base address of a TTBR (BADDR, bits 47:1), without its ASID
+/// and CnP bit: what tells two roots apart.
+const TTBR_BADDR: u64 = 0x0000_ffff_ffff_fffe;
+
 /// The word and bit of the two positions of the leaf of `size` bytes at
 /// `base` in a filter of [`FETCHED_LEAVES`] bits. A base's low bits are clear,
 /// so the size's exponent keeps leaves of one base apart.
@@ -599,6 +603,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 let started = self.whole_tlbi_clock();
                 let live =
                     !self.fill_log.is_empty() || self.spaces.iter().any(|spaces| spaces.len() != 0);
+                // A lower-half global code address run since the contexts
+                // were last forgotten, before this forget empties the span:
+                // where the trigger reads the shared region.
+                let probe = (self.lower_globals != NO_GLOBALS).then_some(self.lower_globals.0);
                 if self.tlbi_keep.on {
                     // `--tlbi-keep on`: kept, and verified before any use.
                     self.keep_spaces();
@@ -606,7 +614,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     self.forget_spaces(0..=1, 1);
                 }
                 if !self.applying_mail {
-                    whole = Some((started, live));
+                    whole = Some((started, live, probe));
                 }
             }
         }
@@ -622,10 +630,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // A local TLBI of everything: its PC, whether the ITLB held
         // anything, and, under step timing, the time of the engine's and
         // the host's parts.
-        if let Some((started, live)) = whole {
+        if let Some((started, live, probe)) = whole {
             let done = self.whole_tlbi_clock();
             self.statistics.whole_tlbi_sites.add(self.cpu.pc, 1);
-            self.note_whole_tlbi_trigger();
+            self.note_whole_tlbi_trigger(probe);
             let times = &mut self.statistics.whole_tlbi_times;
             times[0] += u64::from(live);
             times[1] += forgot.wrapping_sub(started);
@@ -633,27 +641,79 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
     }
 
-    /// What came before this PE's own TLBI of everything: whether TTBR0_EL1
-    /// changed since its previous one and, under step timing, one in
-    /// [`WHOLE_TLBI_SAMPLE_EVERY`] sampled ([`WholeTlbiTrigger`]). Reads
-    /// registers only.
-    fn note_whole_tlbi_trigger(&mut self) {
-        let ttbr0 = self.cpu.read(SystemRegister::TTBR0_EL1);
-        let switched = self.whole_tlbis != 0 && ttbr0 != self.whole_tlbi_ttbr0;
-        let sample = (self.step_timing.is_some()
-            && self.whole_tlbis.is_multiple_of(WHOLE_TLBI_SAMPLE_EVERY))
-        .then(|| {
+    /// What came before this PE's own TLBI of everything: whether the lower
+    /// half's root and ASID changed since its previous one, of the regime
+    /// EL0 translates in ([`Self::lower_controls`]); and, under step timing,
+    /// one in [`WHOLE_TLBI_SAMPLE_EVERY`] sampled with the shared region
+    /// the root maps at `probe` ([`WholeTlbiTrigger`]). The next context
+    /// made at EL0 completes it ([`Self::note_next_root`]). Reads registers
+    /// and, for a sample, the descriptors of one walk.
+    fn note_whole_tlbi_trigger(&mut self, probe: Option<u64>) {
+        let controls = self.lower_controls();
+        let (root, asid) = (controls.ttbr0, mmu::current_asid(&controls));
+        let (previous, previous_asid) = self.whole_tlbi_root;
+        let first = self.whole_tlbis == 0;
+        let switched = [
+            !first && root & TTBR_BADDR != previous & TTBR_BADDR,
+            !first && asid != previous_asid,
+        ];
+        // The one before had no context at EL0 after it.
+        if self.whole_tlbi_next.take().is_some() {
+            self.statistics.whole_tlbi_trigger.next_context(None, None);
+        }
+        let sampled =
+            self.step_timing.is_some() && self.whole_tlbis.is_multiple_of(WHOLE_TLBI_SAMPLE_EVERY);
+        let sample = sampled.then(|| {
+            let region = probe.map_or(0, |at| self.shared_region(&controls, at));
             [
                 self.cpu.pc,
                 self.cpu.state.x[16],
                 self.cpu.state.x[30],
-                self.whole_tlbi_ttbr0,
-                ttbr0,
+                previous,
+                root,
+                0,
+                u64::from(previous_asid) << 32 | u64::from(asid) << 16,
+                region,
+                0,
+                probe.unwrap_or(0),
             ]
         });
         self.statistics.whole_tlbi_trigger.note(switched, sample);
-        self.whole_tlbi_ttbr0 = ttbr0;
+        self.whole_tlbi_root = (root, asid);
+        self.whole_tlbi_next = Some(NextRoot {
+            root,
+            sampled: sampled.then_some(probe.unwrap_or(0)),
+        });
         self.whole_tlbis += 1;
+    }
+
+    /// The first context made at EL0 after this PE's latest TLBI of
+    /// everything (`next`) translates under `controls`: through the root
+    /// that TLBI found or another, and for a sampled one its root, ASID and
+    /// shared region.
+    pub(super) fn note_next_root(&mut self, next: NextRoot, controls: &mmu::Controls) {
+        let other = controls.ttbr0 & TTBR_BADDR != next.root & TTBR_BADDR;
+        let sampled = next.sampled.map(|probe| {
+            let region = match probe {
+                0 => 0,
+                at => self.shared_region(controls, at),
+            };
+            (controls.ttbr0, mmu::current_asid(controls), region)
+        });
+        self.statistics
+            .whole_tlbi_trigger
+            .next_context(Some(other), sampled);
+    }
+
+    /// Which shared region `controls` map at the lower-half address `at`:
+    /// the physical address of the last descriptor a walk of it reads, or
+    /// 0 if it reads none. The walk makes no descriptor updates and fills
+    /// nothing.
+    fn shared_region(&mut self, controls: &mmu::Controls, at: u64) -> u64 {
+        let requester = self.cpu.requester();
+        let mut tables = tlbi_keep::RecordingTables::new(&mut self.host);
+        let _ = mmu::translate(controls, at, Access::Execute, requester, &mut tables);
+        tables.reads.last_address().unwrap_or(0)
     }
 
     /// The counter, for the times of a TLBI of everything, while step

@@ -224,6 +224,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.mirrors.transitions.contexts_moved();
         }
         self.statistics.itlb_sources[ItlbSource::Made as usize] += 1;
+        // The first context at EL0 after a TLBI of everything: the process
+        // that runs next.
+        if half == 0
+            && key.el & 3 == 0
+            && let Some(next) = self.whole_tlbi_next.take()
+        {
+            self.note_next_root(next, controls);
+        }
         if let Some(pending) = self.pending_refills.remove(&(half, key)) {
             // A list a TLBI of everything since kept for its key.
             if pending.flushes != 0 {
@@ -347,6 +355,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// address space of a hot sample ([`step_timing::AsidSamples`]). Under
     /// VHE the kernel's `TTBR0_EL1` writes reach `TTBR0_EL2`, so the EL1
     /// register alone reads 0 there.
+    /// The controls of the regime EL0 translates in, whose TTBR0 is the
+    /// lower half's root: EL2&0's under HCR_EL2.TGE, else EL1&0's
+    /// ([`Self::fetch_regime`]).
+    pub(super) fn lower_controls(&self) -> mmu::Controls {
+        self.cpu.translating_controls(self.fetch_regime(0))
+    }
+
     pub(super) fn current_space_asid(&self) -> u16 {
         mmu::current_asid(
             &self

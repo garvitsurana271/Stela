@@ -116,6 +116,14 @@ pub(super) struct WalkReads {
 }
 
 impl WalkReads {
+    /// The address of the last descriptor the walk read, if it read any
+    /// within the record's room.
+    pub(super) fn last_address(&self) -> Option<u64> {
+        self.reads[..usize::from(self.len)]
+            .last()
+            .map(|&(address, _)| address)
+    }
+
     /// The record of this walk of `pc` under `ttbr0`, which gave
     /// `translation`.
     pub(super) fn record(

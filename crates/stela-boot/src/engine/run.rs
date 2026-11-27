@@ -2817,20 +2817,40 @@ impl Heartbeat {
                 line.push_str(&format!(" {pc:#x}={count}"));
             }
             output::arguments(format_args!("{line}\n"));
-            // What came before them: an address-space switch since the PE's
-            // previous one or none, and under --profile a sample of where
-            // they were called from.
-            let mut line = String::from("PES WHOLE TLBI TRIGGER same_ttbr0/new_ttbr0");
+            // What came before and after them, by the root and ASID of the
+            // regime EL0 translates in (TTBR0_EL2 under VHE): whether the
+            // root and the ASID were the PE's previous one's, and whether
+            // the first context made at EL0 after it ran through the same
+            // root, another, or none came before the next; under --profile
+            // a sample with the roots, ASIDs and the shared region each root
+            // maps at a global code address the PE ran (the physical address
+            // of its walk's last descriptor), of the previous TLBI, this one
+            // and the next EL0 context.
+            let mut line = String::from(concat!(
+                "PES WHOLE TLBI TRIGGER same_root/new_root/same_asid/new_asid",
+                "/next_same/next_other/next_none",
+            ));
             let mut sampled = String::new();
             for (pe, counts) in per_pe.iter().enumerate() {
                 let trigger = &counts.whole_tlbi_trigger;
                 let [same, new] = trigger.switched;
-                line.push_str(&format!(" {pe}:{same}/{new}"));
-                for [pc, x16, x30, from, to] in trigger.samples {
+                let [same_asid, new_asid] = trigger.asids;
+                let [next_same, next_other, next_none] = trigger.next;
+                line.push_str(&format!(
+                    " {pe}:{same}/{new}/{same_asid}/{new_asid}/{next_same}/{next_other}/{next_none}"
+                ));
+                for [pc, x16, x30, from, root, next, asids, region, next_region, at] in
+                    trigger.samples
+                {
                     if pc != 0 {
+                        let asid = |shift: u32| (asids >> shift) & 0xffff;
                         sampled.push_str(&format!(
                             "PES WHOLE TLBI SAMPLE pe={pe} pc={pc:#x} x16={x16:#x} x30={x30:#x} \
-                             ttbr0={from:#x}->{to:#x}\n"
+                             root={from:#x}->{root:#x}->{next:#x} asid={}->{}->{} \
+                             region={region:#x}->{next_region:#x} at={at:#x}\n",
+                            asid(32),
+                            asid(16),
+                            asid(0),
                         ));
                     }
                 }

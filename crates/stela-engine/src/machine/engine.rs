@@ -20,8 +20,8 @@ pub use reports::{
     DeviceRegister, Discard, Event, ExitWordsWalk, Footprint, FootprintWalk, ITLB_REFILL_BATCHES,
     ITLB_REFILLED, MAIL_WAITS, MailWait, Occupancy, PeState, Requirement, RequirementKind, Reset,
     Statistics, Stop, Surveyed, Suspension, TLBI_KEEP_SAMPLES, TRACE_HITS, TlbiKeepCounts,
-    TraceHit, WATCH_HITS, WHOLE_TLBI_SAMPLE_EVERY, WHOLE_TLBI_SAMPLES, WatchHit, WholeTlbiSites,
-    WholeTlbiTrigger,
+    TraceHit, WATCH_HITS, WHOLE_TLBI_SAMPLE_EVERY, WHOLE_TLBI_SAMPLE_WORDS, WHOLE_TLBI_SAMPLES,
+    WatchHit, WholeTlbiSites, WholeTlbiTrigger,
 };
 mod amx;
 pub use amx::{AmxCell, AmxCounts, AmxForms, FORMS};
@@ -736,6 +736,15 @@ const RECENT: usize = 4;
 /// `Machine::lower_globals` with no such fetch.
 const NO_GLOBALS: (u64, u64) = (u64::MAX, 0);
 
+/// A PE's latest TLBI of everything, for the next context it makes at EL0
+/// ([`WholeTlbiTrigger::next_context`]): its root, and the address its
+/// shared region was read at when it was sampled.
+#[derive(Debug, Clone, Copy)]
+struct NextRoot {
+    root: u64,
+    sampled: Option<u64>,
+}
+
 /// The translation inputs besides TTBR0 and the SPRR permissions that a
 /// PE's contexts name at once ([`Machine::context_frames`]).
 const CONTEXT_FRAMES: usize = 64;
@@ -1037,10 +1046,12 @@ pub struct Machine<H: Host, D: Devices> {
     /// ([`Self::refill_after`]), and the next place.
     fill_log: Vec<(u64, u64)>,
     fill_next: usize,
-    /// TTBR0_EL1 at this PE's last TLBI of everything, and how many it
-    /// issued ([`WholeTlbiTrigger`]).
-    whole_tlbi_ttbr0: u64,
+    /// The root and ASID at this PE's last TLBI of everything, how many it
+    /// issued, and what the next context made at EL0 is compared with
+    /// ([`WholeTlbiTrigger`]).
+    whole_tlbi_root: (u64, u16),
     whole_tlbis: u64,
+    whole_tlbi_next: Option<NextRoot>,
     /// Keeping the lookup contexts across a TLBI of everything, and
     /// verifying them before use (`--tlbi-keep on`, [`tlbi_keep`]).
     tlbi_keep: tlbi_keep::TlbiKeep,
@@ -1573,8 +1584,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             itlb_seen_bits: 0,
             fill_log: Vec::new(),
             fill_next: 0,
-            whole_tlbi_ttbr0: 0,
+            whole_tlbi_root: (0, 0),
             whole_tlbis: 0,
+            whole_tlbi_next: None,
             tlbi_keep: tlbi_keep::TlbiKeep::default(),
             share: share_aliases::Share::default(),
             pending_refills: BTreeMap::new(),

@@ -220,6 +220,22 @@ pub(crate) fn passed_at(counter: u64, at: &'static Location<'static>) -> bool {
     passed
 }
 
+/// Whether this processor's armed budget has passed. Unlike [`passed_at`],
+/// this only observes the budget and leaves the step where it first expired
+/// unchanged.
+#[inline]
+pub fn is_expired() -> bool {
+    if !state::armed() {
+        return false;
+    }
+    let current = state::get();
+    let elapsed = Clock::ticks().wrapping_sub(current.start) as i64;
+    current.ticks != 0
+        && elapsed >= 0
+        && elapsed as u64 >= current.ticks
+        && current.owner == state::processor()
+}
+
 /// A minimum-delay provider whose waits fail once an armed budget has
 /// passed, after waiting in full: a driver's counted polls and fixed
 /// delays, each bounded, can together outlast its start budget, and the
@@ -383,5 +399,25 @@ mod tests {
         }
         assert!(!CLOCK.deadline(5_000_000).passed());
         assert!(outer.expired().is_none());
+    }
+
+    #[test]
+    fn observing_expiry_reports_only_the_owning_processor_without_overwriting_step() {
+        let _virtual = test_clock::virtualize();
+        assert!(!is_expired());
+        act_as(1);
+        let budget = Budget::start(CLOCK, 1_000).unwrap();
+        assert!(!is_expired());
+        assert!(!CLOCK.wait(60_000_000, || false));
+        let first = budget.expired().unwrap().at;
+        assert!(first.is_some());
+        assert!(is_expired());
+        assert_eq!(budget.expired().unwrap().at, first);
+        act_as(2);
+        assert!(!is_expired());
+        act_as(1);
+        drop(budget);
+        assert!(!is_expired());
+        act_as(0);
     }
 }

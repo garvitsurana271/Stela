@@ -158,8 +158,9 @@ pub struct Plan {
     pub ends: Ends,
     pub mode: Mode,
     /// The partition table's blocks in the order to write them
-    /// ([`shared::encode`]'s, without its protective MBR where the disk
-    /// has one); none when the table stays as it is.
+    /// ([`shared::encode_keeping`]'s, the disk's own headers but for their
+    /// checksums, without its protective MBR where the disk has one); none
+    /// when the table stays as it is.
     pub table: Vec<Write>,
     /// The blocks to zero: the partition's first MiB and the machine
     /// state's tail, so the restore and the NOR start blank.
@@ -210,6 +211,12 @@ pub enum PlanError {
     Overlap,
     /// The partition cannot hold a namespace and the machine state.
     TooSmall,
+    /// The disk's GPT header at `lba` is not one a rewrite keeps
+    /// ([`shared::kept_layout`]).
+    Layout {
+        lba: u64,
+        why: shared::Unkept,
+    },
     /// The new table cannot be encoded.
     Table(&'static str),
 }
@@ -227,6 +234,12 @@ impl fmt::Display for PlanError {
             Self::NotReusable => f.write_str("the partition chosen is not a Stambha partition"),
             Self::Overlap => f.write_str("the new partition overlaps one that stays"),
             Self::TooSmall => f.write_str("the partition is too small"),
+            Self::Layout { lba, why } => {
+                write!(
+                    f,
+                    "the disk's partition table at block {lba} is not added to: {why}"
+                )
+            }
             Self::Table(why) => write!(f, "the new partition table is invalid: {why}"),
         }
     }
@@ -310,10 +323,22 @@ pub fn plan(decision: &Decision<'_>, entropy: &mut dyn FnMut() -> Guid) -> Resul
     let table = match place {
         Place::Reuse(_) => Vec::new(),
         Place::Free { .. } => {
-            let mut writes = shared::encode(geometry, &new).map_err(|error| match error {
-                PayloadError::Disk(why) => PlanError::Table(why),
-                _ => PlanError::Table("it cannot be encoded"),
-            })?;
+            // The disk's own headers, as the picker read them, but for
+            // their checksums: the layout another tool chose stays, and
+            // every partition lies in the blocks its headers name.
+            let entries = (geometry.entry_blocks() * block) as usize;
+            let (primary, backup) = (
+                &ends.head[block as usize..2 * block as usize],
+                &ends.tail[entries..],
+            );
+            shared::kept_layout(geometry, primary, backup)
+                .map_err(|(lba, why)| PlanError::Layout { lba, why })?;
+            let mut writes = shared::encode_keeping(geometry, &new, primary, backup).map_err(
+                |error| match error {
+                    PayloadError::Disk(why) => PlanError::Table(why),
+                    _ => PlanError::Table("it cannot be encoded"),
+                },
+            )?;
             // The disk's own protective MBR stays: the one `encode` builds
             // drops its disk signature and other bytes the systems on the
             // disk wrote.
@@ -394,6 +419,9 @@ pub enum Cause {
     /// The disk's two copies of the GPT are not whole, alike and in the
     /// layout a rewrite keeps: why.
     Copies(&'static str),
+    /// A GPT header of the disk names a layout a rewrite does not keep, or
+    /// the two name different ones: the field and its values.
+    Layout(shared::Unkept),
     /// The plan writes what no plan writes: why.
     Refused(&'static str),
     /// The plan changes the entry of a partition that stays, numbered from
@@ -446,6 +474,7 @@ impl fmt::Display for ApplyError {
                  firmware",
             ),
             Cause::Copies(why) | Cause::Refused(why) => write!(f, ": {why}"),
+            Cause::Layout(why) => write!(f, ": {why}"),
             Cause::Entry { entry } => write!(
                 f,
                 ": the plan changes the entry of partition {entry}, which stays as it is"
@@ -532,15 +561,18 @@ fn first_difference(found: &[u8], expected: &[u8], block: u64) -> Option<u64> {
         .map(|index| index as u64)
 }
 
-/// The disk's table as both copies of its GPT hold it, from its [`Ends`]:
-/// each header valid at its own block, naming the other copy, the usable
-/// blocks a rewrite keeps and 128 entries of 128 bytes beside it, each
-/// entry array its header's, and both arrays the same bytes.
+/// The disk's table as both copies of its GPT hold it, from its [`Ends`],
+/// and the blocks its headers give partitions: each header valid at its
+/// own block and one a rewrite keeps ([`shared::keepable`]: naming the
+/// other copy and 128 entries of 128 bytes beside it, and usable blocks
+/// that are none of the GPT's own), both headers naming the same usable
+/// blocks, each entry array its header's, both arrays the same bytes, and
+/// no two of the partitions overlapping.
 #[expect(
     clippy::result_large_err,
     reason = "the driver's error is kept whole for the stop's message, and one plan is checked a boot"
 )]
-fn copies(geometry: Disk, ends: &Ends) -> Result<Table, ApplyError> {
+fn copies(geometry: Disk, ends: &Ends) -> Result<(Table, shared::Usable), ApplyError> {
     let block = geometry.block_bytes as usize;
     let entry_blocks = geometry.entry_blocks();
     let entries = entry_blocks as usize * block;
@@ -560,28 +592,36 @@ fn copies(geometry: Disk, ends: &Ends) -> Result<Table, ApplyError> {
         &ends.tail[..entries],
     );
     let mut tables = Vec::new();
-    for ((lba, header, entries_lba, array), other) in [(primary, last), (backup, 1)] {
-        let info = match shared::parse_header(geometry, lba, header) {
-            Ok(Some(info)) => info,
-            Ok(None) => return Err(refuse(lba, "a GPT header is missing")),
-            Err(_) => return Err(refuse(lba, "a GPT header is damaged")),
-        };
-        let alternate = u64::from_le_bytes(header[32..40].try_into().expect("8 bytes"));
-        if info.entries_lba != entries_lba
-            || info.entry_count != 128
-            || info.entry_bytes != ENTRY_BYTES as u32
-            || info.first_usable != geometry.first_usable()
-            || info.last_usable != geometry.last_usable()
-            || alternate != other
-        {
-            return Err(refuse(
-                lba,
-                "a GPT header names another layout than the one a rewrite keeps",
-            ));
-        }
+    let mut usable = Vec::new();
+    for (lba, header, entries_lba, array) in [primary, backup] {
+        let info = shared::keepable(geometry, lba, header).map_err(|why| match why {
+            shared::Unkept::Missing => refuse(lba, "a GPT header is missing"),
+            shared::Unkept::Field { .. } => error(Step::Check, Some(lba), Cause::Layout(why)),
+            _ => refuse(lba, "a GPT header is damaged"),
+        })?;
         let table = shared::parse_entries(&info, array)
             .map_err(|_| refuse(entries_lba, "a GPT entry array is damaged"))?;
         tables.push(table);
+        usable.push(shared::Usable {
+            first: info.first_usable,
+            last: info.last_usable,
+        });
+    }
+    for (field, primary, backup) in [
+        ("first usable LBA", usable[0].first, usable[1].first),
+        ("last usable LBA", usable[0].last, usable[1].last),
+    ] {
+        if primary != backup {
+            return Err(error(
+                Step::Check,
+                Some(last),
+                Cause::Layout(shared::Unkept::Disagree {
+                    field,
+                    primary,
+                    backup,
+                }),
+            ));
+        }
     }
     if primary.3 != backup.3 || tables[0] != tables[1] {
         return Err(refuse(
@@ -589,7 +629,19 @@ fn copies(geometry: Disk, ends: &Ends) -> Result<Table, ApplyError> {
             "the backup GPT is not the primary's copy",
         ));
     }
-    Ok(tables.swap_remove(0))
+    let table = tables.swap_remove(0);
+    for (index, one) in table.partitions.iter().enumerate() {
+        let overlapped = table.partitions[index + 1..]
+            .iter()
+            .any(|other| one.first_lba <= other.last_lba && other.first_lba <= one.last_lba);
+        if overlapped {
+            return Err(refuse(
+                2 + (table.slot(index) as usize * ENTRY_BYTES / block) as u64,
+                "two of the disk's partitions overlap",
+            ));
+        }
+    }
+    Ok((table, usable[0]))
 }
 
 /// The table the backup copy in `tail` holds, if it is whole.
@@ -841,12 +893,14 @@ impl Plan {
                 self.span(span.lba, span.blocks)
             ));
         }
-        let existing = copies(geometry, &now)?;
+        let (existing, usable) = copies(geometry, &now)?;
         say(&format!(
             "PASS both GPT copies are whole and alike: headers at LBA 1 and {}, 128 entries of \
-             128 bytes at LBA 2 and {}, {} partitions",
+             128 bytes at LBA 2 and {}, usable LBA {}-{}, {} partitions",
             geometry.blocks - 1,
             tail.lba,
+            usable.first,
+            usable.last,
             existing.partitions.len()
         ));
         let partition = self.partition;
@@ -859,7 +913,9 @@ impl Plan {
                 partition.first_lba,
                 "the macOS partition has no blocks",
             ))?;
-        if partition.first_lba < geometry.first_usable() || last_lba > geometry.last_usable() {
+        // The blocks the disk's headers give partitions, which another tool
+        // may have made fewer than the geometry's.
+        if partition.first_lba < usable.first || last_lba > usable.last {
             return Err(refuse(
                 partition.first_lba,
                 "the macOS partition lies outside the blocks the GPT gives partitions",
@@ -1247,7 +1303,8 @@ impl Plan {
             let now = read_ends(geometry, Step::Verify, |lba, buffer| {
                 device.read(lba, buffer)
             })?;
-            let found = copies(geometry, &now).map_err(|found| verify(found.lba, found.cause))?;
+            let (found, _) =
+                copies(geometry, &now).map_err(|found| verify(found.lba, found.cause))?;
             if found != *planned || table != *planned {
                 return Err(verify(Some(1), Cause::Missing));
             }

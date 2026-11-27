@@ -193,6 +193,12 @@ impl Partition {
 }
 
 /// A disk's geometry: logical block size and number of blocks.
+///
+/// The fields are whatever the firmware reported, which may be nothing: a
+/// UFS logical unit with no media reports a block size of 0, or 0 blocks.
+/// [`Disk::new`] accepts only a geometry a GPT fits on, and [`Disk::usable`]
+/// says whether one does; the methods below never panic on any geometry,
+/// and for one that holds a GPT they are exact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Disk {
     pub block_bytes: u64,
@@ -200,22 +206,56 @@ pub struct Disk {
 }
 
 impl Disk {
-    /// The blocks the 16 KiB entry array takes at each end.
+    /// `block_bytes` and `blocks` as a geometry every function here
+    /// accepts: a supported block size, and at least [`Disk::minimum_blocks`].
+    pub fn new(block_bytes: u64, blocks: u64) -> Result<Self, PayloadError> {
+        let disk = Self {
+            block_bytes,
+            blocks,
+        };
+        disk.validate()?;
+        Ok(disk)
+    }
+
+    /// The blocks the 16 KiB entry array takes at each end. A block size of
+    /// 0, which no GPT has, counts as 1 byte rather than dividing by zero.
     pub fn entry_blocks(&self) -> u64 {
-        ENTRY_ARRAY_BYTES.div_ceil(self.block_bytes)
+        ENTRY_ARRAY_BYTES.div_ceil(self.block_bytes.max(1))
     }
 
     pub fn first_usable(&self) -> u64 {
         2 + self.entry_blocks()
     }
 
+    /// Inclusive; 0 on a disk too small for a GPT rather than underflowing.
     pub fn last_usable(&self) -> u64 {
-        self.blocks - 2 - self.entry_blocks()
+        self.blocks
+            .saturating_sub(2)
+            .saturating_sub(self.entry_blocks())
+    }
+
+    /// The fewest blocks a GPT fits on, as the reader has always required:
+    /// the protective MBR, a header and an entry array at each end, and two
+    /// usable blocks.
+    pub fn minimum_blocks(&self) -> u64 {
+        2 * (2 + self.entry_blocks()) + 1
+    }
+
+    /// Whether the disk reports a size at all: a block size and blocks.
+    pub fn reports_size(&self) -> bool {
+        self.block_bytes != 0 && self.blocks != 0
+    }
+
+    /// The blocks a partition may use, `first_usable` to `last_usable + 1`;
+    /// `None` when the disk reports no size or is too small for a GPT.
+    pub fn usable(&self) -> Option<(u64, u64)> {
+        (self.reports_size() && self.blocks >= self.minimum_blocks())
+            .then(|| (self.first_usable(), self.last_usable() + 1))
     }
 
     fn validate(&self) -> Result<(), PayloadError> {
         if !matches!(self.block_bytes, 512 | 1024 | 2048 | 4096)
-            || self.blocks < 2 * (2 + self.entry_blocks()) + 1
+            || self.blocks < self.minimum_blocks()
         {
             return Err(PayloadError::Disk("unsupported block size or tiny disk"));
         }
@@ -300,6 +340,10 @@ pub struct HeaderInfo {
     pub entries_lba: u64,
     pub entry_count: u32,
     pub entry_bytes: u32,
+    /// The bytes the header's checksum covers.
+    pub header_bytes: u32,
+    /// The block of the other copy's header.
+    pub alternate_lba: u64,
     entries_crc: u32,
 }
 
@@ -337,6 +381,8 @@ pub fn parse_header(
         entries_lba: le64(block, 72),
         entry_count: le32(block, 80),
         entry_bytes: le32(block, 84),
+        header_bytes: size,
+        alternate_lba: le64(block, 32),
         entries_crc: le32(block, 88),
     };
     if le64(block, 24) != lba
@@ -397,6 +443,174 @@ pub fn parse_entries(info: &HeaderInfo, bytes: &[u8]) -> Result<Table, PayloadEr
         disk_guid: info.disk_guid,
         partitions,
         slots,
+    })
+}
+
+/// The blocks a GPT gives partitions, from `first` to `last` inclusive, as
+/// its headers name them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Usable {
+    pub first: u64,
+    pub last: u64,
+}
+
+/// What a header field must hold for [`encode_keeping`] to keep the header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kept {
+    Exactly(u64),
+    AtLeast(u64),
+    AtMost(u64),
+}
+
+impl fmt::Display for Kept {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exactly(value) => write!(f, "{value}"),
+            Self::AtLeast(value) => write!(f, "{value} or more"),
+            Self::AtMost(value) => write!(f, "{value} or less"),
+        }
+    }
+}
+
+/// Why a disk's GPT headers are not ones [`encode_keeping`] keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unkept {
+    /// The block holds no GPT header.
+    Missing,
+    /// The header does not parse: why.
+    Damaged(&'static str),
+    /// A field of the header holds `found`, where a rewrite keeps `kept`.
+    Field {
+        field: &'static str,
+        found: u64,
+        kept: Kept,
+    },
+    /// The two headers name different usable blocks.
+    Disagree {
+        field: &'static str,
+        primary: u64,
+        backup: u64,
+    },
+    /// The two headers name different disk GUIDs.
+    OtherDisk,
+}
+
+impl fmt::Display for Unkept {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => f.write_str("a GPT header is missing"),
+            Self::Damaged(why) => write!(f, "a GPT header is damaged: {why}"),
+            Self::Field { field, found, kept } => write!(
+                f,
+                "a GPT header names another layout than the one a rewrite keeps: its {field} is \
+                 {found}, where a rewrite keeps {kept}"
+            ),
+            Self::Disagree {
+                field,
+                primary,
+                backup,
+            } => write!(
+                f,
+                "the GPT's two headers name different layouts: the primary's {field} is \
+                 {primary}, the backup's {backup}"
+            ),
+            Self::OtherDisk => f.write_str("the GPT's two headers name different disk GUIDs"),
+        }
+    }
+}
+
+/// The header in `block`, read from `lba`, the primary (1) or the backup
+/// (the last), when [`encode_keeping`] keeps it: its every field but the
+/// usable blocks [`encode`]'s, so its revision is 1.0, the entry array is 128 entries of 128
+/// bytes just after the primary header and just before the backup, and
+/// the other copy's header at the other end of the disk; and the usable
+/// blocks within [`encode`]'s, so none of them is a GPT's own. Windows,
+/// gdisk, parted and macOS start the usable blocks at [`encode`]'s, and
+/// Linux's fdisk (libfdisk) at 1 MiB.
+pub fn keepable(disk: Disk, lba: u64, block: &[u8]) -> Result<HeaderInfo, Unkept> {
+    let last = disk
+        .blocks
+        .checked_sub(1)
+        .ok_or(Unkept::Damaged("no blocks"))?;
+    if block.len() as u64 != disk.block_bytes {
+        return Err(Unkept::Damaged("not one block"));
+    }
+    let info = match parse_header(disk, lba, block) {
+        Ok(Some(info)) => info,
+        Ok(None) => return Err(Unkept::Missing),
+        Err(PayloadError::Disk(why)) => return Err(Unkept::Damaged(why)),
+        Err(_) => return Err(Unkept::Damaged("unreadable")),
+    };
+    let (entries_lba, other) = match lba {
+        1 => (2, last),
+        lba if lba == last => (last - disk.entry_blocks(), 1),
+        _ => return Err(Unkept::Damaged("a GPT header is at block 1 or the last")),
+    };
+    let exactly = |field, found: u64, kept: u64| {
+        (found != kept).then_some(Unkept::Field {
+            field,
+            found,
+            kept: Kept::Exactly(kept),
+        })
+    };
+    let unkept = exactly("revision", le32(block, 8).into(), REVISION.into())
+        .or_else(|| exactly("header size", info.header_bytes.into(), HEADER_BYTES.into()))
+        .or_else(|| exactly("entry array LBA", info.entries_lba, entries_lba))
+        .or_else(|| exactly("entry count", info.entry_count.into(), ENTRY_COUNT.into()))
+        .or_else(|| exactly("entry size", info.entry_bytes.into(), ENTRY_BYTES.into()))
+        .or_else(|| exactly("other copy's LBA", info.alternate_lba, other))
+        .or_else(|| {
+            (info.first_usable < disk.first_usable()).then_some(Unkept::Field {
+                field: "first usable LBA",
+                found: info.first_usable,
+                kept: Kept::AtLeast(disk.first_usable()),
+            })
+        })
+        .or_else(|| {
+            (info.last_usable > disk.last_usable()).then_some(Unkept::Field {
+                field: "last usable LBA",
+                found: info.last_usable,
+                kept: Kept::AtMost(disk.last_usable()),
+            })
+        });
+    match unkept {
+        Some(unkept) => Err(unkept),
+        None => Ok(info),
+    }
+}
+
+/// The usable blocks both of a disk's headers name, `primary` read from
+/// LBA 1 and `backup` from the last, when [`encode_keeping`] keeps them:
+/// each [`keepable`], and the two alike in usable blocks and disk GUID.
+/// The error names the block of the header that is not.
+pub fn kept_layout(disk: Disk, primary: &[u8], backup: &[u8]) -> Result<Usable, (u64, Unkept)> {
+    let last = disk
+        .blocks
+        .checked_sub(1)
+        .ok_or((0, Unkept::Damaged("no blocks")))?;
+    let first = keepable(disk, 1, primary).map_err(|why| (1, why))?;
+    let second = keepable(disk, last, backup).map_err(|why| (last, why))?;
+    for (field, primary, backup) in [
+        ("first usable LBA", first.first_usable, second.first_usable),
+        ("last usable LBA", first.last_usable, second.last_usable),
+    ] {
+        if primary != backup {
+            return Err((
+                last,
+                Unkept::Disagree {
+                    field,
+                    primary,
+                    backup,
+                },
+            ));
+        }
+    }
+    if first.disk_guid != second.disk_guid {
+        return Err((last, Unkept::OtherDisk));
+    }
+    Ok(Usable {
+        first: first.first_usable,
+        last: first.last_usable,
     })
 }
 
@@ -565,10 +779,82 @@ pub struct Write {
 /// never leaves a valid primary header that names unwritten entries.
 pub fn encode(disk: Disk, table: &Table) -> Result<Vec<Write>, PayloadError> {
     disk.validate()?;
+    let usable = Usable {
+        first: disk.first_usable(),
+        last: disk.last_usable(),
+    };
+    let (entries, entries_crc) = entry_array(table, usable)?;
+    let block = disk.block_bytes as usize;
+    let last = disk.blocks - 1;
+    let header = |current: u64, backup: u64, entries_lba: u64| {
+        let mut h = vec![0u8; block];
+        h[0..8].copy_from_slice(SIGNATURE);
+        h[8..12].copy_from_slice(&REVISION.to_le_bytes());
+        h[12..16].copy_from_slice(&HEADER_BYTES.to_le_bytes());
+        h[24..32].copy_from_slice(&current.to_le_bytes());
+        h[32..40].copy_from_slice(&backup.to_le_bytes());
+        h[40..48].copy_from_slice(&usable.first.to_le_bytes());
+        h[48..56].copy_from_slice(&usable.last.to_le_bytes());
+        h[56..72].copy_from_slice(&table.disk_guid.0);
+        h[72..80].copy_from_slice(&entries_lba.to_le_bytes());
+        h[80..84].copy_from_slice(&ENTRY_COUNT.to_le_bytes());
+        h[84..88].copy_from_slice(&ENTRY_BYTES.to_le_bytes());
+        h[88..92].copy_from_slice(&entries_crc.to_le_bytes());
+        let crc = crc32(&h[..HEADER_BYTES as usize]);
+        h[16..20].copy_from_slice(&crc.to_le_bytes());
+        h
+    };
+    let entry_blocks = disk.entry_blocks();
+    Ok(writes(
+        disk,
+        entries,
+        header(last, 1, last - entry_blocks),
+        header(1, last, 2),
+    ))
+}
+
+/// [`encode`]'s writes for `table` on a disk whose GPT another tool may
+/// have laid out, keeping it: each header written is the disk's own,
+/// `primary` read from LBA 1 and `backup` from the last, with only its
+/// entries' checksum and its own made anew. The headers must be ones a
+/// rewrite keeps ([`kept_layout`]), and every partition of `table` must
+/// lie in the usable blocks they name, which may be fewer than
+/// [`encode`]'s: a GPT Linux's fdisk made gives partitions the blocks
+/// from 1 MiB. On a disk [`encode`] laid out, the writes are [`encode`]'s
+/// byte for byte.
+pub fn encode_keeping(
+    disk: Disk,
+    table: &Table,
+    primary: &[u8],
+    backup: &[u8],
+) -> Result<Vec<Write>, PayloadError> {
+    disk.validate()?;
+    let usable = kept_layout(disk, primary, backup)
+        .map_err(|_| PayloadError::Disk("the disk's GPT headers are not ones a rewrite keeps"))?;
+    let disk_guid = guid_at(primary, 56);
+    if table.disk_guid != disk_guid {
+        return Err(PayloadError::Disk(
+            "the table's disk GUID is not the one its headers name",
+        ));
+    }
+    let (entries, entries_crc) = entry_array(table, usable)?;
+    let keep = |was: &[u8]| {
+        let mut h = was.to_vec();
+        h[88..92].copy_from_slice(&entries_crc.to_le_bytes());
+        h[16..20].fill(0);
+        let crc = crc32(&h[..HEADER_BYTES as usize]);
+        h[16..20].copy_from_slice(&crc.to_le_bytes());
+        h
+    };
+    Ok(writes(disk, entries, keep(backup), keep(primary)))
+}
+
+/// The entry array holding `table`, each partition in its entry and in
+/// `usable`, and its checksum.
+fn entry_array(table: &Table, usable: Usable) -> Result<(Vec<u8>, u32), PayloadError> {
     if table.partitions.len() > ENTRY_COUNT as usize {
         return Err(PayloadError::Disk("too many partitions"));
     }
-    let block = disk.block_bytes as usize;
     let mut entries = vec![0u8; ENTRY_ARRAY_BYTES as usize];
     let mut taken = [false; ENTRY_COUNT as usize];
     for (index, partition) in table.partitions.iter().enumerate() {
@@ -582,8 +868,8 @@ pub fn encode(disk: Disk, table: &Table) -> Result<Vec<Write>, PayloadError> {
             return Err(PayloadError::Disk("two partitions in one entry"));
         }
         let slot = &mut entries[number * ENTRY_BYTES as usize..][..ENTRY_BYTES as usize];
-        if partition.first_lba < disk.first_usable()
-            || partition.last_lba > disk.last_usable()
+        if partition.first_lba < usable.first
+            || partition.last_lba > usable.last
             || partition.first_lba > partition.last_lba
         {
             return Err(PayloadError::Disk("partition outside the usable range"));
@@ -605,26 +891,15 @@ pub fn encode(disk: Disk, table: &Table) -> Result<Vec<Write>, PayloadError> {
         }
     }
     let entries_crc = crc32(&entries);
+    Ok((entries, entries_crc))
+}
+
+/// The writes of a GPT of `entries` with these headers: the backup entries
+/// and header, the primary entries and header, then a protective MBR.
+fn writes(disk: Disk, entries: Vec<u8>, backup: Vec<u8>, primary: Vec<u8>) -> Vec<Write> {
+    let block = disk.block_bytes as usize;
     let entry_blocks = disk.entry_blocks();
     let last = disk.blocks - 1;
-    let header = |current: u64, backup: u64, entries_lba: u64| {
-        let mut h = vec![0u8; block];
-        h[0..8].copy_from_slice(SIGNATURE);
-        h[8..12].copy_from_slice(&REVISION.to_le_bytes());
-        h[12..16].copy_from_slice(&HEADER_BYTES.to_le_bytes());
-        h[24..32].copy_from_slice(&current.to_le_bytes());
-        h[32..40].copy_from_slice(&backup.to_le_bytes());
-        h[40..48].copy_from_slice(&disk.first_usable().to_le_bytes());
-        h[48..56].copy_from_slice(&disk.last_usable().to_le_bytes());
-        h[56..72].copy_from_slice(&table.disk_guid.0);
-        h[72..80].copy_from_slice(&entries_lba.to_le_bytes());
-        h[80..84].copy_from_slice(&ENTRY_COUNT.to_le_bytes());
-        h[84..88].copy_from_slice(&ENTRY_BYTES.to_le_bytes());
-        h[88..92].copy_from_slice(&entries_crc.to_le_bytes());
-        let crc = crc32(&h[..HEADER_BYTES as usize]);
-        h[16..20].copy_from_slice(&crc.to_le_bytes());
-        h
-    };
     let mut padded = entries;
     padded.resize((entry_blocks * disk.block_bytes) as usize, 0);
     let mut mbr = vec![0u8; block];
@@ -637,14 +912,14 @@ pub fn encode(disk: Disk, table: &Table) -> Result<Vec<Write>, PayloadError> {
     mbr[446 + 12..446 + 16].copy_from_slice(&protective_blocks.to_le_bytes());
     mbr[510] = 0x55;
     mbr[511] = 0xaa;
-    Ok(vec![
+    vec![
         Write {
             lba: last - entry_blocks,
             bytes: padded.clone(),
         },
         Write {
             lba: last,
-            bytes: header(last, 1, last - entry_blocks),
+            bytes: backup,
         },
         Write {
             lba: 2,
@@ -652,10 +927,10 @@ pub fn encode(disk: Disk, table: &Table) -> Result<Vec<Write>, PayloadError> {
         },
         Write {
             lba: 1,
-            bytes: header(1, last, 2),
+            bytes: primary,
         },
         Write { lba: 0, bytes: mbr },
-    ])
+    ]
 }
 
 /// Blocks at each end of a disk that a GPT occupies at 512-byte blocks (the

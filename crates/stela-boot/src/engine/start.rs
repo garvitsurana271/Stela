@@ -825,8 +825,9 @@ fn start_processors(boot: Boot<'_>, host: &mut OpenedHost) -> Processors {
         ..
     } = *host;
     crate::status::begin("Starting the other host processors");
-    // The boot processor's counter is free for `--profile` from here on.
-    super::step_watchdog::retire();
+    // The boot processor no longer runs alone; its counter keeps watching
+    // its own work until the machine starts (`step_watchdog::retire`).
+    super::step_watchdog::others_started();
     // SAFETY: the physical inventory and loader-owned reservations
     // were validated before any SIPI; the BSP Host is installed, guest entry
     // is excluded, and APs remain parked until canonical worker publication.
@@ -1456,6 +1457,12 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
         _published,
         io,
     } = parts;
+    // The boot processor's counter is free for `--profile` from here on,
+    // and the other processors watch its steps once they run the guest.
+    // Until here it watched what the boot processor did alone before the
+    // guest: the install image's reads (`prepare_restore`), where nothing
+    // looked at a wait that never returned.
+    super::step_watchdog::retire();
     let capture = native_processors.expect("validated native roster");
     let hub = stela_engine::machine::engine::Hub::new(
         profile.processors.len().max(1),
@@ -2499,6 +2506,18 @@ fn prepare_restore(
     let Boot {
         handoff, options, ..
     } = boot;
+    // A remote image's first reads stream from Apple's servers: they run
+    // under their own step, which the screen names and whose lines the
+    // logs keep, inside a step watchdog segment that its waits keep alive
+    // (`remote::Http::wait`).
+    let remote = source.remote_reader();
+    let opening = remote.as_ref().map(|_| {
+        static OPENING: &str = "opening the macOS install image from Apple's servers";
+        crate::status::begin("Opening the macOS install image from Apple");
+        super::step_watchdog::stage(&OPENING);
+        super::step_watchdog::enter();
+        output::now()
+    });
     let boot_ecid = tree
         .and_then(stela_contracts::adt::Node::root)
         .and_then(|root| root.child("chosen"))
@@ -2555,7 +2574,7 @@ fn prepare_restore(
         (None, _, false) => restore::Mode::Study,
         _ => unreachable!("validated restore-mode combination"),
     };
-    restore::Experiment::new(
+    let experiment = restore::Experiment::new(
         source,
         usb,
         handoff,
@@ -2572,7 +2591,35 @@ fn prepare_restore(
             signing_network: matches!(host_network, Some(Ok(_))),
         },
     )
-    .unwrap_or_else(|error| output::fatal(format_args!("restore preparation failed: {error}")))
+    .unwrap_or_else(|error| {
+        // Reads that gave up before the guest stop with their plain reason,
+        // the technical one in the log before it.
+        let gave_up = remote
+            .as_ref()
+            .and_then(|remote| remote.borrow().gave_up().cloned());
+        if let Some(gave_up) = gave_up {
+            output::arguments(format_args!(
+                "REMOTE IMAGE gave up before the guest: {error}\n"
+            ));
+            output::fatal(gave_up)
+        }
+        output::fatal(format_args!("restore preparation failed: {error}"))
+    });
+    if let (Some(remote), Some(opened)) = (remote, opening) {
+        super::step_watchdog::leave();
+        super::step_watchdog::clear_stage();
+        let received = remote.borrow().received();
+        output::arguments(format_args!(
+            "REMOTE IMAGE opened before the guest: received={received} ms={}\n",
+            output::millis_since(opened)
+        ));
+        crate::status::done(&format!(
+            "{} MB read, {} s",
+            received.div_ceil(1 << 20),
+            output::millis_since(opened).div_ceil(1000)
+        ));
+    }
+    experiment
 }
 
 /// The boot processor's installed host, with what the later phases need.
@@ -3716,7 +3763,9 @@ fn start_devices(
             // The guest's adapter is its own, one the mount's client left.
             // Without one the Mac boots with no network, which is reported
             // at once and then once a minute with what the host's adapters
-            // were. Adapters left over are stopped with `links`.
+            // were. The guest keeps the wired adapters left that can take
+            // its station address as spares; the rest are stopped with
+            // `links`.
             let mut adapters: Vec<String> = network_account
                 .iter()
                 .map(|line| network::adapter_account(line, "not started"))

@@ -8,6 +8,8 @@
 //! confirmed. Only a store that cannot be read on a partition that is
 //! otherwise the chosen one, with a Mac system on it, still stops the boot.
 
+use stela_formats::payload::gpt;
+
 /// What a search for the chosen partition found: every whole disk
 /// reporting the serial, then its GPT partitions with the GUID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,8 +147,30 @@ pub struct Candidate<'a> {
     /// again once the firmware has exited.
     pub serial: Option<&'a str>,
     pub bytes: u64,
+    /// Why its geometry holds no partition table ([`size_refusal`]).
+    pub size: Option<&'static str>,
     /// Why Stela's own drivers cannot reach its controller.
     pub controller: Option<&'static str>,
+}
+
+/// The picker's refusal of a disk that reports a block size of 0 or no
+/// blocks, as a UFS logical unit without media does.
+pub const NO_SIZE: &str = "Reports no size";
+/// The picker's refusal of a disk with fewer blocks than both copies of a
+/// GPT take.
+pub const NO_ROOM_FOR_TABLE: &str = "Too small for a partition table";
+
+/// Why a disk of `geometry`, as its firmware reports it, cannot hold a GPT;
+/// `None` when it can. The picker shows such a disk refused, and nothing
+/// reads or lays out a GPT on it.
+pub fn size_refusal(geometry: gpt::Disk) -> Option<&'static str> {
+    if !geometry.reports_size() {
+        Some(NO_SIZE)
+    } else if geometry.usable().is_none() {
+        Some(NO_ROOM_FOR_TABLE)
+    } else {
+        None
+    }
 }
 
 /// The picker's refusal of a disk whose serial another listed disk also
@@ -156,14 +180,19 @@ pub struct Candidate<'a> {
 pub const SAME_SERIAL: &str = "Same serial as another disk";
 
 /// Why the picker refuses disk `index` of `disks`, which it shows by the
-/// disk; `None` when it can be chosen. A disk Stela's drivers cannot reach
-/// or cannot find again by its serial is refused before its size is.
+/// disk; `None` when it can be chosen. A disk that reports no size, or too
+/// small a one for a GPT, is refused first, as nothing else about it can be
+/// used; then one Stela's drivers cannot reach or cannot find again by its
+/// serial, before its size is.
 pub fn picker_refusal(
     disks: &[Candidate<'_>],
     index: usize,
     min_bytes: u64,
 ) -> Option<&'static str> {
     let disk = disks.get(index)?;
+    if disk.size.is_some() {
+        return disk.size;
+    }
     if disk.controller.is_some() {
         return disk.controller;
     }
@@ -233,6 +262,7 @@ mod tests {
         let disks = [Candidate {
             serial: Some("WD-1"),
             bytes: 1_000_000_000_000,
+            size: None,
             controller: None,
         }];
         assert_eq!(picker_refusal(&disks, 0, 60_000_000_000), None);
@@ -294,6 +324,7 @@ mod tests {
         let disk = |serial: Option<&'static str>, bytes: u64| Candidate {
             serial,
             bytes,
+            size: None,
             controller: None,
         };
         // Two disks behind one USB-SATA bridge, or a cloned NVMe disk,
@@ -335,6 +366,93 @@ mod tests {
         // No serial is shared by two disks that report none.
         let unknown = [disk(None, 1), disk(None, 1)];
         assert_eq!(picker_refusal(&unknown, 0, MIN), Some("No serial number"));
+    }
+
+    #[test]
+    fn a_disk_without_a_size_or_room_for_a_gpt_is_refused_by_its_size() {
+        let geometry = |block_bytes, blocks| gpt::Disk {
+            block_bytes,
+            blocks,
+        };
+        for none in [geometry(0, 0), geometry(0, 1 << 20), geometry(512, 0)] {
+            assert_eq!(size_refusal(none), Some(NO_SIZE), "{none:?}");
+        }
+        for tiny in [geometry(512, 1), geometry(512, 68), geometry(4096, 12)] {
+            assert_eq!(size_refusal(tiny), Some(NO_ROOM_FOR_TABLE), "{tiny:?}");
+        }
+        for fits in [
+            geometry(512, 69),
+            geometry(4096, 13),
+            geometry(512, 1_953_458_176),
+            geometry(4096, 31_246_336),
+        ] {
+            assert_eq!(size_refusal(fits), None, "{fits:?}");
+        }
+    }
+
+    #[test]
+    fn the_picker_refuses_a_disk_that_reports_no_size_by_that() {
+        const MIN: u64 = 60_000_000_000;
+        // The two UFS logical units a Lenovo 500w Gen 5 listed: 128 GB
+        // with a GPT, and one of 0 bytes. Both sit behind a controller
+        // Stela has no driver for and report no serial; the empty one is
+        // refused for having no size, so nothing lays out a GPT on it.
+        let ufs = |bytes, geometry| Candidate {
+            serial: None,
+            bytes,
+            size: size_refusal(geometry),
+            controller: Some("Stambha has no driver for its controller"),
+        };
+        let disks = [
+            ufs(
+                127_984_992_256,
+                gpt::Disk {
+                    block_bytes: 4096,
+                    blocks: 127_984_992_256 / 4096,
+                },
+            ),
+            ufs(
+                0,
+                gpt::Disk {
+                    block_bytes: 0,
+                    blocks: 0,
+                },
+            ),
+        ];
+        let refusals: Vec<_> = (0..disks.len())
+            .map(|index| picker_refusal(&disks, index, MIN))
+            .collect();
+        assert_eq!(
+            refusals,
+            [
+                Some("Stambha has no driver for its controller"),
+                Some(NO_SIZE)
+            ]
+        );
+        // Its size is refused before anything else it lacks.
+        let alone = [Candidate {
+            serial: Some("S1"),
+            bytes: 0,
+            size: Some(NO_SIZE),
+            controller: None,
+        }];
+        assert_eq!(picker_refusal(&alone, 0, MIN), Some(NO_SIZE));
+        let tiny = [Candidate {
+            size: size_refusal(gpt::Disk {
+                block_bytes: 512,
+                blocks: 8,
+            }),
+            bytes: 4096,
+            ..alone[0]
+        }];
+        assert_eq!(picker_refusal(&tiny, 0, MIN), Some(NO_ROOM_FOR_TABLE));
+        // A disk that holds a GPT is judged as before.
+        let sized = [Candidate {
+            size: None,
+            bytes: 500_000_000_000,
+            ..alone[0]
+        }];
+        assert_eq!(picker_refusal(&sized, 0, MIN), None);
     }
 
     #[test]

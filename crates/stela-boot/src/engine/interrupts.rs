@@ -435,7 +435,9 @@ extern "sysv64" fn page_fault_gate(error: u64, rip: u64, rflags: u64) -> bool {
 
 /// Whether the NMI at `rip`, the interrupted stack at `rsp`, was owed by a
 /// `--profile` counter overflow ([`host::sampling::overflow`]), now
-/// sampled, or by a retirement's NMI, now answered
+/// sampled, by the step watchdog's counter overflowing before its limit
+/// passed (`step_watchdog::check_in`), now counting again, or by a
+/// retirement's NMI, now answered
 /// (`native_mmio::shootdown::gate`): the gate then returns. The step
 /// watchdog's keeps its stop. On a processor already in a terminal handler,
 /// which no retirement sends one to, an NMI (a platform's, or the step
@@ -443,7 +445,7 @@ extern "sysv64" fn page_fault_gate(error: u64, rip: u64, rflags: u64) -> bool {
 /// handler's stop goes on and keeps its reason, where the NMI's terminal
 /// stub would find the terminal entry slot in use and halt.
 extern "sysv64" fn nmi_answer(rip: u64, rsp: u64) -> bool {
-    let fired = host::sampling::overflow(rip, rsp);
+    let fired = host::sampling::overflow(rip, rsp) + super::step_watchdog::check_in();
     if crate::native_mmio::shootdown::terminal_here() {
         return true;
     }

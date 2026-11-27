@@ -12,6 +12,9 @@ s64 stela_linux_service_run(const struct stela_linux_timer_delivery *delivery);
 /* Bring jiffies up to the clock, as a resuming task does. */
 void stela_linux_jiffies_refresh(void);
 
+/* Bring jiffies forward to now, a sample of the owner's clock. */
+void stela_linux_jiffies_at(s64 now);
+
 /* Notify the mounted service after original source posts a softirq. */
 void stela_linux_service_softirq_raised(void);
 

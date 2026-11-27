@@ -392,7 +392,8 @@ pub struct UsbCables {
     /// Host disks, each a USB mass storage device (at most five with a
     /// network adapter, six without).
     pub disks: Vec<Box<dyn BlockDevice>>,
-    /// A USB Ethernet adapter with this station address.
+    /// A USB Ethernet adapter with this station address, when it is a
+    /// usable unicast one ([`Mac::is_valid`]); none otherwise.
     pub network: Option<Mac>,
     /// A USB Bluetooth controller.
     pub bluetooth: Option<UsbBluetooth>,

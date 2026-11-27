@@ -223,3 +223,39 @@ fn the_diagnostic_line_gives_the_phy_words_and_the_setup_that_ran() {
     assert!(line.starts_with("phy unread ("), "{line}");
     assert!(line.ends_with("setup=version 18 firmware none"), "{line}");
 }
+
+/// A running chip takes another station address as Linux's
+/// rtl_set_mac_address writes it: unlocked, high word before low, the
+/// EXGMAC copies on version 34, and locked again even when a write fails.
+#[test]
+fn a_running_chip_adopts_another_station_address_and_relocks() {
+    for (version, fault) in [(18, false), (34, false), (34, true)] {
+        let time = Time::default();
+        let mut model = Model::ready(&time);
+        if fault {
+            model.fault = Some(ERI_ADDRESS);
+        }
+        let hw = Hardware::new(&model, &time, revision(version), 0);
+        let mac = Mac([2, 3, 4, 5, 6, 7]);
+        let result = adopt_station(&hw, mac);
+        let s = model.state.borrow();
+        assert_eq!(s.bytes[CONFIG_LOCK], CONFIG_LOCKED, "version {version}");
+        let unlocked = s
+            .writes
+            .iter()
+            .position(|(r, value, _)| *r == CONFIG_LOCK && *value == u32::from(CONFIG_UNLOCKED))
+            .expect("unlocked");
+        let at = |reg| s.writes.iter().position(|(r, _, _)| *r == reg).unwrap();
+        assert!(unlocked < at(MAC4) && at(MAC4) < at(MAC0));
+        if fault {
+            assert_eq!(result, Err(BlockError::Timeout));
+            continue;
+        }
+        assert_eq!(result, Ok(()));
+        drop(s);
+        assert_eq!(station(model.read32(MAC0), model.read32(MAC4)), Some(mac));
+        if version == 34 {
+            assert_eq!(model.state.borrow().eri[&0xe0], 0x0504_0302);
+        }
+    }
+}

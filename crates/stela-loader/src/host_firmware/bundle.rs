@@ -775,6 +775,10 @@ pub enum Held {
     Lacks,
     /// Read, and handed to the engine.
     Read,
+    /// The bundle's manifest names it and its volume has no such file: the
+    /// USB lacks it as much as one the manifest leaves out, and `stela
+    /// repair` writes it again.
+    Missing,
     /// Reading it failed.
     Failed,
     /// Selected for a GPU that may answer late, and left out for want of
@@ -785,8 +789,9 @@ pub enum Held {
 }
 
 impl Held {
-    const STATES: [(Self, u8); 4] = [
+    const STATES: [(Self, u8); 5] = [
         (Self::Read, b'r'),
+        (Self::Missing, b'm'),
         (Self::Failed, b'f'),
         (Self::NoRoom, b'b'),
         (Self::Unread, b'n'),
@@ -852,7 +857,7 @@ impl Absent {
         let mut absent = Self::AnsweredLate;
         for state in states {
             match state {
-                Held::NoBundle | Held::Lacks => return Self::NotOnUsb,
+                Held::NoBundle | Held::Lacks | Held::Missing => return Self::NotOnUsb,
                 Held::Failed | Held::Read => absent = Self::ReadFailed,
                 Held::NoRoom | Held::Unread => {}
             }

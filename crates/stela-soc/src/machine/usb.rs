@@ -175,6 +175,12 @@ impl AppleDevices {
             system_control,
             trackpad,
         } = cables;
+        // An address that is not a usable unicast one, as a Wi-Fi chip
+        // whose firmware has not named its own yet has, places no USB
+        // Ethernet adapter: macOS starts without the network, where 0.6.1
+        // stopped the boot ("the USB Ethernet address must be a unicast
+        // address").
+        let network = network.filter(Mac::is_valid);
         #[cfg(not(any(feature = "trackpad", test)))]
         if trackpad.is_some() {
             return Err(refuse!(

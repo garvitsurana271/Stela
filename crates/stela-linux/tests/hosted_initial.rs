@@ -637,6 +637,7 @@ mod original_fixtures {
 
     unsafe extern "C" {
         fn stela_linux_timer_test_sleeper();
+        fn stela_linux_timer_test_spinner();
         fn stela_linux_srcu_source_cases();
         fn stela_linux_srcu_worker_pressure_test();
         fn stela_linux_srcu_bootstrap_pressure_test();
@@ -721,6 +722,21 @@ mod original_fixtures {
             14,
             mount_timers,
             drive,
+        );
+    }
+
+    /// A task that spins on a jiffies bound without blocking returns within
+    /// the step it spins in. Before jiffies moved with clock reads and
+    /// `udelay()`, that step never returned and the alarm ended the child.
+    #[test]
+    fn a_task_spinning_on_a_jiffies_bound_returns_within_its_step() {
+        in_fresh_process(
+            "original_fixtures::a_task_spinning_on_a_jiffies_bound_returns_within_its_step",
+            "a jiffies-bound spin returned within its step",
+            16 * 1024,
+            14,
+            mount_spinner,
+            drive_spinner,
         );
     }
 
@@ -885,6 +901,13 @@ mod original_fixtures {
         0
     }
 
+    unsafe extern "C" fn spinner_job(_: *mut c_void) -> i32 {
+        // SAFETY: the original kthread enters this exact owner before the body.
+        unsafe { stela_linux_timer_test_spinner() };
+        BODY_RETURNED.store(true, Ordering::Relaxed);
+        0
+    }
+
     unsafe extern "C" fn workqueue_job(_: *mut c_void) -> i32 {
         // SAFETY: the original kthread has entered the exact retained owner.
         unsafe { stela_linux_workqueue_test_main() };
@@ -967,6 +990,11 @@ mod original_fixtures {
     unsafe extern "C" fn mount_timers(owner: *const RawOwner, context: *mut c_void) -> ! {
         // SAFETY: exact retained Initial scope and live fixture callback.
         unsafe { mount(owner, context, timer_job, c"timer-fixture", None) }
+    }
+
+    unsafe extern "C" fn mount_spinner(owner: *const RawOwner, context: *mut c_void) -> ! {
+        // SAFETY: exact retained Initial scope and live fixture callback.
+        unsafe { mount(owner, context, spinner_job, c"spin-fixture", None) }
     }
 
     unsafe extern "C" fn mount_workqueues(owner: *const RawOwner, context: *mut c_void) -> ! {
@@ -1115,6 +1143,12 @@ mod original_fixtures {
     fn drive_registry(runtime: Pin<&TestRuntime>, _: &HostedClock, _: &TestQueue) {
         await_fixture(runtime);
         println!("original registry retirement completed");
+        process::exit(0);
+    }
+
+    fn drive_spinner(runtime: Pin<&TestRuntime>, _: &HostedClock, _: &TestQueue) {
+        await_fixture(runtime);
+        println!("a jiffies-bound spin returned within its step");
         process::exit(0);
     }
 

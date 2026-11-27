@@ -44,6 +44,77 @@ pub fn guest_adapter(carriers: &[bool], wireless: &[bool], wifi_configured: bool
         .unwrap_or(0)
 }
 
+/// How long macOS's host adapter has had no carrier before another started
+/// adapter with one takes its place ([`guest_switch`]): a cable moved from
+/// one port to another, or a USB adapter whose PHY was still negotiating
+/// when the guest network chose, is followed within seconds, where 0.6.0
+/// kept the adapter it chose at the start for the whole boot.
+pub const SWITCH_AFTER_MS: u64 = 2_000;
+
+/// How long a spare adapter's carrier has held before it takes macOS's
+/// network ([`guest_switch`]): a port that blinks up for a moment does not.
+/// A 0.6.0 log of an IdeaPad with a broken RTL8168G port has that port up
+/// for 410 ms and later 5.6 s, and an AX88179A up for 107 ms.
+pub const SPARE_STEADY_MS: u64 = 1_000;
+
+/// How long a wired adapter's carrier has held before the boot records a
+/// wired network as up for the next boot's menu
+/// (`wifi_prompt::Record::Wired`), which then leaves its Wi-Fi page closed:
+/// that log's broken port and AX88179A each had a link for a moment, which
+/// 0.6.1 would record as a wired network, closing the page on a machine
+/// whose only working network may be its Wi-Fi.
+pub const WIRED_STEADY_MS: u64 = 10_000;
+
+/// Whether a carrier up since `since_ms` (none while down) has held for
+/// `hold_ms` at `now_ms`.
+pub fn steady(since_ms: Option<u64>, now_ms: u64, hold_ms: u64) -> bool {
+    since_ms.is_some_and(|since| now_ms.saturating_sub(since) >= hold_ms)
+}
+
+/// Which spare adapter takes macOS's network at `now_ms`, all times in one
+/// clock's milliseconds: none while its host adapter has carrier
+/// (`down_since_ms` none) or has had none for less than
+/// [`SWITCH_AFTER_MS`]; else the first spare, in order, whose carrier has
+/// been up (`spares_up_since_ms`) for [`SPARE_STEADY_MS`].
+pub fn guest_switch(
+    now_ms: u64,
+    down_since_ms: Option<u64>,
+    spares_up_since_ms: &[Option<u64>],
+) -> Option<usize> {
+    if !steady(down_since_ms, now_ms, SWITCH_AFTER_MS) {
+        return None;
+    }
+    spares_up_since_ms
+        .iter()
+        .position(|&since| steady(since, now_ms, SPARE_STEADY_MS))
+}
+
+/// [`guest_adapter`] among the adapters whose station address is `usable`,
+/// in the same order; none when no adapter has one. The guest's USB
+/// Ethernet adapter takes its host adapter's address, so an Intel Wi-Fi
+/// chip whose firmware had not read its address yet gave macOS all zeros
+/// and 0.6.1 stopped the boot ("the USB Ethernet address must be a unicast
+/// address") on a laptop with no cable and a Wi-Fi network configured.
+pub fn usable_guest_adapter(
+    carriers: &[bool],
+    wireless: &[bool],
+    usable: &[bool],
+    wifi_configured: bool,
+) -> Option<usize> {
+    let kept: alloc::vec::Vec<usize> = (0..carriers.len())
+        .filter(|&index| usable.get(index).copied().unwrap_or(false))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let pick = |of: &[bool]| -> alloc::vec::Vec<bool> {
+        kept.iter()
+            .map(|&index| of.get(index).copied().unwrap_or(false))
+            .collect()
+    };
+    Some(kept[guest_adapter(&pick(carriers), &pick(wireless), wifi_configured)])
+}
+
 /// `text` with the network's name `ssid` written `<ssid>` wherever it
 /// occurs, byte for byte, as `String::from_utf8_lossy` writes it (the
 /// connection keeper's failures name the network so): occurrences that

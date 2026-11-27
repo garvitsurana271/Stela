@@ -977,3 +977,49 @@ fn ax88772_link_calls_run_in_steps_when_the_device_answers_late() {
         asix_link_through_loss(false, true, ownership)
     );
 }
+
+/// An AX88179 takes another station address, as the guest network moves
+/// macOS onto it: the node ID is written at the next carrier check, and the
+/// link's state line names the checks, the PHY status and no address. An
+/// AX88772 does not offer it.
+#[test]
+fn an_ax88179_adopts_a_station_address_at_its_next_carrier_check() {
+    use crate::net::{Link, Mac};
+    let mut fixture = asix_fixture(false);
+    set_asix_link(&mut fixture.model.borrow_mut(), true);
+    let link = &mut fixture.link;
+    assert!(link.settled_carrier());
+    assert!(link.adopts_station());
+    let mac = Mac([2, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    assert!(!link.adopt_station(Mac([1, 0, 0, 0, 0, 1])));
+    assert!(link.adopt_station(mac));
+    assert_eq!(link.mac(), mac);
+    assert!(link.settled_carrier());
+    let model = fixture.model.borrow();
+    assert_eq!(&model.asix.as_ref().unwrap().mac[0x10..0x16], &mac.0);
+    drop(model);
+    let state = fixture.link.diagnostic().unwrap();
+    assert!(state.contains("closed=false carrier=true"), "{state}");
+    assert!(state.contains("physr=0xa400"), "{state}");
+    assert!(state.contains("station_pending=false failure=-"), "{state}");
+    assert!(!state.contains("11:22"), "{state}");
+
+    let legacy = &mut asix_fixture(true).link;
+    assert!(!legacy.adopts_station());
+    assert!(!legacy.adopt_station(mac));
+}
+
+/// A lost link is counted in the state line with the PHY status that said
+/// so, which 0.6.0 never logged for a USB adapter.
+#[test]
+fn an_ax88179s_state_line_counts_a_lost_link() {
+    use crate::net::Link;
+    let mut fixture = asix_fixture(false);
+    set_asix_link(&mut fixture.model.borrow_mut(), true);
+    assert!(fixture.link.settled_carrier());
+    set_asix_link(&mut fixture.model.borrow_mut(), false);
+    assert!(!fixture.link.checked_carrier());
+    let state = fixture.link.diagnostic().unwrap();
+    assert!(state.contains("carrier=false"), "{state}");
+    assert!(state.contains("downs=1 physr=0x0000"), "{state}");
+}

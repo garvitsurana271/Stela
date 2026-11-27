@@ -356,6 +356,216 @@ fn new_in(table: &mut Table) -> &mut Partition {
         .unwrap()
 }
 
+/// `plan` as the picker would have made it had it read `disk` as it is
+/// now: its GPT blocks and first blocks `disk`'s, its writes `plan`'s.
+fn as_read(plan: &Plan, disk: &Sparse) -> Plan {
+    Plan {
+        ends: disk.ends(),
+        seen: seen(&disk.bytes(0, SEEN_BLOCKS)),
+        ..plan.clone()
+    }
+}
+
+/// `header` with `value` at byte `at` and its checksum made anew, as
+/// another tool writes a field of it.
+fn relabel(header: &mut [u8], at: usize, value: &[u8]) {
+    header[at..at + value.len()].copy_from_slice(value);
+    let size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    header[16..20].fill(0);
+    let crc = shared::crc32(&header[..size]);
+    header[16..20].copy_from_slice(&crc.to_le_bytes());
+}
+
+impl Sparse {
+    /// A disk of `blocks` blocks of `block` bytes holding `table` as
+    /// another tool lays one out: [`shared::encode`]'s blocks, each header
+    /// then changed by `edit`, given its LBA, and a protective MBR with a
+    /// disk signature.
+    fn laid_out(block: u64, blocks: u64, table: &Table, edit: impl Fn(u64, &mut [u8])) -> Self {
+        let mut disk = Self::new(block);
+        disk.identity.blocks = blocks;
+        for write in shared::encode(gpt::geometry(&disk.identity), table).unwrap() {
+            disk.put(write.lba, &write.bytes);
+        }
+        for lba in [1, blocks - 1] {
+            let mut header = disk.block_at(lba);
+            edit(lba, &mut header);
+            disk.put(lba, &header);
+        }
+        let mut mbr = disk.block_at(0);
+        mbr[440..444].copy_from_slice(&[0x5e, 0x1f, 0x7a, 0x0b]);
+        disk.put(0, &mbr);
+        disk
+    }
+}
+
+/// Linux's fdisk (libfdisk, also behind sfdisk, cfdisk and GNOME Disks):
+/// the usable blocks from 1 MiB, the last and the rest as Windows'.
+fn fdisk(block: u64) -> impl Fn(u64, &mut [u8]) {
+    move |_: u64, header: &mut [u8]| relabel(header, 40, &(MIB / block).to_le_bytes())
+}
+
+/// Windows, gdisk, parted and macOS: the header as [`shared::encode`]'s.
+fn standard(_: u64, _: &mut [u8]) {}
+
+/// The usable blocks `disk`'s primary header names.
+fn usable_of(disk: &Sparse) -> (u64, u64) {
+    let geometry = gpt::geometry(&disk.identity);
+    let info = shared::parse_header(geometry, 1, &disk.block_at(1))
+        .unwrap()
+        .unwrap();
+    (info.first_usable, info.last_usable)
+}
+
+/// The free space after `table`'s last partition as the picker offers
+/// it: from a MiB boundary, to the last MiB boundary of the usable blocks,
+/// all of it.
+fn free_after(disk: &Sparse, table: &Table) -> Place {
+    let block = u64::from(disk.identity.block_size);
+    let mib = MIB / block;
+    let (first, last) = usable_of(disk);
+    let start = table
+        .partitions
+        .iter()
+        .map(|partition| partition.last_lba + 1)
+        .fold(first, u64::max)
+        .div_ceil(mib)
+        * mib;
+    let end = (last + 1) / mib * mib;
+    Place::Free {
+        first_lba: start,
+        bytes: (end - start) * block / MIB * MIB,
+    }
+}
+
+/// Check only, then install, macOS in the free space after the last of
+/// the partitions `disk` holds, as the picker reads them; and prove what
+/// the install leaves: every write in the GPT's own blocks or the new
+/// partition, the MBR, every partition's entry and every header byte but
+/// the two checksums as they were, both copies whole and alike with the
+/// same layout, and the table the disk's with one partition more.
+fn installs_beside(mut disk: Sparse, what: &str) -> Plan {
+    let geometry = gpt::geometry(&disk.identity);
+    let block = geometry.block_bytes as usize;
+    let table = gpt::read(&mut disk).unwrap();
+    let before = disk.ends();
+    let made = planned(&disk, &table, free_after(&disk, &table), Mode::Check);
+    let (result, lines) = checked(&made, &mut disk);
+    assert!(result.is_ok(), "{what}: {result:?}\n{lines:#?}");
+    assert_eq!(disk.done, [], "{what}");
+    let made = Plan {
+        mode: Mode::Install,
+        ..made
+    };
+    made.apply(&mut disk)
+        .unwrap_or_else(|error| panic!("{what}: {error}"));
+    let [head, tail] = Ends::spans(geometry).unwrap();
+    let (first, end) = (
+        made.partition.first_lba,
+        made.partition.first_lba + made.partition.blocks,
+    );
+    for change in disk.changes() {
+        let (Done::Write { lba, blocks } | Done::Zeroes { lba, blocks }) = change else {
+            panic!("{what}: {change:?}");
+        };
+        assert!(
+            lba + blocks <= head.blocks || lba >= tail.lba || (lba >= first && lba + blocks <= end),
+            "{what}: {change:?}"
+        );
+    }
+    let after = disk.ends();
+    assert_eq!(after.head[..block], before.head[..block], "{what}");
+    let entries = geometry.entry_blocks() as usize * block;
+    let array = |ends: &Ends| ends.head[2 * block..2 * block + entries].to_vec();
+    let (was, now) = (array(&before), array(&after));
+    let changed: Vec<usize> = (0..128)
+        .filter(|slot| was[slot * 128..][..128] != now[slot * 128..][..128])
+        .collect();
+    assert_eq!(changed.len(), 1, "{what}");
+    assert!(was[changed[0] * 128..][..128].iter().all(|&byte| byte == 0));
+    assert_eq!(after.tail[..entries], now[..], "{what}");
+    let headers = |ends: &Ends| {
+        (
+            ends.head[block..2 * block].to_vec(),
+            ends.tail[entries..].to_vec(),
+        )
+    };
+    let (was_headers, now_headers) = (headers(&before), headers(&after));
+    for (was, now) in [
+        (&was_headers.0, &now_headers.0),
+        (&was_headers.1, &now_headers.1),
+    ] {
+        let changed: Vec<usize> = (0..block).filter(|&at| was[at] != now[at]).collect();
+        assert!(
+            changed
+                .iter()
+                .all(|at| CHECKSUMS.iter().any(|c| c.contains(at))),
+            "{what}: {changed:?}"
+        );
+    }
+    assert_eq!(
+        shared::kept_layout(geometry, &now_headers.0, &now_headers.1),
+        shared::kept_layout(geometry, &was_headers.0, &was_headers.1),
+        "{what}"
+    );
+    // As the firmware and the systems on the disk read it: both copies
+    // whole and alike, and a protective MBR.
+    let found = shared::read(geometry, |lba, blocks| Ok(disk.bytes(lba, blocks))).unwrap();
+    let shared::Found::Table {
+        table: read,
+        repair: None,
+    } = found
+    else {
+        panic!("{what}: {found:?}");
+    };
+    assert_eq!(read, written(&made), "{what}");
+    let mut kept = read.clone();
+    let new = kept
+        .partitions
+        .iter()
+        .position(|partition| partition.unique_guid == guid(NEW))
+        .unwrap();
+    assert_eq!(kept.slot(new) as usize, changed[0], "{what}");
+    kept.remove(new);
+    assert_eq!(kept, table, "{what}");
+    made
+}
+
+const LINUX: &str = "0FC63DAF-8483-4772-8E79-3D69D8477DE4";
+const APFS: &str = "7C3457EF-0000-11AA-AA11-00306543ECAC";
+/// The tester's NVMe disk: a Samsung 970 EVO Plus, 500 GB.
+const EVO: u64 = 976_773_168;
+/// The tester's SATA disk: a PNY, 250 GB.
+const PNY: u64 = 488_397_168;
+
+fn blocks_partition(kind: &str, tag: u8, first: u64, last: u64, name: &str) -> Partition {
+    Partition {
+        type_guid: guid(kind),
+        unique_guid: Guid([tag; 16]),
+        first_lba: first,
+        last_lba: last,
+        attributes: 0,
+        name: name.into(),
+    }
+}
+
+fn table_of(partitions: Vec<Partition>) -> Table {
+    Table {
+        disk_guid: guid(DISK),
+        partitions,
+        slots: Vec::new(),
+    }
+}
+
+/// The tester's SATA disk as the log shows it: a Linux filesystem from
+/// 1 MiB, then a 2 GiB ESP, ending where the plan's free space starts.
+fn pny() -> Table {
+    table_of(vec![
+        blocks_partition(LINUX, 1, 2048, 103_426_047, ""),
+        blocks_partition(ESP, 2, 103_426_048, 107_620_351, ""),
+    ])
+}
+
 /// Check `plan` on `disk`; its lines.
 fn checked(plan: &Plan, disk: &mut Sparse) -> (Result<Checked, ApplyError>, Vec<String>) {
     let mut lines = Vec::new();
@@ -453,7 +663,7 @@ fn checking_says_every_write_and_writes_nothing() {
         "PASS the backup GPT's blocks, LBA 268435423-268435455 (33 blocks, 16896 bytes), read \
          through Stela's driver are byte for byte what the picker read through the firmware",
         "PASS both GPT copies are whole and alike: headers at LBA 1 and 268435455, 128 entries \
-         of 128 bytes at LBA 2 and 268435423, 5 partitions",
+         of 128 bytes at LBA 2 and 268435423, usable LBA 34-268435422, 5 partitions",
         "PASS the new partition, LBA 83886080-230686719 (146800640 blocks, 75161927680 bytes), \
          lies in free space: it overlaps none of the disk's 5 partitions and holds at least \
          60017825792 bytes",
@@ -738,11 +948,16 @@ fn a_disk_whose_gpt_copies_are_not_whole_and_alike_is_not_written() {
     let backup = shared::encode(gpt::geometry(&Sparse::new(512).identity), &other).unwrap();
     /// Damage done to the disk, given another table's encoded GPT.
     type Damage = fn(&mut Sparse, &[Write]);
-    let cases: [(Damage, u64, &str); 4] = [
+    type Unplanned = Option<(u64, shared::Unkept)>;
+    // Each with the block at which the picker's plan is refused, when it is:
+    // a plan's headers are the disk's own, so one missing or damaged makes
+    // no plan.
+    let cases: [(Damage, u64, &str, Unplanned); 4] = [
         (
             |disk, _| disk.put(disk.last(), &[0; 512]),
             last,
             "a GPT header is missing",
+            Some((last, shared::Unkept::Missing)),
         ),
         (
             |disk, _| {
@@ -752,6 +967,7 @@ fn a_disk_whose_gpt_copies_are_not_whole_and_alike_is_not_written() {
             },
             1,
             "a GPT header is damaged",
+            Some((1, shared::Unkept::Damaged("GPT header CRC mismatch"))),
         ),
         (
             |disk, _| {
@@ -761,6 +977,7 @@ fn a_disk_whose_gpt_copies_are_not_whole_and_alike_is_not_written() {
             },
             2,
             "a GPT entry array is damaged",
+            None,
         ),
         // A backup that is whole, of another table.
         (
@@ -770,13 +987,31 @@ fn a_disk_whose_gpt_copies_are_not_whole_and_alike_is_not_written() {
             },
             last - 32,
             "the backup GPT is not the primary's copy",
+            None,
         ),
     ];
-    for (damage, lba, why) in cases {
+    let whole = planned(&Sparse::with(512, &table), &table, free(512), Mode::Check);
+    for (damage, lba, why, unplanned) in cases {
         let mut disk = Sparse::with(512, &table);
         damage(&mut disk, &backup);
-        // The picker read the disk as it is now.
-        let made = planned(&disk, &table, free(512), Mode::Check);
+        let ends = disk.ends();
+        let picked = plan(
+            &Decision {
+                mode: Mode::Check,
+                ..decision(&disk, &ends, Some(&table), free(512))
+            },
+            &mut || guid(NEW),
+        );
+        assert_eq!(
+            picked.as_ref().err(),
+            unplanned
+                .map(|(lba, why)| PlanError::Layout { lba, why })
+                .as_ref(),
+            "{why}"
+        );
+        // The picker read the disk as it is now; a plan it refused to make
+        // is refused by the check too.
+        let made = picked.unwrap_or_else(|_| as_read(&whole, &disk));
         assert_eq!(
             checked(&made, &mut disk).0,
             Err(ApplyError {
@@ -1344,4 +1579,415 @@ fn the_disk_is_found_by_its_serial_or_by_what_the_picker_read() {
     devices.truncate(1);
     assert_eq!(made.locate(&mut devices), Err(LocateError::NoDisk));
     assert_eq!(made.locate(&mut []), Err(LocateError::NoDisk));
+}
+
+#[test]
+fn an_empty_libfdisk_gpt_takes_macos() {
+    // The tester's NVMe disk, wiped in Linux: no partitions, the usable
+    // blocks from 1 MiB.
+    let table = table_of(Vec::new());
+    let disk = Sparse::laid_out(512, EVO, &table, fdisk(512));
+    assert_eq!(usable_of(&disk), (2048, EVO - 34));
+    assert_eq!(
+        free_after(&disk, &table),
+        Place::Free {
+            first_lba: 2048,
+            bytes: 976_771_072 * 512
+        }
+    );
+    let made = installs_beside(disk, "fdisk, empty");
+    let lbas: Vec<u64> = made.table.iter().map(|write| write.lba).collect();
+    assert_eq!(lbas, [EVO - 33, EVO - 1, 2, 1]);
+    assert_eq!(
+        (made.partition.first_lba, made.partition.blocks),
+        (2048, 976_771_072)
+    );
+}
+
+#[test]
+fn a_libfdisk_disk_with_linux_and_an_esp_takes_macos() {
+    let table = pny();
+    let disk = Sparse::laid_out(512, PNY, &table, fdisk(512));
+    assert_eq!(
+        free_after(&disk, &table),
+        Place::Free {
+            first_lba: 107_620_352,
+            bytes: 380_776_448 * 512
+        }
+    );
+    let made = installs_beside(disk, "fdisk, Linux and an ESP");
+    let new = written(&made);
+    assert_eq!(new.slots, [0, 1, 2]);
+    assert_eq!(
+        (new.partitions[2].first_lba, new.partitions[2].last_lba),
+        (107_620_352, 488_396_799)
+    );
+}
+
+#[test]
+fn a_disk_each_tool_partitioned_takes_macos() {
+    let msr = |last| blocks_partition(RESERVED, 3, 34, last, "Microsoft reserved partition");
+    type Edit = Box<dyn Fn(u64, &mut [u8])>;
+    let cases: Vec<(&str, u64, u64, Table, Edit)> = vec![
+        // Windows' Initialize Disk: a 16 MiB reserved partition.
+        (
+            "Windows, initialized",
+            512,
+            PNY,
+            table_of(vec![msr(32_767)]),
+            Box::new(standard),
+        ),
+        (
+            "Windows, initialized",
+            512,
+            EVO,
+            table_of(vec![msr(32_767)]),
+            Box::new(standard),
+        ),
+        (
+            "Windows, initialized, 4096-byte blocks",
+            4096,
+            BYTES / 4096,
+            table_of(vec![blocks_partition(
+                RESERVED,
+                3,
+                6,
+                4095,
+                "Microsoft reserved partition",
+            )]),
+            Box::new(standard),
+        ),
+        (
+            "Windows, installed and shrunk",
+            512,
+            PNY,
+            layout(512),
+            Box::new(standard),
+        ),
+        (
+            "Windows, installed and shrunk, 4096-byte blocks",
+            4096,
+            PNY / 8,
+            layout(4096),
+            Box::new(standard),
+        ),
+        (
+            "gdisk, empty",
+            512,
+            PNY,
+            table_of(Vec::new()),
+            Box::new(standard),
+        ),
+        (
+            "gdisk, a Linux filesystem",
+            512,
+            PNY,
+            table_of(vec![blocks_partition(
+                LINUX,
+                4,
+                2048,
+                104_859_647,
+                "Linux filesystem",
+            )]),
+            Box::new(standard),
+        ),
+        (
+            "parted, empty",
+            512,
+            EVO,
+            table_of(Vec::new()),
+            Box::new(standard),
+        ),
+        (
+            "parted, an ESP",
+            512,
+            EVO,
+            table_of(vec![blocks_partition(ESP, 5, 2048, 1_050_623, "ESP")]),
+            Box::new(standard),
+        ),
+        // diskutil: a 200 MiB ESP from LBA 40, the container after it, on
+        // no MiB boundary.
+        (
+            "macOS, an ESP and an APFS container",
+            512,
+            EVO,
+            table_of(vec![
+                blocks_partition(ESP, 6, 40, 409_639, "EFI System Partition"),
+                blocks_partition(APFS, 7, 409_640, 409_640 + 200 * GIB / 512 - 1, ""),
+            ]),
+            Box::new(standard),
+        ),
+        (
+            "fdisk, empty",
+            512,
+            PNY,
+            table_of(Vec::new()),
+            Box::new(fdisk(512)),
+        ),
+        (
+            "fdisk, empty, 4096-byte blocks",
+            4096,
+            BYTES / 4096,
+            table_of(Vec::new()),
+            Box::new(fdisk(4096)),
+        ),
+        (
+            "fdisk, a Linux filesystem",
+            512,
+            EVO,
+            table_of(vec![blocks_partition(
+                LINUX,
+                8,
+                2048,
+                2048 + 50 * GIB / 512 - 1,
+                "",
+            )]),
+            Box::new(fdisk(512)),
+        ),
+        // Usable blocks from any block past encode's, and to any before.
+        (
+            "usable from LBA 40",
+            512,
+            PNY,
+            table_of(Vec::new()),
+            Box::new(|_: u64, header: &mut [u8]| relabel(header, 40, &40u64.to_le_bytes())),
+        ),
+    ];
+    for (what, block, blocks, table, edit) in cases {
+        let disk = Sparse::laid_out(block, blocks, &table, edit);
+        let (first, last) = usable_of(&disk);
+        assert!(first >= 2 + 16384 / block && last == blocks - 2 - 16384 / block);
+        installs_beside(disk, what);
+    }
+}
+
+#[test]
+fn layouts_a_rewrite_does_not_keep_are_refused_naming_the_field() {
+    let table = pny();
+    let last = PNY - 1;
+    let mut clean = Sparse::laid_out(512, PNY, &table, fdisk(512));
+    let read = gpt::read(&mut clean).unwrap();
+    let place = free_after(&clean, &read);
+    let whole = planned(&clean, &read, place, Mode::Install);
+    let exactly = |field, found, kept| shared::Unkept::Field {
+        field,
+        found,
+        kept: shared::Kept::Exactly(kept),
+    };
+    type Edit = fn(u64, &mut [u8]);
+    let cases: [(Edit, u64, shared::Unkept); 10] = [
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 80, &64u32.to_le_bytes())
+                }
+            },
+            1,
+            exactly("entry count", 64, 128),
+        ),
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 80, &256u32.to_le_bytes())
+                }
+            },
+            1,
+            exactly("entry count", 256, 128),
+        ),
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 84, &256u32.to_le_bytes())
+                }
+            },
+            1,
+            exactly("entry size", 256, 128),
+        ),
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 72, &3u64.to_le_bytes())
+                }
+            },
+            1,
+            exactly("entry array LBA", 3, 2),
+        ),
+        // Cloned from a smaller disk.
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 32, &488_000_000u64.to_le_bytes())
+                }
+            },
+            1,
+            exactly("other copy's LBA", 488_000_000, PNY - 1),
+        ),
+        (
+            |_, h| relabel(h, 40, &33u64.to_le_bytes()),
+            1,
+            shared::Unkept::Field {
+                field: "first usable LBA",
+                found: 33,
+                kept: shared::Kept::AtLeast(34),
+            },
+        ),
+        // Over the backup entries.
+        (
+            |_, h| relabel(h, 48, &488_397_135u64.to_le_bytes()),
+            1,
+            shared::Unkept::Field {
+                field: "last usable LBA",
+                found: 488_397_135,
+                kept: shared::Kept::AtMost(488_397_134),
+            },
+        ),
+        (
+            |lba, h| {
+                if lba == 1 {
+                    relabel(h, 12, &96u32.to_le_bytes())
+                }
+            },
+            1,
+            exactly("header size", 96, 92),
+        ),
+        (
+            |lba, h| {
+                if lba != 1 {
+                    relabel(h, 72, &(lba - 33).to_le_bytes())
+                }
+            },
+            last,
+            exactly("entry array LBA", last - 33, last - 32),
+        ),
+        // The copies disagree: the primary from 1 MiB, the backup from 34.
+        (
+            |lba, h| {
+                if lba != 1 {
+                    relabel(h, 40, &34u64.to_le_bytes())
+                }
+            },
+            last,
+            shared::Unkept::Disagree {
+                field: "first usable LBA",
+                primary: 2048,
+                backup: 34,
+            },
+        ),
+    ];
+    for (index, (edit, lba, why)) in cases.into_iter().enumerate() {
+        let mut disk = Sparse::laid_out(512, PNY, &table, |lba, header: &mut [u8]| {
+            fdisk(512)(lba, header);
+            edit(lba, header);
+        });
+        let ends = disk.ends();
+        assert_eq!(
+            plan(&decision(&disk, &ends, Some(&read), place), &mut || guid(
+                NEW
+            )),
+            Err(PlanError::Layout { lba, why }),
+            "{index}"
+        );
+        // A plan made anyway is refused before anything is written, a
+        // check and an install alike.
+        let refused = Err(ApplyError {
+            step: Step::Check,
+            lba: Some(lba),
+            cause: Cause::Layout(why),
+        });
+        let made = as_read(&whole, &disk);
+        assert_eq!(made.apply(&mut disk), refused, "{index}");
+        let check = Plan {
+            mode: Mode::Check,
+            ..made
+        };
+        assert_eq!(checked(&check, &mut disk).0.map(drop), refused.map(drop));
+        assert_eq!(disk.done, [], "{index}");
+    }
+    // The stop names the field and both values.
+    let mut disk = Sparse::laid_out(512, PNY, &table, |_, header: &mut [u8]| {
+        relabel(header, 40, &33u64.to_le_bytes())
+    });
+    assert_eq!(
+        as_read(&whole, &disk)
+            .apply(&mut disk)
+            .unwrap_err()
+            .to_string(),
+        "checking the plan against the disk at block 1: a GPT header names another layout than \
+         the one a rewrite keeps: its first usable LBA is 33, where a rewrite keeps 34 or more"
+    );
+    let ends = disk.ends();
+    assert_eq!(
+        plan(&decision(&disk, &ends, Some(&read), place), &mut || guid(
+            NEW
+        ))
+        .unwrap_err()
+        .to_string(),
+        "the disk's partition table at block 1 is not added to: a GPT header names another \
+         layout than the one a rewrite keeps: its first usable LBA is 33, where a rewrite keeps \
+         34 or more"
+    );
+}
+
+#[test]
+fn a_disk_whose_partitions_overlap_is_not_written() {
+    let table = table_of(vec![
+        blocks_partition(LINUX, 1, 2048, 103_426_047, ""),
+        blocks_partition(ESP, 2, 103_426_000, 107_620_351, ""),
+    ]);
+    let mut disk = Sparse::laid_out(512, PNY, &table, fdisk(512));
+    let read = gpt::read(&mut disk).unwrap();
+    let made = planned(&disk, &read, free_after(&disk, &read), Mode::Install);
+    assert_eq!(
+        made.apply(&mut disk),
+        Err(ApplyError {
+            step: Step::Check,
+            lba: Some(2),
+            cause: Cause::Copies("two of the disk's partitions overlap"),
+        })
+    );
+    assert_eq!(disk.done, []);
+}
+
+#[test]
+fn a_partition_past_a_narrowed_last_usable_is_not_written() {
+    let table = pny();
+    let narrowed = PNY - 34 - 2048;
+    let edit = |lba: u64, header: &mut [u8]| {
+        fdisk(512)(lba, header);
+        relabel(header, 48, &narrowed.to_le_bytes());
+    };
+    let mut disk = Sparse::laid_out(512, PNY, &table, edit);
+    assert_eq!(usable_of(&disk), (2048, narrowed));
+    let read = gpt::read(&mut disk).unwrap();
+    // To the geometry's last MiB, past the header's last usable block.
+    let wide = Place::Free {
+        first_lba: 107_620_352,
+        bytes: 380_776_448 * 512,
+    };
+    let ends = disk.ends();
+    assert_eq!(
+        plan(&decision(&disk, &ends, Some(&read), wide), &mut || guid(
+            NEW
+        )),
+        Err(PlanError::Table("partition outside the usable range"))
+    );
+    // A plan made anyway, from the disk before its usable blocks were
+    // narrowed, is refused by the check.
+    let clean = Sparse::laid_out(512, PNY, &table, fdisk(512));
+    let made = as_read(&planned(&clean, &read, wide, Mode::Install), &disk);
+    assert_eq!(
+        made.apply(&mut disk),
+        Err(error(
+            Step::Check,
+            Some(107_620_352),
+            Cause::Refused("the macOS partition lies outside the blocks the GPT gives partitions"),
+        ))
+    );
+    assert_eq!(disk.done, []);
+    // The free space within them takes macOS.
+    let made = installs_beside(
+        Sparse::laid_out(512, PNY, &table, edit),
+        "a narrowed last usable LBA",
+    );
+    assert!(made.partition.first_lba + made.partition.blocks - 1 <= narrowed);
 }

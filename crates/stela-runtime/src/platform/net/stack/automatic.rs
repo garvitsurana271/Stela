@@ -11,6 +11,15 @@ pub(super) fn unique_local(address: Ipv6Addr) -> bool {
     address.octets()[0] & 0xfe == 0xfc
 }
 
+/// A 6to4 (RFC 3056, 2002::/16) or Teredo (RFC 4380, 2001::/32) address:
+/// global, but reached through a relay that is often gone, so RFC 6724
+/// ranks it below IPv4. A Windows PC sharing its connection advertises a
+/// 2002:: prefix with no DNS server.
+pub(super) fn transition(address: Ipv6Addr) -> bool {
+    let octets = address.octets();
+    octets[..2] == [0x20, 0x02] || octets[..4] == [0x20, 0x01, 0, 0]
+}
+
 pub(super) fn link_local(mac: [u8; 6]) -> Ipv6Addr {
     let mut bytes = [0u8; 16];
     bytes[..2].copy_from_slice(&[0xfe, 0x80]);
@@ -66,6 +75,41 @@ impl<L: Link, C: Clock> Stack<L, C> {
     /// 6724 gives it a label of its own for that reason), so IPv4 is used.
     pub(super) fn ipv6_global_ready(&self) -> bool {
         self.ipv6_admitted(|address| !unique_local(address))
+    }
+    /// [`Self::ipv6_global_ready`] with a native global address, not only a
+    /// 6to4 or Teredo one ([`transition`]), which IPv4 is preferred to.
+    pub(super) fn ipv6_native_ready(&self) -> bool {
+        self.ipv6_admitted(|address| !unique_local(address) && !transition(address))
+    }
+    /// Lines for the adapter's log once [`Self::automatic`] gave it an
+    /// address: the DHCPv4 exchange when it has no IPv4 lease, so a log of
+    /// an IPv6-only start says whether any offer came; and, when the
+    /// network named no DNS server and no `--dns` is set, that lookups ask
+    /// the public resolvers.
+    pub fn admission_notes(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.config.is_none()
+            && let Some(dhcp) = self.dhcp_summary()
+        {
+            notes.push(alloc::format!("no IPv4 lease; dhcp: {dhcp}"));
+        }
+        if self.fixed_dns.is_none() && self.dns_servers.is_empty() {
+            let servers: Vec<String> = self
+                .fallback_servers()
+                .iter()
+                .map(alloc::string::ToString::to_string)
+                .collect();
+            notes.push(match servers.is_empty() {
+                true => String::from(
+                    "no DNS server from DHCPv4 or IPv6 router advertisements, and no route to a public resolver",
+                ),
+                false => alloc::format!(
+                    "no DNS server from DHCPv4 or IPv6 router advertisements: lookups ask the public resolvers {}",
+                    servers.join(", ")
+                ),
+            });
+        }
+        notes
     }
     fn ipv6_admitted(&self, kind: impl Fn(Ipv6Addr) -> bool) -> bool {
         self.iface.routes().get_default_ipv6_route().is_some()
@@ -208,13 +252,16 @@ impl<L: Link, C: Clock> Stack<L, C> {
         let deadline = self.now()?.saturating_add(DHCP_WAIT_US);
         loop {
             self.poll()?;
-            // IPv4, or IPv6 with a global address, is ready at once. IPv6
-            // with only a unique local address waits for a DHCPv4 lease
-            // until the deadline, and is taken then: before, an install
-            // asked the IPSW's global address from a ULA and every range
-            // timed out while the lease came seconds later.
+            // IPv4, or IPv6 with a native global address and a DNS server,
+            // is ready at once. IPv6 with only a unique local, 6to4 or
+            // Teredo address, or with no DNS server, waits for a DHCPv4
+            // lease until the deadline, and is taken then: before, an
+            // install asked the IPSW's global address from a ULA and every
+            // range timed out while the lease came seconds later, and one
+            // took a 2002:: address with no DNS server 37 s in and never
+            // waited for DHCPv4.
             if self.config.is_some()
-                || self.ipv6_global_ready()
+                || (self.ipv6_native_ready() && !self.dns_servers.is_empty())
                 || (self.ipv6_ready() && self.now()? >= deadline)
             {
                 return Ok(Automatic {
@@ -302,6 +349,16 @@ pub(super) mod tests {
         probes: usize,
         /// The /64 prefix the router advertises.
         prefix: &'static str,
+        /// Whether its advertisement names a DNS server (RDNSS).
+        rdnss: bool,
+    }
+    fn router(prefix: &'static str, rdnss: bool) -> Router {
+        Router {
+            frames: VecDeque::new(),
+            probes: 0,
+            prefix,
+            rdnss,
+        }
     }
     impl Link for Router {
         fn mac(&self) -> stela_drivers::net::Mac {
@@ -313,7 +370,8 @@ pub(super) mod tests {
                     self.probes += 1;
                 }
                 if frame[54] == 133 {
-                    self.frames.push_back(advertisement_with(self.prefix));
+                    self.frames
+                        .push_back(advertisement_with(self.prefix, self.rdnss));
                 }
             }
             Ok(())
@@ -323,22 +381,23 @@ pub(super) mod tests {
         }
     }
     pub(crate) fn advertisement() -> Vec<u8> {
-        advertisement_with("2001:db8:1234::")
+        advertisement_with("2001:db8:1234::", true)
     }
     /// A router advertisement of `prefix`/64, the router being the default
-    /// route, with an RDNSS server in it.
-    fn advertisement_with(prefix: &str) -> Vec<u8> {
+    /// route, with an RDNSS server in it when `rdnss`.
+    fn advertisement_with(prefix: &str, rdnss: bool) -> Vec<u8> {
         let source: Ipv6Addr = "fe80::1".parse().unwrap();
         let destination: Ipv6Addr = "ff02::1".parse().unwrap();
         let prefix: Ipv6Addr = prefix.parse().unwrap();
         let dns: Ipv6Addr = "2001:db8:1234::53".parse().unwrap();
-        let mut frame = vec![0; 14 + 40 + 72];
+        let length: u16 = if rdnss { 72 } else { 48 };
+        let mut frame = vec![0; 14 + 40 + usize::from(length)];
         frame[..6].copy_from_slice(&[0x33, 0x33, 0, 0, 0, 1]);
         frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
         frame[12..14].copy_from_slice(&[0x86, 0xdd]);
         let ip = &mut frame[14..];
         ip[0] = 0x60;
-        ip[4..6].copy_from_slice(&72u16.to_be_bytes());
+        ip[4..6].copy_from_slice(&length.to_be_bytes());
         ip[6] = 58;
         ip[7] = 255;
         ip[8..24].copy_from_slice(&source.octets());
@@ -355,11 +414,13 @@ pub(super) mod tests {
         pi[4..8].copy_from_slice(&600u32.to_be_bytes());
         pi[8..12].copy_from_slice(&300u32.to_be_bytes());
         pi[16..32].copy_from_slice(&prefix.octets());
-        let dns_option = &mut icmp[48..72];
-        dns_option[0] = 25;
-        dns_option[1] = 3;
-        dns_option[4..8].copy_from_slice(&600u32.to_be_bytes());
-        dns_option[8..24].copy_from_slice(&dns.octets());
+        if rdnss {
+            let dns_option = &mut icmp[48..72];
+            dns_option[0] = 25;
+            dns_option[1] = 3;
+            dns_option[4..8].copy_from_slice(&600u32.to_be_bytes());
+            dns_option[8..24].copy_from_slice(&dns.octets());
+        }
         let sum = rdnss::checksum(source, destination, icmp);
         icmp[2..4].copy_from_slice(&sum.to_be_bytes());
         frame
@@ -509,11 +570,7 @@ pub(super) mod tests {
     }
     #[test]
     fn addresses_and_servers_set_by_hand_replace_dhcp_and_advertised_dns() {
-        let router = Router {
-            frames: VecDeque::new(),
-            probes: 0,
-            prefix: "2001:db8:1234::",
-        };
+        let router = router("2001:db8:1234::", true);
         let mut stack = Stack::new(router, ClockStep(core::cell::Cell::new(0)), 7).unwrap();
         let address = core::net::Ipv4Addr::new(192, 168, 1, 20);
         stack
@@ -537,11 +594,7 @@ pub(super) mod tests {
     }
     #[test]
     fn ipv6_only_link_uses_real_router_advertisement_and_dad() {
-        let router = Router {
-            frames: VecDeque::new(),
-            probes: 0,
-            prefix: "2001:db8:1234::",
-        };
+        let router = router("2001:db8:1234::", true);
         let mut stack = Stack::new(router, ClockStep(core::cell::Cell::new(0)), 7).unwrap();
         let configuration = stack.automatic().unwrap();
         assert!(stack.config().is_none());
@@ -561,11 +614,7 @@ pub(super) mod tests {
     }
     #[test]
     fn a_unique_local_prefix_alone_waits_for_dhcpv4_and_is_taken_at_the_deadline() {
-        let router = Router {
-            frames: VecDeque::new(),
-            probes: 0,
-            prefix: "fd12:3456:789a::",
-        };
+        let router = router("fd12:3456:789a::", true);
         let mut stack = Stack::new(router, ClockStep(core::cell::Cell::new(0)), 7).unwrap();
         let configuration = stack.automatic().unwrap();
         // No lease came: the ULA is taken, but only once the wait is over.
@@ -586,6 +635,94 @@ pub(super) mod tests {
         let site: Ipv6Addr = "fd12:3456:789a::1".parse().unwrap();
         assert!(!stack.address_usable(IpAddress::Ipv6(global)));
         assert!(stack.address_usable(IpAddress::Ipv6(site)));
+    }
+    /// A router whose advertisement names no DNS server, with no DHCPv4:
+    /// the global address is taken only once the DHCPv4 wait is over, not
+    /// the moment it passes DAD, and the log says lookups ask the public
+    /// resolvers.
+    #[test]
+    fn ipv6_alone_without_a_dns_server_waits_for_dhcpv4() {
+        let mut stack = Stack::new(
+            router("2001:db8:1234::", false),
+            ClockStep(core::cell::Cell::new(0)),
+            7,
+        )
+        .unwrap();
+        let configuration = stack.automatic().unwrap();
+        assert!(configuration.dns.is_empty());
+        assert!(stack.ipv6_native_ready());
+        assert!(
+            stack.clock.0.get() >= DHCP_WAIT_US,
+            "{}",
+            stack.clock.0.get()
+        );
+        let notes = stack.admission_notes();
+        assert!(notes[0].starts_with("no IPv4 lease; dhcp: "), "{notes:?}");
+        assert!(
+            notes[1]
+                .ends_with("lookups ask the public resolvers 2606:4700:4700::1111, 2620:fe::fe"),
+            "{notes:?}"
+        );
+    }
+    /// A 6to4 prefix, as a Windows PC sharing its connection advertises, is
+    /// global but no reason to stop waiting for DHCPv4, even with a DNS
+    /// server; a lookup then asks for IPv4 first where it has a lease.
+    #[test]
+    fn a_6to4_prefix_waits_for_dhcpv4_and_ipv4_is_preferred_to_it() {
+        let mut stack = Stack::new(
+            router("2002:c000:0201::", true),
+            ClockStep(core::cell::Cell::new(0)),
+            7,
+        )
+        .unwrap();
+        let configuration = stack.automatic().unwrap();
+        assert!(!configuration.dns.is_empty());
+        assert!(stack.ipv6_global_ready() && !stack.ipv6_native_ready());
+        assert!(
+            stack.clock.0.get() >= DHCP_WAIT_US,
+            "{}",
+            stack.clock.0.get()
+        );
+        // IPv6 alone: the 6to4 address is what there is.
+        assert_eq!(stack.query_kind(false), Some(DnsQueryType::Aaaa));
+        stack
+            .set_ipv4(
+                core::net::Ipv4Addr::new(192, 168, 137, 20),
+                24,
+                Some(core::net::Ipv4Addr::new(192, 168, 137, 1)),
+            )
+            .unwrap();
+        assert_eq!(stack.query_kind(false), Some(DnsQueryType::A));
+        // A native prefix is still asked first.
+        let mut native = Stack::new(
+            router("2001:db8:1234::", true),
+            ClockStep(core::cell::Cell::new(0)),
+            7,
+        )
+        .unwrap();
+        native.automatic().unwrap();
+        native
+            .set_ipv4(core::net::Ipv4Addr::new(192, 168, 1, 20), 24, None)
+            .unwrap();
+        assert_eq!(native.query_kind(false), Some(DnsQueryType::Aaaa));
+        assert_eq!(native.query_kind(true), Some(DnsQueryType::A));
+    }
+    #[test]
+    fn transition_addresses_are_6to4_and_teredo() {
+        for (address, transition_address) in [
+            ("2002:c000:201::1", true),
+            ("2001:0:4136:e378::1", true),
+            ("2001:db8::1", false),
+            ("2001:1::1", false),
+            ("2606:4700::1111", false),
+            ("fd00::1", false),
+        ] {
+            assert_eq!(
+                transition(address.parse().unwrap()),
+                transition_address,
+                "{address}"
+            );
+        }
     }
     #[test]
     fn unique_local_addresses_are_fc00_slash_7() {

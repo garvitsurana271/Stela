@@ -608,7 +608,13 @@ impl From<Vec<u8>> for Chosen {
 /// Log the chosen entry; its options, on `disk`.
 fn chosen(choices: &Choices, index: usize, disk: Option<&str>) -> Vec<u8> {
     let entry = &choices.entries[index];
+    // Its line in choices.cfg runs, not stela.cfg's: an option written by
+    // hand into stela.cfg alone does not reach it (dev64's
+    // --gpu-strict-families in test 6).
     output::arguments(format_args!("CHOICE {} ({})\n", index + 1, entry.name));
+    output::arguments(format_args!(
+        "CHOICE options: its line in \\EFI\\stela\\choices.cfg runs in place of stela.cfg's\n"
+    ));
     status::info(&format!("Starting {}", entry.name));
     with_disk(&entry.options, disk)
         .unwrap_or_else(|| entry.options.clone())

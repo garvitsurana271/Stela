@@ -1202,11 +1202,13 @@ pub struct HeapLayout {
 
 impl HeapLayout {
     /// The most sampled or storage descriptors the heap takes, texel buffers
-    /// included: eight times Apple's tier 2 count of 500 000. The heap is one
-    /// pool, and Intel's Vulkan driver on Gen9 to Gen12.0 GPUs reports 201
-    /// million images, which its pool keeps 48 host bytes each for: 9.1 GiB
-    /// in one allocation, which no PC holds.
-    pub const MAX_IMAGES: u32 = 1 << 22;
+    /// included: 1 048 576, whose three quarters for images still hold
+    /// Apple's tier 2 count of 500 000. The heap is one pool, and Intel's
+    /// Vulkan driver on Gen9 to Gen12.0 GPUs reports 201 million images, which
+    /// its pool keeps 48 host bytes each for: 9.1 GiB in one allocation, which
+    /// no PC holds. Four times this still left a descriptor buffer of tens of
+    /// MiB in the integrated GPU's small share of RAM (Ice Lake, PR #23).
+    pub const MAX_IMAGES: u32 = 1 << 20;
 
     pub fn new(limits: &Limits) -> Self {
         let sampled = limits
@@ -2618,7 +2620,7 @@ mod tests {
         let layout = HeapLayout::new(&limits);
         assert_eq!(
             layout.counts,
-            [3_145_728, 1_572_864, 65_536, 1_048_576, 524_288]
+            [786_432, 786_432, 65_536, 262_144, 262_144]
         );
         assert!(layout.count(HeapArray::SampledImages) >= 500_000);
         assert!(layout.count(HeapArray::StorageImages) >= 500_000);
@@ -2628,7 +2630,7 @@ mod tests {
             .iter()
             .map(|&count| u64::from(count) * 48)
             .sum();
-        assert_eq!(host, 305_135_616);
+        assert_eq!(host, 103_809_024);
         let mut heap = DescriptorHeap::new(layout);
         assert_eq!(heap.allocate(HeapArray::SampledImages), Ok(1));
     }

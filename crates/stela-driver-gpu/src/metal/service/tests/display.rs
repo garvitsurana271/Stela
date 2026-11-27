@@ -71,6 +71,34 @@ fn a_display_composition_completes_as_the_gpu_finishes_it() {
     shared.release_display(target);
 }
 
+/// A lost device takes none of a display's buffers, so the platform closes
+/// them, and its generation stays the one the shared buffers were imported
+/// in until a reopened device serves: the display shares again only then.
+#[test]
+fn a_lost_device_takes_no_scanout_buffer_and_keeps_its_generation() {
+    let shared = Shared::new(service(), HOST);
+    let generation = shared.generation();
+    let target = shared.share_scanouts(&[(3, 128)]).unwrap();
+    assert_eq!(target.epoch(), generation);
+    let imported = {
+        let mut turn = shared.try_turn().unwrap();
+        turn.device().mark_lost();
+        turn.device().backend().dma_bufs.len()
+    };
+    assert!(matches!(
+        shared.share_scanouts(&[(4, 128), (5, 128)]),
+        Err(Error::DeviceLost)
+    ));
+    let mut turn = shared.try_turn().unwrap();
+    assert_eq!(turn.device().backend().dma_bufs.len(), imported);
+    drop(turn);
+    assert_eq!(shared.generation(), generation);
+    assert!(matches!(
+        shared.compose_display(&target, 0, &frame()),
+        Err(Error::DeviceLost)
+    ));
+}
+
 #[test]
 fn a_busy_service_refuses_a_composition_past_the_wait_bound() {
     let shared = Shared::new(service(), HOST);

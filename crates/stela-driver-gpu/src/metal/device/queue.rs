@@ -88,8 +88,12 @@ const COMPLETION_QUERIES: u32 = PASS_MARKS + 2;
 
 /// Marks a command buffer's timestamps make where the GPU already waits:
 /// after each pass and before each barrier that follows dispatches, so the
-/// platform's report can say which part of a slow one took the time.
-const PASS_MARKS: u32 = 30;
+/// platform's report can say which part of a slow one took the time, and a
+/// lost device's fault dump which part never ended
+/// ([`Device::unfinished_progress`]). WindowServer's Liquid Glass frames
+/// run past 30 passes: with 30 marks, dev64's slowest spans were the 31st,
+/// everything after the 30th pass.
+const PASS_MARKS: u32 = 62;
 
 /// Completed command buffers whose GPU times are kept.
 pub(super) const TIMES_KEPT: usize = 1024;
@@ -280,6 +284,9 @@ struct SpanShape {
     groups: u64,
     /// The last pass's note, zero for none.
     note: u32,
+    /// Its indirect draws and dispatches, whose counts the GPU reads, and
+    /// executions of indirect command buffers.
+    indirect: u32,
 }
 
 impl SpanShape {
@@ -320,10 +327,13 @@ impl SpanShape {
                     .largest
                     .max(u64::from(*count) * u64::from(*instance_count));
             }
+            Command::DrawMeshTasks(_) => self.draws += 1,
             Command::DrawIndirect { .. }
             | Command::DrawIndexedIndirect { .. }
-            | Command::DrawMeshTasks(_)
-            | Command::DrawMeshTasksIndirect { .. } => self.draws += 1,
+            | Command::DrawMeshTasksIndirect { .. } => {
+                self.draws += 1;
+                self.indirect += 1;
+            }
             Command::Dispatch(groups) => {
                 self.dispatches += 1;
                 self.groups += groups
@@ -331,9 +341,31 @@ impl SpanShape {
                     .map(|&count| u64::from(count))
                     .product::<u64>();
             }
-            Command::DispatchIndirect { .. } => self.dispatches += 1,
+            Command::DispatchIndirect { .. } => {
+                self.dispatches += 1;
+                self.indirect += 1;
+            }
+            // An indirect command buffer's commands, which the GPU
+            // generates from what it reads.
+            Command::ExecuteGeneratedCommands(_) => self.indirect += 1,
             _ => {}
         }
+    }
+
+    /// [`Self::describe`] with what a hang report also names: its kind of
+    /// work, indirect draws and dispatches, and direct workgroups.
+    fn hang_detail(&self) -> String {
+        format!(
+            "[{:?} {}x{} draws={} dispatches={} largest={} indirect={} groups={}]",
+            self.kind,
+            self.extent[0],
+            self.extent[1],
+            self.draws,
+            self.dispatches,
+            self.largest,
+            self.indirect,
+            self.groups
+        )
     }
 
     /// `[WxH draws=… dispatches=… largest=…]`, which the report shows after
@@ -1931,6 +1963,59 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             }
         }
         (serials, pipelines)
+    }
+
+    /// How far each of the first [`fault_dump::MAX_PROGRESS`] submitted,
+    /// unfinished command buffers with timestamps got, by serial: the span
+    /// whose start the GPU wrote and whose end it did not, read without
+    /// waiting from the pool's memory, which a lost device keeps.
+    ///
+    /// [`fault_dump::MAX_PROGRESS`]: crate::metal::fault_dump::MAX_PROGRESS
+    pub(super) fn unfinished_progress(&mut self) -> Vec<(u64, crate::metal::fault_dump::Progress)> {
+        use crate::metal::fault_dump::{MAX_PROGRESS, Progress};
+        let mut progress = Vec::new();
+        let unfinished = self
+            .queue
+            .in_flight
+            .iter()
+            .filter(|flight| !matches!(flight.track, Track::Held | Track::Done));
+        for flight in unfinished.take(MAX_PROGRESS) {
+            let Some((pool, marks)) = &flight.times else {
+                continue;
+            };
+            let count = marks.spans.len();
+            let mut stamps = alloc::vec![None; count + 1];
+            let found = match self.backend.query_progress(*pool, 0, &mut stamps) {
+                Err(error) => Progress::Unreadable(format!("{error:?}")),
+                Ok(()) => match stamps.iter().take_while(|stamp| stamp.is_some()).count() {
+                    0 => Progress::NotStarted,
+                    written if written > count => Progress::Ended { count },
+                    written => {
+                        let index = written - 1;
+                        let pipelines = marks.spans[index]
+                            .iter()
+                            .filter_map(|&bound| flight.pipelines.get(usize::from(bound)))
+                            .map(|&pipeline| {
+                                let label = match pipeline {
+                                    BoundPipeline::Render(id) => format!("render {id}"),
+                                    BoundPipeline::Compute(id) => format!("compute {id}"),
+                                };
+                                let entries = self.pipelines.entries(pipeline).unwrap_or_default();
+                                format!("{label} ({})", super::gpu_times::names(entries))
+                            })
+                            .collect();
+                        Progress::Stopped {
+                            index,
+                            count,
+                            shape: marks.shapes[index].hang_detail(),
+                            pipelines,
+                        }
+                    }
+                },
+            };
+            progress.push((flight.serial, found));
+        }
+        progress
     }
 
     /// Submits ready held work, retires completed command buffers and

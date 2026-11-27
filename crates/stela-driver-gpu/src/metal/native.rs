@@ -3604,6 +3604,36 @@ impl Backend for NativeBackend {
         }
     }
 
+    fn query_progress(
+        &mut self,
+        pool: QueryPool,
+        first: u32,
+        results: &mut [Option<u64>],
+    ) -> Result<()> {
+        // Each result followed by its availability.
+        let mut pairs = alloc::vec![[0u64; 2]; results.len()];
+        // SAFETY: the pool holds `results.len()` queries from `first`; with
+        // neither WAIT nor PARTIAL the driver writes each available result
+        // and every availability, and answers NOT_READY for the rest.
+        let queried = unsafe {
+            self.device.get_query_pool_results(
+                handle(pool.0),
+                first,
+                &mut pairs,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY,
+            )
+        };
+        match queried {
+            Ok(()) | Err(vk::Result::NOT_READY) => {
+                for (result, [value, available]) in results.iter_mut().zip(pairs) {
+                    *result = (available != 0).then_some(value);
+                }
+                Ok(())
+            }
+            Err(error) => Err(failure(error)),
+        }
+    }
+
     fn submit_failure(&mut self, semaphore: Semaphore, value: u64) -> Option<Error> {
         let refusals = self.refusals?;
         // SAFETY: the queue and semaphore are alive; the driver only reads

@@ -176,6 +176,63 @@ pub fn opening(fault: u32, serials: &[u64], pipelines: &[String]) -> String {
     line
 }
 
+/// The unfinished command buffers whose progress a dump gives.
+pub const MAX_PROGRESS: usize = 4;
+
+/// How far an unfinished command buffer's timestamps got by the loss: its
+/// start, then the end of each span between its marks (after a pass, before
+/// the barrier after dispatches). A span whose start is written and whose
+/// end is not is the work the GPU did not finish: on a reset for a hang,
+/// the work that hung, or work behind it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Progress {
+    /// No timestamp was written: the GPU had not started it.
+    NotStarted,
+    /// Span `index` of `count` started and never ended: what it did, and
+    /// the pipelines it bound by label and entry points.
+    Stopped {
+        index: usize,
+        count: usize,
+        shape: String,
+        pipelines: Vec<String>,
+    },
+    /// Every span ended: the command buffer's own work was done.
+    Ended { count: usize },
+    /// The driver reads no results on a lost device.
+    Unreadable(String),
+}
+
+/// Fault `fault`'s line of command buffer `serial`'s [`Progress`].
+pub fn progress(fault: u32, serial: u64, progress: &Progress) -> String {
+    let opening = format!("{PREFIX}{fault} command buffer {serial}");
+    match progress {
+        Progress::NotStarted => {
+            format!("{opening}: not started, no timestamp written (the GPU ran work before it)")
+        }
+        Progress::Stopped {
+            index,
+            count,
+            shape,
+            pipelines,
+        } => {
+            let mut line =
+                format!("{opening}: span {index} of {count} started and never ended {shape}");
+            if pipelines.is_empty() {
+                line.push_str(", binding no pipeline");
+            } else {
+                let _ = write!(line, ", binding {}", pipelines.join(", "));
+            }
+            line
+        }
+        Progress::Ended { count } => {
+            format!("{opening}: all {count} spans ended (its own work finished)")
+        }
+        Progress::Unreadable(why) => {
+            format!("{opening}: its timestamps are unreadable on the lost device: {why}")
+        }
+    }
+}
+
 /// A pipeline whose object is gone, so its shaders cannot be named.
 pub fn released(fault: u32, pipeline: &str) -> String {
     format!("{PREFIX}{fault} {pipeline}: released, its shaders unknown")

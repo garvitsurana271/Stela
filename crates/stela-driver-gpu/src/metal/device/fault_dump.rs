@@ -34,6 +34,11 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         pipelines.sort_by_key(|pipeline| matches!(pipeline, BoundPipeline::Compute(_)));
         let labels: Vec<String> = pipelines.iter().copied().map(label).collect();
         let mut lines = vec![fault_dump::opening(fault, &serials, &labels)];
+        // Where each stopped, before the pipelines' code: the span a hang
+        // was in names the few pipelines worth reading of the many dumped.
+        for (serial, progress) in self.unfinished_progress() {
+            lines.push(fault_dump::progress(fault, serial, &progress));
+        }
         let mut stages: Vec<(&str, usize, ShaderImage)> = Vec::new();
         for (&pipeline, label) in pipelines.iter().zip(&labels).take(MAX_PIPELINES) {
             let (Ok(functions), Ok(vulkan)) = (

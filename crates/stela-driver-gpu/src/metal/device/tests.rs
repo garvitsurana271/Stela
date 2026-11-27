@@ -4755,7 +4755,7 @@ fn completion_query_pools_reuse_two_slots_after_retirement() {
     };
     assert_eq!(public_info.count, 17);
     assert_eq!(first_info.query_type, QueryType::Timestamp);
-    assert_eq!(first_info.count, 32);
+    assert_eq!(first_info.count, 64);
     assert_eq!(second_info, first_info);
     let (public_pool, first_pool, second_pool) = (*public_pool, *first_pool, *second_pool);
     assert_ne!(first_pool, second_pool);
@@ -4763,8 +4763,8 @@ fn completion_query_pools_reuse_two_slots_after_retirement() {
         backend.query_resets,
         [
             (public_pool, 0, 17),
-            (first_pool, 0, 32),
-            (second_pool, 0, 32)
+            (first_pool, 0, 64),
+            (second_pool, 0, 64)
         ]
     );
     assert!(backend.query_reads.is_empty());
@@ -4773,7 +4773,7 @@ fn completion_query_pools_reuse_two_slots_after_retirement() {
     complete(&mut device, first);
     assert_eq!(device.command_buffer_times(first), Ok([0, 10]));
     assert_eq!(device.backend().query_reads, [(first_pool, 0, 2)]);
-    assert_eq!(device.backend().query_resets[3..], [(first_pool, 0, 32)]);
+    assert_eq!(device.backend().query_resets[3..], [(first_pool, 0, 64)]);
 
     let third = submit(&mut device);
     let backend = device.backend();
@@ -4795,9 +4795,9 @@ fn completion_query_pools_reuse_two_slots_after_retirement() {
     assert_eq!(
         device.backend().query_resets[3..],
         [
-            (first_pool, 0, 32),
-            (second_pool, 0, 32),
-            (first_pool, 0, 32)
+            (first_pool, 0, 64),
+            (second_pool, 0, 64),
+            (first_pool, 0, 64)
         ]
     );
 }
@@ -4852,14 +4852,14 @@ fn failed_completion_preparation_preserves_pending_texture_uploads() {
     assert_eq!(device.commit(commands), Err(Error::OutOfMemory));
     assert_eq!(device.backend().next, created + 1);
     let pool = device.backend().query_pools[0].0;
-    assert_eq!(device.backend().query_resets, [(pool, 0, 32)]);
+    assert_eq!(device.backend().query_resets, [(pool, 0, 64)]);
     assert!(device.backend().submissions.is_empty());
 
     let commands = encode(&mut device);
     let serial = device.commit(commands).unwrap();
     assert_eq!(serial, 1);
     assert_eq!(device.backend().next, created + 1);
-    assert_eq!(device.backend().query_resets, [(pool, 0, 32)]);
+    assert_eq!(device.backend().query_resets, [(pool, 0, 64)]);
     let submitted = &device.backend().submissions[0][0].commands;
     assert!(matches!(submitted[1], Command::CopyBufferToImage { .. }));
     assert!(matches!(
@@ -4869,7 +4869,7 @@ fn failed_completion_preparation_preserves_pending_texture_uploads() {
     complete(&mut device, serial);
     assert_eq!(
         device.backend().query_resets,
-        [(pool, 0, 32), (pool, 0, 32)]
+        [(pool, 0, 64), (pool, 0, 64)]
     );
 }
 

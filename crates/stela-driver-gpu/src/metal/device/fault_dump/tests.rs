@@ -82,10 +82,11 @@ fn a_lost_device_dumps_the_pipelines_its_unfinished_work_bound() {
              pipeline: compute {id}"
         )
     );
+    assert!(lines[1].starts_with(&format!("fault dump 1 command buffer {serial}: ")));
     let stage = format!("fault dump 1 compute {id} variant 0 compute (kernel): code=100 sha256=");
-    assert!(lines[1].starts_with(&stage), "{}", lines[1]);
-    assert!(lines[1].ends_with(" gprs=8 sph=none"), "{}", lines[1]);
-    let hex: Vec<&String> = lines[2..].iter().collect();
+    assert!(lines[2].starts_with(&stage), "{}", lines[2]);
+    assert!(lines[2].ends_with(" gprs=8 sph=none"), "{}", lines[2]);
+    let hex: Vec<&String> = lines[3..].iter().collect();
     assert_eq!(hex.len(), 100usize.div_ceil(HEX_LINE_BYTES));
     assert!(hex[0].starts_with(&format!(
         "fault dump 1 compute {id} variant 0 compute code+0x0000: 000102"
@@ -97,10 +98,10 @@ fn a_lost_device_dumps_the_pipelines_its_unfinished_work_bound() {
     let later = device.fault_dump(2);
     assert_eq!(
         later.len(),
-        2,
+        3,
         "no hex past the boot's first fault: {later:?}"
     );
-    assert!(later[1].starts_with(&format!("fault dump 2 compute {id} variant 0 compute")));
+    assert!(later[2].starts_with(&format!("fault dump 2 compute {id} variant 0 compute")));
 }
 
 /// A driver that reports no shaders still has its pipelines named.
@@ -110,10 +111,59 @@ fn a_driver_without_shader_images_still_names_the_pipelines() {
     let (id, _) = dispatched(&mut device);
     lose(&mut device);
     assert_eq!(
-        device.fault_dump(1)[1..],
+        device.fault_dump(1)[2..],
         [format!(
             "fault dump 1 compute {id} variant 0 (kernel): the driver reports no shaders"
         )]
+    );
+}
+
+/// The span whose start the GPU wrote and whose end it did not is named
+/// with the pipelines it bound; a command buffer the GPU had not started,
+/// one whose spans all ended, and a driver that reads nothing on a lost
+/// device are each said so.
+#[test]
+fn a_lost_device_says_which_span_of_its_unfinished_work_never_ended() {
+    let mut device = device();
+    let (id, serial) = dispatched(&mut device);
+    lose(&mut device);
+    let opening = format!("fault dump 1 command buffer {serial}: ");
+
+    device.backend().queries_written = Some(1);
+    let line = &device.fault_dump(1)[1];
+    assert!(line.starts_with(&format!("{opening}span 0 of ")), "{line}");
+    assert!(
+        line.contains("started and never ended [Compute 0x0 draws=0 dispatches=1"),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(&format!(
+            "indirect=0 groups=1], binding compute {id} (kernel)"
+        )),
+        "{line}"
+    );
+
+    device.backend().queries_written = Some(0);
+    assert_eq!(
+        device.fault_dump(1)[1],
+        format!("{opening}not started, no timestamp written (the GPU ran work before it)")
+    );
+
+    device.backend().queries_written = Some(u32::MAX);
+    let line = &device.fault_dump(1)[1];
+    assert!(
+        line.starts_with(&format!("{opening}all "))
+            && line.ends_with(" spans ended (its own work finished)"),
+        "{line}"
+    );
+
+    device.backend().queries_written = None;
+    assert_eq!(
+        device.fault_dump(1)[1],
+        format!(
+            "{opening}its timestamps are unreadable on the lost device: \
+             Unsupported(\"query results without waiting\")"
+        )
     );
 }
 

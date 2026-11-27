@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Garvit Surana <251430630+garvitsurana271@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 11:32:54 +0000
+Subject: [PATCH] anv: read a lost device's query results without waiting, so
+ the timestamps a hung command buffer wrote before the reset say how far it
+ got, where every read after a loss answered VK_ERROR_DEVICE_LOST and the
+ fault dump of dev64's Iris Xe could not say which of the 68 pipelines a 10.5
+ s hang was in
+
+---
+ src/intel/vulkan/genX_query.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/intel/vulkan/genX_query.c b/src/intel/vulkan/genX_query.c
+index 881d80a41747ad1ef08511e6a1afe5abcecd1a06..4fd527dfdf3fd75a236a78f401a7e253bdebe86e 100644
+--- a/src/intel/vulkan/genX_query.c
++++ b/src/intel/vulkan/genX_query.c
+@@ -569,7 +569,12 @@ VkResult genX(GetQueryPoolResults)(
+    pool->vk.query_type == VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR ||
+    pool->vk.query_type == VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR);
+ 
+-   if (vk_device_is_lost(&device->vk))
++   /* A lost device keeps its query pools mapped: what the GPU wrote before
++    * the loss is read without waiting, which says how far a command buffer
++    * that hung got (its timestamps after each pass). Only a wait for a
++    * result the GPU will never write answers the loss.
++    */
++   if (vk_device_is_lost(&device->vk) && (flags & VK_QUERY_RESULT_WAIT_BIT))
+       return VK_ERROR_DEVICE_LOST;
+ 
+    if (pData == NULL)

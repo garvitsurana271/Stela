@@ -247,6 +247,10 @@ pub(crate) struct MockBackend {
     /// behind it included, until a signal arrives.
     pub(crate) unpromised: Vec<(Semaphore, u64)>,
     pub(crate) queries_ready: bool,
+    /// How many of a pool's first queries [`Backend::query_progress`]
+    /// finds written, on a lost device too; `None` answers as a driver
+    /// that reads no results without waiting.
+    pub(crate) queries_written: Option<u32>,
     pub(crate) query_pool_error: Option<Error>,
     pub(crate) query_pools: Vec<(QueryPool, QueryPoolInfo)>,
     pub(crate) query_resets: Vec<(QueryPool, u32, u32)>,
@@ -698,6 +702,20 @@ impl Backend for MockBackend {
             .enumerate()
             .for_each(|(index, result)| *result = index as u64 * 10);
         Ok(self.queries_ready)
+    }
+    fn query_progress(
+        &mut self,
+        _: QueryPool,
+        first: u32,
+        results: &mut [Option<u64>],
+    ) -> Result<()> {
+        let written = self
+            .queries_written
+            .ok_or(Error::Unsupported("query results without waiting"))?;
+        for (index, result) in (first..).zip(results.iter_mut()) {
+            *result = (index < written).then_some(u64::from(index) * 10);
+        }
+        Ok(())
     }
     fn submit_failure(&mut self, semaphore: Semaphore, value: u64) -> Option<Error> {
         let index = self

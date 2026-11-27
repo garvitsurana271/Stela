@@ -437,6 +437,20 @@ pub trait Backend {
     fn reset_queries(&mut self, pool: QueryPool, first: u32, count: u32);
     /// 64-bit results; `false` while any is still unavailable.
     fn query_results(&mut self, pool: QueryPool, first: u32, results: &mut [u64]) -> Result<bool>;
+    /// The results available now, without waiting, each `None` until the
+    /// GPU wrote it: how far a command buffer's timestamps got. A lost
+    /// device answers too where the driver reads its pool's memory after a
+    /// loss (ANV with Mesa patch 0045); elsewhere the error says why not.
+    fn query_progress(
+        &mut self,
+        _pool: QueryPool,
+        _first: u32,
+        _results: &mut [Option<u64>],
+    ) -> Result<()> {
+        Err(crate::metal::error::Error::Unsupported(
+            "query results without waiting",
+        ))
+    }
 
     fn semaphore_value(&mut self, semaphore: Semaphore) -> Result<u64>;
     /// Every submission signaling `semaphore` at `value` or less is known

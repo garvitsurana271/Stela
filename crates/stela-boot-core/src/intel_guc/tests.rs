@@ -149,7 +149,10 @@ fn alder_and_raptor_lake_p_start_with_the_guc_in_test_4_and_fall_back_after_a_fa
         );
         assert_eq!(Mode::decide(setting, record, 0xa7ab, p), Mode::Guc);
     }
-    assert_eq!(Mode::decide(Setting::Off, record, 0xa7a0, p), Mode::OffByHand);
+    assert_eq!(
+        Mode::decide(Setting::Off, record, 0xa7a0, p),
+        Mode::OffByHand
+    );
     let line = Mode::OffByDefault.line(0xa7a0, None);
     assert!(
         line.starts_with("INTEL GUC off (test4): ") && line.contains("--i915-guc on"),

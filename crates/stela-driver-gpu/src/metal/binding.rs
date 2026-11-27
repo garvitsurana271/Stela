@@ -2618,10 +2618,7 @@ mod tests {
         limits.max_descriptor_set_update_after_bind_samplers = 3 << 27;
         limits.max_sampler_allocation_count = 64 * 1024;
         let layout = HeapLayout::new(&limits);
-        assert_eq!(
-            layout.counts,
-            [786_432, 786_432, 65_536, 262_144, 262_144]
-        );
+        assert_eq!(layout.counts, [786_432, 786_432, 65_536, 262_144, 262_144]);
         assert!(layout.count(HeapArray::SampledImages) >= 500_000);
         assert!(layout.count(HeapArray::StorageImages) >= 500_000);
         // `sizeof(struct anv_descriptor)` host bytes per descriptor.

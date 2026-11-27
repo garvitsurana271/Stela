@@ -120,7 +120,12 @@ pub(super) fn off_for(device: u16, platform: &str) -> bool {
     let record = earlier();
     let mode = Mode::decide(setting(), record, device, platform);
     if MODE
-        .compare_exchange(0, encode_mode(mode, device), Ordering::AcqRel, Ordering::Acquire)
+        .compare_exchange(
+            0,
+            encode_mode(mode, device),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
         .is_err()
     {
         return decided().is_some_and(|(_, guc)| !guc);

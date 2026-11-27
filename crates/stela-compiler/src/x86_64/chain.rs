@@ -3439,7 +3439,7 @@ pub(crate) fn paired_call(
 /// discards the frames. A block retired meanwhile, by any PE, advances
 /// the epoch, which every frame of the run then fails, so a return never
 /// enters a retired block's continuation through its frame.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(crate) fn paired_return(asm: &mut crate::x86_64::asm::Asm, ran: u32) -> Option<()> {
     paired_return_for(asm, ran, false)
 }

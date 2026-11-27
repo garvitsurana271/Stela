@@ -1090,6 +1090,42 @@ fn a_full_heap_is_not_out_of_memory() {
     );
 }
 
+/// A texture of an automatic heap takes a range an earlier texture may
+/// have left its bytes in, and is cleared as a new one is; a placement
+/// heap's texture aliases what its client placed there and is not.
+#[test]
+fn automatic_heap_textures_are_cleared_and_placed_ones_are_not() {
+    let mut device = device();
+    let descriptor = texture(PixelFormat::Rgba8Unorm, TextureUsage::SHADER_READ);
+    let answered = device.heap_texture_size_and_align(&descriptor).unwrap();
+    let heap = |device: &mut TestDevice, heap_type| {
+        device
+            .new_heap(&HeapDescriptor {
+                size: 2 * answered.size,
+                options: options(StorageMode::Private),
+                heap_type,
+                sparse_page_size: SparsePageSize::Size64,
+            })
+            .unwrap()
+    };
+    let automatic = heap(&mut device, HeapType::Automatic);
+    let first = device
+        .new_heap_texture(automatic, &descriptor, None)
+        .unwrap();
+    device.destroy_texture(first).unwrap();
+    device
+        .new_heap_texture(automatic, &descriptor, None)
+        .unwrap();
+    assert_eq!(device.backend().cleared.len(), 2);
+    assert_eq!(device.memory().heap_clears, 2);
+    let placement = heap(&mut device, HeapType::Placement);
+    device
+        .new_heap_texture(placement, &descriptor, Some(0))
+        .unwrap();
+    assert_eq!(device.backend().cleared.len(), 2);
+    assert_eq!(device.memory().heap_clears, 2);
+}
+
 fn color_targets() -> RenderTargets {
     let mut targets = RenderTargets::default();
     targets.color_attachments[0] = ColorAttachmentDescriptor {

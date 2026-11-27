@@ -274,6 +274,9 @@ pub(super) struct Resources {
     recycle_hits: u64,
     recycle_misses: u64,
     heap_refusals: HeapRefusals,
+    /// Textures of automatic heaps cleared as new ones, as their ranges
+    /// may hold another texture's bytes ([`Device::new_heap_texture`]).
+    heap_clears: u64,
     /// Who may still read a live buffer's or texture's memory through the
     /// destroyed textures over it or views of it, by buffer and by texture:
     /// a view or buffer texture shared with other connections, or with an
@@ -2821,9 +2824,19 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let created = match real {
             Some(range) => {
                 let at = range.map_or(offset, |(at, _)| at);
-                self.backend
-                    .create_placed_image(&plan.image, memory, at)
-                    .map(|image| (image, None))
+                let placed = self.backend.create_placed_image(&plan.image, memory, at);
+                // An automatic heap gives each texture a range of its own,
+                // which an earlier texture of the heap may have left its
+                // bytes in, and whose fill with zero when the heap took it
+                // is not zero texels in a compressed layout: the image is
+                // cleared as a new one is, unless the next submission's
+                // first commands write it whole. A placement heap's
+                // textures alias what the client placed there, as on a Mac.
+                if let (Ok(image), Some(_)) = (&placed, range) {
+                    self.backend.clear_reused_image(*image, &plan.image);
+                    self.resources.heap_clears += 1;
+                }
+                placed.map(|image| (image, None))
             }
             None => self
                 .make_image(&plan.image, plan.memory)
@@ -3018,6 +3031,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// The resources automatic heaps answered nil for so far.
     pub fn heap_refusals(&self) -> HeapRefusals {
         self.resources.heap_refusals
+    }
+
+    /// Textures of automatic heaps cleared as new ones since the device
+    /// opened.
+    pub fn heap_clears(&self) -> u64 {
+        self.resources.heap_clears
     }
 
     /// A heap's size, whole pages as a Mac answers `size` and

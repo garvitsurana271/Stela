@@ -238,6 +238,8 @@ pub struct DeviceMemory {
     pub recycled: resources::RecycleReport,
     /// Resources automatic heaps answered nil for, by cause.
     pub heap_refusals: resources::HeapRefusals,
+    /// Textures of automatic heaps cleared as new ones.
+    pub heap_clears: u64,
     /// The backend's memory blocks and the resources placed in them.
     pub blocks: crate::metal::vulkan::backend::MemoryBlocks,
     /// The upload chunks, which `allocated` does not count.
@@ -327,6 +329,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             completed: self.completed,
             recycled: self.recycled(),
             heap_refusals: self.heap_refusals(),
+            heap_clears: self.heap_clears(),
             blocks: self.backend.memory_blocks(),
             chunks: self.upload_chunks(),
             out_of_memory: self.out_of_memory(),

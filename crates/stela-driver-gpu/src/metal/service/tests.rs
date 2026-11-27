@@ -811,6 +811,36 @@ fn a_report_reaches_the_platform_as_a_refusal_does() {
         core::mem::take(&mut service.refused),
         ["newTextureWithDescriptor: is absent"]
     );
+    // A report without the bundle's `name[pid]` names no process.
+    assert_eq!(service.process(connection), None);
+}
+
+#[test]
+fn a_connection_is_named_by_its_first_report() {
+    let mut service = service();
+    let connection = connect(&mut service);
+    let memory = &mut Memory::default();
+    for report in [
+        &b"Installer Progress[127] GPU family Apple7: status 0, gate fault 0: no"[..],
+        &b"Other[9] later: status 0"[..],
+    ] {
+        let text = memory.put(report);
+        call::<_, Empty>(
+            &mut service,
+            connection,
+            Operation::Report,
+            &ReportRequest { text },
+            memory,
+        )
+        .unwrap();
+    }
+    assert_eq!(service.process(connection), Some("Installer Progress[127]"));
+    assert_eq!(super::reporter("a[b] c"), None);
+    assert_eq!(super::reporter("[12] c"), None);
+    assert_eq!(
+        super::reporter("iconservicesagent[456] x"),
+        Some("iconservicesagent[456]")
+    );
 }
 
 #[test]

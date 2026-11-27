@@ -236,6 +236,19 @@ struct Connection {
     /// samplers its functions take as arguments, and those its pipelines'
     /// GPU-encoded commands and mesh draws bind, may then be.
     bicubic: bool,
+    /// The process that holds it, `name[pid]`, from its first report
+    /// ([`reporter`]).
+    process: Option<String>,
+}
+
+/// The `name[pid]` the guest bundle opens each of its reports with
+/// (`Gate.m`), or `None` for a report without one.
+fn reporter(text: &str) -> Option<&str> {
+    let end = text.find("] ")?;
+    let open = text[..end].rfind('[')?;
+    let pid = &text[open + 1..end];
+    (open > 0 && !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| &text[..=end])
 }
 
 impl Connection {
@@ -559,9 +572,18 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 allocated: 0,
                 negotiated: false,
                 bicubic: false,
+                process: None,
             },
         );
         Ok(id)
+    }
+
+    /// The process that holds `connection`, as its first report named it
+    /// (`name[pid]`); `None` before it reported anything.
+    pub fn process(&self, connection: NonZeroU64) -> Option<&str> {
+        self.connections
+            .get(&connection)
+            .and_then(|open| open.process.as_deref())
     }
 
     /// Closes a connection and releases its objects, newest first. The
@@ -937,8 +959,16 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             Operation::Report => {
                 let request: wire::ReportRequest = call.request()?;
                 let text = call.memory.read(request.text)?;
-                self.refused
-                    .push(String::from_utf8_lossy(&text).into_owned());
+                let text = String::from_utf8_lossy(&text).into_owned();
+                // The bundle names its process in each report: the
+                // connection's later log lines name it too.
+                if let (Some(name), Some(open)) =
+                    (reporter(&text), self.connections.get_mut(&connection))
+                    && open.process.is_none()
+                {
+                    open.process = Some(String::from(name));
+                }
+                self.refused.push(text);
                 call.reply(&wire::Empty {})
             }
             Operation::NewLibrary => self.new_library(&mut call),

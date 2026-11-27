@@ -485,9 +485,10 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         if count > NOTED_HEAP_NILS {
             return;
         }
+        let process = self.process(connection).unwrap_or("unnamed");
         self.noted = Some(alloc::format!(
-            "HEAP NIL {count} connection={connection} heap={size} resources={resources} \
-             used={used} largest={largest} asked={}@{:#x} {what}",
+            "HEAP NIL {count} connection={connection} process={process} heap={size} \
+             resources={resources} used={used} largest={largest} asked={}@{:#x} {what}",
             asked.size,
             asked.align,
         ));

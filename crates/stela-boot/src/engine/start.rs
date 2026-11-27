@@ -3683,6 +3683,14 @@ fn start_devices(
                 gpu::intel_guc::set_setting(options.i915_guc());
                 gpu::intel_guc::set_earlier(handoff.intel_guc_earlier);
             }
+            #[cfg(all(feature = "nvk", feature = "intel"))]
+            {
+                gpu::client::keep_intel_ccs(options.intel_ccs);
+                output::arguments(format_args!(
+                    "{}\n",
+                    stela_boot_core::options::intel_ccs_line(options.intel_ccs)
+                ));
+            }
             if options.boots_macos()
                 && let Ok(work) = work
                 && let Some(mut fallback) = open_gpus(

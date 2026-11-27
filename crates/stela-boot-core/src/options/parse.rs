@@ -146,6 +146,7 @@ impl ParseState<'_> {
             SINGLE_USER => options.single_user = true,
             SCANOUT_MIRROR => options.scanout_mirror = true,
             GPU_STRICT_FAMILIES => options.gpu_strict_families = true,
+            INTEL_CCS => options.intel_ccs = true,
             "--monitor-trace" => options.monitor_trace = true,
             "--display-trace" => options.display_trace = true,
             "--native-shared-check" => flag(

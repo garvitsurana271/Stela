@@ -2101,6 +2101,20 @@ extern "C" fn stela_libc_now_ns() -> u64 {
     installed().map_or(0, |gpu| gpu.libc_clock.now_ns(host::rdtsc(), gpu.tsc_hz))
 }
 
+/// Whether ANV keeps Gen12's CCS aux compression on (`--intel-ccs`); off by
+/// default, as `compat/libc/libc.c`'s INTEL_DEBUG says.
+static INTEL_CCS: AtomicBool = AtomicBool::new(false);
+
+/// Keeps Intel's CCS compression on for the Vulkan devices opened after it.
+pub(in crate::engine) fn keep_intel_ccs(on: bool) {
+    INTEL_CCS.store(on, Ordering::Relaxed);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn stela_libc_intel_ccs() -> c_int {
+    c_int::from(INTEL_CCS.load(Ordering::Relaxed))
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn stela_libc_core() -> c_uint {
     match installed().and_then(current_thread) {

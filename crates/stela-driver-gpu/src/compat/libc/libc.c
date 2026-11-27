@@ -173,11 +173,20 @@ int atexit(void (*function)(void))
  * allocations against it. At half, a 2560 MiB share gave a UHD 630 a 1280
  * MiB heap that the guest memory ANV imports (IOSurfaces, no-copy buffers)
  * counts in too; it filled with Linux holding 1017 MiB of the share, every
- * further allocation and import was refused, and WindowServer died. */
+ * further allocation and import was refused, and WindowServer died.
+ *
+ * ANV runs with Gen12's CCS aux compression off (INTEL_DEBUG=noccs), the
+ * counterpart of RADV's nodcc, unless the boot asks to keep it
+ * (stela_libc_intel_ccs, `--intel-ccs`): with it on, Iris Xe GPUs drew
+ * garbled UI and hung in 10 s context resets; with it off, a Latitude 5340's
+ * Iris Xe ran 13 minutes and 8,465 submissions with no hang (found by
+ * rqffael, stambha issue #35). Nothing else sets INTEL_DEBUG. */
 char *getenv(const char *name)
 {
 	if (name && !strcmp(name, "RADV_DEBUG"))
 		return (char *)"nodcc";
+	if (name && !strcmp(name, "INTEL_DEBUG"))
+		return stela_libc_intel_ccs() ? NULL : (char *)"noccs";
 	if (name && !strcmp(name, "ANV_SYS_MEM_LIMIT"))
 		return (char *)"100";
 	return NULL;

@@ -21,6 +21,9 @@ uint64_t stela_libc_memory_bytes(void);
 uint64_t stela_libc_available_memory_bytes(void);
 /* This host processor or Mesa thread, below STELA_LIBC_CORES. */
 unsigned int stela_libc_core(void);
+/* Nonzero when the boot keeps Intel's CCS aux compression on (`--intel-ccs`);
+ * ANV otherwise runs with INTEL_DEBUG=noccs. */
+int stela_libc_intel_ccs(void);
 #define STELA_LIBC_PROCESSORS 256
 #define STELA_LIBC_THREADS 16
 #define STELA_LIBC_CORES (STELA_LIBC_PROCESSORS + STELA_LIBC_THREADS)

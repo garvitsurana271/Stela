@@ -174,6 +174,12 @@ unsigned int stela_libc_core(void)
 	return core;
 }
 
+/* ANV here runs as the boot's does by default: with CCS off. */
+int stela_libc_intel_ccs(void)
+{
+	return 0;
+}
+
 struct thread_start {
 	void (*body)(void *);
 	void *argument;

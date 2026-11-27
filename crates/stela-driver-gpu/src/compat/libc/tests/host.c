@@ -98,6 +98,12 @@ unsigned int stela_libc_core(void)
 	return current_core;
 }
 
+/* The boot's default: Intel's CCS compression off. */
+int stela_libc_intel_ccs(void)
+{
+	return 0;
+}
+
 /* One host processor: a thread runs through at its start. */
 int stela_libc_thread_start(void (*body)(void *), void *argument, unsigned int core)
 {

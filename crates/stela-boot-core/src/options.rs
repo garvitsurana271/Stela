@@ -354,6 +354,25 @@ pub const GPU_ASPM: &str = "--gpu-aspm";
 /// 13.
 pub const GPU_STRICT_FAMILIES: &str = "--gpu-strict-families";
 
+/// Keeps Gen12's CCS aux compression on for Intel GPUs under ANV
+/// (`--intel-ccs`). Without it ANV runs with `INTEL_DEBUG=noccs`, as RADV
+/// runs without DCC: with CCS on, Iris Xe GPUs drew garbled UI and hung in
+/// 10 s context resets, and with it off a Latitude 5340 ran clean (found by
+/// rqffael, stambha issue #35). A hand-written opt-in setup never writes, so
+/// the options revision stays 13.
+pub const INTEL_CCS: &str = "--intel-ccs";
+
+/// The boot log's line of what [`INTEL_CCS`] chose.
+pub const fn intel_ccs_line(on: bool) -> &'static str {
+    if on {
+        "GPU INTEL CCS on (--intel-ccs): ANV keeps Gen12's CCS aux compression"
+    } else {
+        "GPU INTEL CCS off: ANV runs with INTEL_DEBUG=noccs, as RADV runs without DCC, where \
+         CCS on Iris Xe drew garbled UI and hung in 10 s context resets (found by rqffael, \
+         stambha issue #35); --intel-ccs on the startup choice's line keeps it on"
+    }
+}
+
 /// `--gpu-aspm`'s value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GpuAspm {
@@ -658,6 +677,8 @@ pub struct System {
     /// Keep a GPU without multisampled storage images out of Apple4
     /// ([`GPU_STRICT_FAMILIES`]).
     pub gpu_strict_families: bool,
+    /// Keep Intel's CCS compression on ([`INTEL_CCS`]).
+    pub intel_ccs: bool,
     /// The NVRAM boot volume the loader chose (`--boot-volume`), naming the
     /// Preboot disk's container and volume group.
     pub boot_volume: Option<BootVolume>,
@@ -920,6 +941,7 @@ impl Default for System {
             bundle_repair: false,
             scanout_mirror: false,
             gpu_strict_families: false,
+            intel_ccs: false,
             boot_command: None,
             upgrade: false,
             recovery: None,
@@ -1511,6 +1533,7 @@ impl fmt::Display for System {
         line.flag(boot_selection::BUNDLE_REPAIR_OPTION, self.bundle_repair)?;
         line.flag(SCANOUT_MIRROR, self.scanout_mirror)?;
         line.flag(GPU_STRICT_FAMILIES, self.gpu_strict_families)?;
+        line.flag(INTEL_CCS, self.intel_ccs)?;
         line.flag(boot_selection::UPGRADE_OPTION, self.upgrade)?;
         line.flag(
             boot_selection::PAIRED_RECOVERY_OPTION,

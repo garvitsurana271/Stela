@@ -503,6 +503,19 @@ fn strict_gpu_families_round_trip_and_are_off_unless_written() {
 }
 
 #[test]
+fn intel_ccs_round_trips_and_is_off_unless_written() {
+    let plain = round_trip("--system");
+    assert!(!plain.intel_ccs);
+    assert!(!plain.to_string().contains(INTEL_CCS));
+    let kept = round_trip(&format!("--system {INTEL_CCS}"));
+    assert!(kept.intel_ccs);
+    assert!(kept.to_string().contains(INTEL_CCS));
+    assert!(intel_ccs_line(false).contains("INTEL_DEBUG=noccs"));
+    assert!(intel_ccs_line(false).contains(INTEL_CCS));
+    assert!(intel_ccs_line(true).contains(INTEL_CCS));
+}
+
+#[test]
 fn maintenance_writes_require_an_explicit_preboot_selection() {
     let ordinary = round_trip(&format!("--system --preboot {DISK}"));
     assert!(!ordinary.maintenance_write);

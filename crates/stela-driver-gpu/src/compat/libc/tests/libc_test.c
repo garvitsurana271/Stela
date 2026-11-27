@@ -574,6 +574,8 @@ static void test_time(void)
 	/* ANV's heap is all of the share i915 reports. */
 	CHECK(!strcmp(getenv("ANV_SYS_MEM_LIMIT"), "100"));
 	CHECK(!strcmp(getenv("RADV_DEBUG"), "nodcc"));
+	/* ANV runs with CCS off unless the boot keeps it. */
+	CHECK(!strcmp(getenv("INTEL_DEBUG"), "noccs"));
 }
 
 static _Thread_local int per_thread = 5;

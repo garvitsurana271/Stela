@@ -1377,9 +1377,11 @@ fn posted_wait(gpu: &Installed, request: &Request, code: u32) -> Option<i64> {
             return None;
         }
         output::arguments(format_args!(
-            "GPU call {code:#x} still running after {} ms on PE {}, which waits for it\n",
+            "GPU call {code:#x} still running after {} ms on PE {}, which waits for it up to \
+             {} ms for the GPU's driver to finish or reset it\n",
             ms(),
-            host::processor()
+            host::processor(),
+            posted_call::STOP_MS
         ));
         spin(
             gpu,
@@ -1392,6 +1394,12 @@ fn posted_wait(gpu: &Installed, request: &Request, code: u32) -> Option<i64> {
                 posted_call::STOP_MS
             ));
         }
+        output::arguments(format_args!(
+            "GPU call {code:#x} ended after {} ms on PE {}: result {}\n",
+            ms(),
+            host::processor(),
+            request.result.load(Ordering::Acquire)
+        ));
     }
     Some(request.result.load(Ordering::Acquire))
 }

@@ -13,8 +13,23 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 /// How long a posted call may wait for a task to take it.
 pub const WITHDRAW_MS: u64 = 300;
-/// How long a posted call a task performs may run before the boot stops.
-pub const STOP_MS: u64 = 10_000;
+/// How long a posted call a task performs may run before the boot stops:
+/// past the slowest reset a kernel driver gives a hung GPU, so that the
+/// driver's reset ends the call, which fails, the device is lost and
+/// WindowServer restarts on a reopened one. i915 with GuC submission on a
+/// Gen12 render engine takes up to [`I915_GUC_RESET_MS`]: its heartbeat
+/// raises a stuck engine's priority a beat after it found it stuck, and
+/// GuC then waits the render engine's 7.5 s preemption timeout before it
+/// resets the context. dev64's Iris Xe recovered from a hung execbuffer
+/// 5.6 s after it was first reported in test 4, and test 5's 10 s stop
+/// came first in both of its boots, before i915 reset anything.
+pub const STOP_MS: u64 = 30_000;
+/// The longest i915 with GuC submission takes to reset a hung Gen12 render
+/// context: two of its heartbeats (`DRM_I915_HEARTBEAT_INTERVAL`, 2.5 s),
+/// one that finds the engine stuck and one that raises its priority, then
+/// the render engine's preemption timeout
+/// (`DRM_I915_PREEMPT_TIMEOUT_COMPUTE`, 7.5 s on Gen12).
+pub const I915_GUC_RESET_MS: u64 = 2 * 2_500 + 7_500;
 /// The longest a posted DRM fence wait may wait in a deferred job's slice,
 /// which gives its processor back while it waits: the bound of the GPU
 /// backend's own idle waits. A wait asking for longer, as Mesa's
@@ -148,6 +163,14 @@ mod tests {
     #[test]
     fn the_bounds_stay_inside_xnus_half_second_and_stop_after_it() {
         const _: () = assert!(WITHDRAW_MS < 500 && STOP_MS > 500);
+    }
+
+    #[test]
+    fn a_hung_gpu_is_reset_by_its_driver_before_the_stop() {
+        // i915's slowest GuC reset of a Gen12 render context, with room for
+        // the reset itself and the call's failing after it.
+        const _: () = assert!(I915_GUC_RESET_MS == 12_500);
+        const _: () = assert!(STOP_MS >= 2 * I915_GUC_RESET_MS);
     }
 
     #[test]
